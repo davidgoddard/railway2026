@@ -2,7 +2,7 @@
 
 An experimental toolkit for detecting occupation on a **model railway** using cameras instead of track or rolling-stock modifications. A camera watches selected parts of the layout and compares each new frame with an empty-track reference. The intended output is a clear, occupied, or unknown state for each virtual sensor or block.
 
-This repository is at the **specification and camera-algorithm experiment** stage. The working code is a single-camera Arduino sketch with a local web page. The controller, ESP-NOW messaging, MQTT publishing, multi-cell blocks, and setup application described below are planned work.
+This repository contains a browser-based camera algorithm experiment and a first multi-cell camera firmware sketch. The bridge controller, MQTT publishing, and setup application described below are planned work; the new camera protocol has not yet been tested with a bridge.
 
 ## Intended system
 
@@ -14,7 +14,7 @@ compact state over ESP-NOW             state and health bridge
 Setup application and temporary Wi-Fi hotspot: configuration, preview, diagnostics
 ```
 
-Each camera will process images locally and report compact state and health messages over ESP-NOW. The controller will publish those states to MQTT. Camera images are intended for setup and diagnosis over Wi-Fi, rather than continuous transfer during normal monitoring. The [draft functional specification](Documentation/functional-specification.md) defines the proposed state model, network modes, failure handling, MQTT contract, and performance guardrails.
+Each camera will process images locally and report compact state and health messages over ESP-NOW. The controller will publish those states to MQTT. The first multi-cell sketch also supports an on-demand grayscale snapshot over ESP-NOW for setup and diagnosis; it pauses monitoring during this slow transfer. The [draft functional specification](Documentation/functional-specification.md) defines the proposed state model, network modes, failure handling, MQTT contract, and performance guardrails.
 
 The target is **at least 10 fresh, analysed frames per second** at a resolution that makes rails and sleepers distinguishable, under the intended cell load and with the radio active. This is a target to test on hardware, not a measured capability of the current sketch.
 
@@ -43,6 +43,8 @@ The [camera module experiment](experiments/camera_module/README.md) runs on an A
 
 The experiment uses one cell and does **not** yet send ESP-NOW or MQTT messages, persist settings, or implement drawn blocks. Its baseline is captured from one frame, and its classification thresholds still need testing on actual track and rolling stock.
 
+The separate [Camera Module firmware](Camera_Module/README.md) accepts up to 300 configured cells, combines cells into block groups, reports state over ESP-NOW, and provides USB configuration and snapshot commands. Its configuration and baseline are currently volatile, and the bridge side of its protocol still needs implementation.
+
 ### Try it
 
 1. Install the Espressif ESP32 Arduino core, select the appropriate camera board, and enable PSRAM.
@@ -63,7 +65,7 @@ The sketch version appears at the top of the `.ino` file, on the web page, and i
 
 1. Collect logs from stationary empty track under changing daylight, artificial light, and camera exposure; tune false-change behaviour before treating the algorithm as reliable.
 2. Test resolution, frame rate, PSRAM use, and cell count on the chosen ESP32-S3 camera hardware.
-3. Add multiple cells along a drawn block, combine their states, and measure the resulting frame rate.
-4. Implement configuration persistence, ESP-NOW state and health reporting, controller MQTT publishing, and the setup application according to the functional specification.
+3. Test the multi-cell block logic, snapshot transfer, and ESP-NOW state reporting against a bridge on real hardware.
+4. Implement configuration persistence, authenticated pairing, controller MQTT publishing, and the setup application according to the functional specification.
 
 The specification deliberately marks unresolved design choices and acceptance scenarios. Results from the camera experiment should update it as the hardware and algorithm are validated.

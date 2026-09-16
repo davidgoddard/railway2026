@@ -1,0 +1,84 @@
+# Railway camera module firmware
+
+`Camera_Module.ino` is the first multi-cell camera firmware. It captures grayscale frames locally, compares configured cells with a captured empty-layout baseline, and sends compact occupancy events to a bridge over ESP-NOW. It has no web server, hotspot, station association, IP address, or MQTT client. ESP-NOW still needs the Wi-Fi radio in station mode. The bridge and Electron application are separate work; this repository does not yet contain a compatible bridge receiver.
+
+The sketch version is at the first line. `CAMERA_DEBUG_SERIAL` is `1` for development. Set it to `0` to suppress USB text and raw frame output; command input remains available. The serial monitor uses **115200 baud** and newline-terminated commands.
+
+## Hardware and build
+
+- The default pin map is the **AI Thinker ESP32-CAM**, with its flash LED on GPIO 4. A second pin map is included for **ESP32-S3-EYE**; select it by commenting out `CAMERA_BOARD_AI_THINKER` and uncommenting `CAMERA_BOARD_ESP32S3_EYE`. Its LED uses GPIO 3 in [Espressif's S3-EYE board definition](https://github.com/espressif/esp-bsp/blob/master/bsp/esp32_s3_eye/esp32_s3_eye.json). Verify the status LED behavior on the particular board revision before relying on its flash pattern. Other S3 camera modules need a new pin map.
+- PSRAM is required for the frame buffer and the two cell arrays. The sketch supports 320×240, 640×480, 800×600, and 1024×768 grayscale modes, subject to the actual camera and PSRAM. Camera XCLK is 20 MHz, one PSRAM frame buffer is used, and a separate full-frame copy is retained for processing and snapshots.
+- Compile with Arduino-ESP32 core 3.3.8 or a compatible 3.x core. For AI Thinker, select **AI Thinker ESP32-CAM** and enable PSRAM; its serial commands need a USB-to-UART adapter. For S3-EYE, select the appropriate ESP32-S3 board and PSRAM configuration and enable USB CDC if using native USB serial. The default sketch compiles with `arduino-cli compile --fqbn esp32:esp32:esp32cam Camera_Module`.
+- Power the camera from a stable supply. The flash LED may draw much more current than the status logic alone.
+
+At boot the module broadcasts a `HELLO` packet containing its station MAC address every two seconds. The bridge must be on the same ESP-NOW channel and direct configuration packets to that MAC. The default channel is **1**; use USB `C` to change it for the current boot. After a complete configuration is committed and a fresh baseline has been captured, the status LED flashes twice and monitoring starts. Configuration and baseline features are **RAM-only in this version**. The bridge must replay configuration and explicitly request a new empty-layout baseline after every restart. Do not issue baseline capture while a train occupies a configured cell.
+
+## Configuration and states
+
+The bridge uploads a whole revision with `CONFIG_BEGIN`, zero to 300 ordered `CONFIG_CELL` records, and `CONFIG_COMMIT`. The camera stages records in a separate PSRAM array. A failed or incomplete upload leaves the active configuration intact. The commit clears the old baseline and sets all cells to `UNKNOWN` until `CAPTURE_BASELINE` succeeds. Changing camera resolution or image settings also requires a new empty-layout baseline. The configuration includes camera resolution, brightness, contrast, saturation, vertical flip, and horizontal mirror settings; it does not currently override the sensor's automatic exposure and gain behavior.
+
+Each cell has a unique nonzero sensor ID, centre `(x,y)`, radius 3–50 pixels, circle or square shape, contrast floor 10–500, angle tolerance 0–20°, mismatch threshold 0.050–1.000, and enter/clear persistence counts. A `groupId` of zero makes it an independent sensor. Cells with the same nonzero `groupId` form one block: **any occupied member makes the block occupied**; otherwise an unknown member makes it unknown; otherwise it is clear. A grouped cell is still printed in the USB debug log, while the bridge receives one state for the group ID. Up to 64 distinct groups are supported.
+
+An occupancy change is queued for radio transmission. The queue coalesces newer states for the same ID and drains at most one event every 20 ms. The camera also queues a full state refresh every 30 seconds, so a lost event can eventually be corrected. The bridge must still validate the camera MAC, configuration revision, sequence and freshness, and treat a silent or stale camera as unknown. ESP-NOW send acceptance alone does not prove that the bridge application processed an event.
+
+## Detection algorithm
+
+The detector retains the experiment's **up to three dominant gradient angles**, plus **up to two edge points** on the strongest angle. These are gradient-normal angles: the visible rail or carriage edge runs 90° from the angle reported in the debug data. A cell with no stable angle is still usable; a blank reference can detect new texture.
+
+1. Baseline capture takes one fresh grayscale frame and calibrates every configured cell from it. The first pixel pass calculates Sobel gradient magnitude and image-quality statistics. The second pass counts qualifying gradient angles in 18 bins of 10°. A qualifying gradient exceeds both the cell's contrast floor and one quarter of that cell's strongest gradient. Peaks must have enough support to be retained. For an oriented reference, the code precomputes unit direction vectors and baseline counts near each peak. It selects up to two strong, separated gradient points for the strongest peak.
+2. Every live frame makes the same two pixel passes for each cell. Where reference peaks exist, the second pass uses integer dot and cross products to count gradients near each stored direction; it does not calculate `atan2` per live edge. Other gradients go into an additional bucket. Without a stable reference peak, it compares smoothed 18-bin angle distributions.
+3. A mismatch is the largest of the direction-share difference, the experimental edge-strength concentration score for weakly oriented cells, and the fraction of saved edge points missing within a two-pixel search radius. A blank/textured classification change scores 1.0. No per-pixel baseline brightness patch is stored or compared.
+4. A sudden bright washout can make existing edges disappear. The provisional exposure guard suspends state transitions if brightness rose and near-white clipping or strong detail loss indicates an unreliable frame. It preserves the prior state and logs the condition. This guard and the contrast floor are still affected by illumination; the detector is **not** lighting independent.
+5. A score at or above the configured threshold for `enterFrames` consecutive usable frames marks the cell occupied. A score below 70% of that threshold for `clearFrames` consecutive usable frames marks it clear. The intermediate range holds the previous state.
+
+Two pixel passes per cell mean hundreds of large or overlapping cells may take longer than the camera capture interval. The loop aims to start a new capture after 100 ms; this is **not a guaranteed 10 fps rate**. Measure the actual board, resolution, and cell set before using it for traffic decisions. Edge points can false-trigger if lighting changes which rail edge is visible or the camera moves. A carriage edge in the same position and direction can still look like the baseline.
+
+## ESP-NOW wire protocol
+
+All fields are packed and little-endian, as sent by ESP32. The packet starts with `uint16 magic=0x5243`, `uint8 version=1`, `uint8 type`, `uint32 seq`, `uint16 payload_length`, followed by exactly that many payload bytes. Maximum packet size is **210 bytes**, within the legacy 250-byte ESP-NOW payload limit. A bridge should implement this exact format and reject wrong lengths, versions, source MACs, and stale revisions. The receive callback only queues valid packets; the main loop handles configuration and camera work. The queue has 16 slots, so configuration senders must wait for each application-level ACK before sending the next item. [Espressif documents the 250-byte v1 limit and the need for application acknowledgements.](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/network/esp_now.html)
+
+| Type | Number | Direction | Payload |
+| --- | ---: | --- | --- |
+| `HELLO` | 1 | broadcast from camera | MAC `[6]`, revision `u32`, width/height/count `u16`, channel and baseline-ready `u8` |
+| `CONFIG_BEGIN` | 2 | bridge → camera | revision `u32`, count `u16`, camera settings: resolution `u8`, brightness/contrast/saturation `i8`, vertical flip/horizontal mirror `u8` |
+| `CONFIG_CELL` | 3 | bridge → camera | index `u16`, then `CellConfig`: id/group ID `u32`, centre x/y `u16`, radius/shape `u8`, contrast floor/threshold in thousandths `u16`, tolerance/enter/clear `u8` |
+| `CONFIG_COMMIT` | 4 | bridge → camera | revision `u32` |
+| `CAPTURE_BASELINE` | 5 | bridge → camera | empty payload; triggers a **fresh** frame and recalibrates every active cell |
+| `SNAPSHOT_REQUEST` | 6 | bridge → camera | empty payload; starts transfer of the latest retained grayscale frame |
+| `ACK` | 7 | camera → bridge | original type `u8`, status `u8`, detail `u16`; header sequence echoes the request |
+| `STATE` | 8 | camera → bridge | id/revision/frame `u32`, score in thousandths `u16`, state and grouped flag `u8` |
+| `HEALTH` | 9 | camera → bridge | revision/frame/capture failures/free heap `u32`, cell count/width/height/capture age ms `u16`, baseline-ready/snapshot-active `u8` |
+| `SNAPSHOT_BEGIN` | 10 | camera → bridge | frame/byte count/CRC32 `u32`, width/height `u16` |
+| `SNAPSHOT_CHUNK` | 11 | camera → bridge | byte offset `u32`, followed by up to 180 grayscale bytes |
+| `SNAPSHOT_END` | 12 | camera → bridge | frame and CRC32 `u32` |
+| `SNAPSHOT_ACK` | 13 | bridge → camera | empty payload; header sequence echoes each received snapshot packet |
+
+ACK status values are `0 OK`, `1 bad payload`, `2 wrong order`, `3 no memory` (reserved), `4 camera error`, and `5 busy`. The bridge should retry a configuration packet with the **same sequence and contents** if its ACK is lost. Repeated `CONFIG_CELL` records at an already staged index are accepted only when their contents match. Repeated `CONFIG_COMMIT` for the active revision succeeds. A repeated baseline command with the same sequence is acknowledged without recapturing, preventing a lost ACK from replacing the empty reference with a later occupied frame. A new sequence explicitly requests a new baseline.
+
+Snapshot transfer is stop-and-wait. The camera sends `SNAPSHOT_BEGIN`, waits for `SNAPSHOT_ACK`, then sends one indexed chunk at a time and finally `SNAPSHOT_END`; each packet requires an ACK with the same sequence. It retries after 250 ms, up to eight times. The bridge must verify the byte count and CRC32. The frame is **raw grayscale, row-major, one byte per pixel**, and is intended for the bridge to forward to the Electron app or save as a baseline snapshot. At 800×600 it is 480,000 bytes and needs about 2,667 chunks plus acknowledgements. Monitoring pauses while the transfer holds the frame; `HEALTH.snapshotActive` and `captureAgeMs` tell the bridge to treat camera observations as stale. This diagnostic path needs throughput testing. The normal state path sends no images.
+
+The first `CONFIG_BEGIN` source becomes the bridge for that boot, or use USB `P` to set its MAC explicitly. This is **commissioning only**: peer traffic is currently unencrypted and unauthenticated. Do not treat the first-source pairing as secure deployment. The controller and camera must share a channel; the camera does not scan channels or follow router changes yet.
+
+## USB commands
+
+Commands are single letters followed by space-separated arguments, with a newline at the end. Run `H` for the built-in summary. Serial output includes boot identity, configuration entries, baseline angles and anchor counts for each sensor, occupancy triggers, sent states, snapshot progress, and errors while `CAMERA_DEBUG_SERIAL=1`.
+
+| Command | Action |
+| --- | --- |
+| `H` | Help |
+| `I` | Identity, frame and health summary, then every cell's metadata, first angle, score and state |
+| `P AA:BB:CC:DD:EE:FF` | Set bridge MAC for this boot |
+| `C 6` | Set ESP-NOW channel 6 for this boot; valid range 1–13 |
+| `B 1 2 2` | Start revision 1, two cells, SVGA (resolution index 2). Optional five camera settings follow: brightness, contrast, saturation, vflip, hmirror |
+| `S 0 101 0 400 300 5 C 80 10 200 3 5` | Stage cell 0, sensor ID 101, independent, centre (400,300), circle radius 5, contrast floor 80, tolerance 10°, threshold 0.200, enter after 3 frames, clear after 5 |
+| `S 1 102 900 420 300 5 S 80 10 200 3 5` | Stage cell 1 as part of block/group ID 900; `S` shape means square |
+| `A` | Commit the staged configuration; baseline becomes invalid |
+| `R` | Capture a **fresh** empty-layout frame and recalibrate all cells; LED flashes twice |
+| `F` | Write a binary snapshot of the latest frame to USB |
+| `X` | Clear the active configuration from RAM |
+
+For `F`, the binary output starts with eight ASCII bytes `RAILFRM1`, then little-endian frame number `u32`, byte count `u32`, CRC32 `u32`, width `u16`, height `u16`, followed immediately by the raw grayscale bytes. Text debug output may precede or follow it; a receiver should scan for the magic and read the exact declared byte count. A terminal is unsuitable for this binary stream. Use a serial capture program instead.
+
+## Current limits
+
+This is a hardware-testable first camera sketch, not a completed controller system. It compiles for the AI Thinker board, but the ESP-NOW configuration/snapshot protocol, S3-EYE LED mapping, image quality, radio throughput, and hundreds-of-cells frame rate still need tests on the target hardware. Configuration, pairing, and derived baselines are volatile; the controller must replay them after a reboot. Whole-frame snapshots belong in durable application project data. The camera has no flash persistence, authenticated pairing, channel discovery, or OTA path yet. The bridge must implement the packet receiver, snapshot forwarding, freshness policy, and MQTT publishing.
