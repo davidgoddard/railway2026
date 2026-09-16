@@ -1,0 +1,71 @@
+# Camera angle experiment
+
+This Arduino sketch runs the detector on the camera board and serves a local web page. It is a getting-started experiment; it does not send ESP-NOW or MQTT messages and does not save sensor settings across restarts.
+
+## Hardware and upload
+
+- Default pin map: **AI Thinker ESP32-CAM with OV2640 and PSRAM**.
+- A second pin map is included for **Espressif ESP32-S3-EYE**. In `camera_module.ino`, comment out `CAMERA_BOARD_AI_THINKER` and uncomment `CAMERA_BOARD_ESP32S3_EYE` before compiling for that board. Other ESP32-S3 camera boards have different pins and need a matching map.
+- Install an ESP32 Arduino core that includes `esp_camera.h`; select the appropriate board and enable PSRAM. This sketch captures grayscale frames and requires PSRAM.
+- For an AI Thinker ESP32-CAM, use a suitable USB-to-serial programmer and stable 5 V supply. Follow that board's upload procedure, including its boot pin, then reset it to run.
+- Open Serial Monitor at **115200 baud** to see camera initialization errors and the hotspot address.
+
+The sketch version is defined on the first line of `camera_module.ino` and printed both in Serial Monitor and on the web page, so you can confirm which upload is running.
+
+The sketch starts the Wi-Fi hotspot **Railway-Angle-Lab** with password **railway123**. Change the password in the sketch before using it near other people. Join the hotspot and open **http://192.168.4.1/** (or the address printed on Serial Monitor). This is a local experiment; no Internet connection is required.
+
+## Experiment
+
+1. Mount the camera firmly so rails and sleepers are visible in the grayscale page view.
+2. Choose a resolution and press **Restart camera at selected resolution**. The page supports 320 × 240, 640 × 480, 800 × 600, and 1024 × 768. Higher modes make distant track detail easier to inspect but may run slowly or fail on an ESP32-CAM.
+3. Click on a sleeper, rail, or ballast to place the cell. The default is a 5 px radius circle; a square with 5 px half-width covers 10 × 10 pixels. Every pixel in the cell is sampled.
+4. With the cell empty, press **Capture empty-track baseline**. A blank, low-feature cell is a valid reference; it does not need a dominant angle.
+5. Put a vehicle into the area and inspect the **Angle comparison** table: reference angle, live angle, angular difference, and match result. Try 5° and 10° match tolerance. Open the raw histogram only when you want to inspect the underlying counts.
+6. Remove the vehicle and check that the score returns below the threshold. Repeat under ordinary lighting changes and with the smallest vehicle you expect to detect.
+7. Compare circle and square using the same centre and radius. The page reports sampled pixels and **analysis time** separately from capture time.
+8. To investigate an unexpected change, press **Clear log**, leave the scene empty, then reproduce the lighting or movement. Inspect the recent rows and press **Download CSV**. Share that CSV with the sketch version and a short note describing what happened and approximately when. No images are included in the log.
+
+## Frame comparison log
+
+Every camera capture attempt is recorded on the device, including failed captures. The page shows the latest 30 attempts; orange rows have a raw mismatch at or above the configured threshold and outlined rows have reached the sustained **CHANGE DETECTED** state. The CSV contains all retained records in time order. Its columns include the cell location, shape, contrast floor, angle tolerance, threshold, reference and live cell classifications, brightness range and mean, gradient count and strength, comparison score, persistence counters, selected angles and support shares, all 18 raw bins for both reference and live frames, and capture and cell processing times. Configuration and baseline revision numbers identify changes made during the run.
+
+The log uses a PSRAM ring of up to 1024 records, falling back to 512 or 256 if memory is tight. When full, the oldest records are overwritten, so download it soon after a false alarm. It is cleared by **Clear log** or a device restart. Serving the CSV and preview uses the same loop as capture, so a download pauses new captures briefly; timestamps and capture-attempt numbers help identify gaps. The CSV does not contain camera images or a wall-clock timestamp; `uptime_ms` is milliseconds since boot.
+
+Changing resolution reinitializes the camera, scales the sensor position to the new image size, **keeps the cell radius in pixels**, and clears the baseline. If the selected mode cannot start, the sketch tries to restore the previous mode. The page preview transfers the full grayscale frame approximately once per second; this can affect measured frame rate.
+
+The histogram has 18 bins, each 10° wide over 0–180°. It counts Sobel gradient angles from every cell pixel. These are **gradient normal** angles: a line's physical direction is 90° from its gradient angle. The algorithm first finds the strongest gradient in the cell, then counts pixels whose gradient passes both one quarter of that strength and the adjustable contrast floor. The relative cutoff is intended to retain the same angle pattern as overall contrast changes. A cell with too few qualifying gradients is classified as blank.
+
+The comparison first distinguishes **blank** from **textured** using the contrast floor and a minimum of eight significant gradient pixels. A blank background becoming textured, or a textured background becoming blank, scores as a change. Two blank views match. When both views are textured, reliable dominant angles are compared; if one or both textured views lack a stable peak, the experiment compares their normalized, smoothed angle histograms. A frame that cannot be captured or is stale remains unavailable; it is not interpreted as blank.
+
+A textured cell needs at least eight significant gradient pixels, regardless of its area. This lets a thin line remain usable inside a larger cell without lowering the contrast floor until weak background texture is counted. A cell below that count is still usable as a **blank reference**. Inspect the strong-gradient count before lowering the contrast floor.
+
+The detector groups counts across each 10° bin and its two neighbours, then selects up to three **separated, well-supported peaks**. Peaks within 20° of a stronger peak are treated as the same feature. The main peak must account for at least 25% of strong gradients; a second or third peak needs at least 20% and at least half the main peak's support. The table shows the support percentage next to each angle so that weak alternatives are visible in the raw histogram but excluded from matching. These are starting thresholds for the experiment, not proven railway settings.
+
+The table compares the refined measured angles with the **fixed empty-background angles**, using an adjustable 0–20° tolerance. Angles wrap at 180°: 179° and 1° differ by 2°. Each live angle can match only one reference angle.
+
+The mismatch score is 0 when all peaks match and rises toward 1 as reference peaks disappear or unmatched live peaks appear. It is based on the number of one-to-one matches divided by the number of distinct peaks across both sets; histogram bar heights and edge density do not contribute. A mismatch above the adjustable threshold for three analysed frames triggers **CHANGE DETECTED**; five frames below 70% of the threshold restore **Background-like**. A stopped vehicle remains changed because each frame is compared with the captured empty background, not with the immediately preceding frame. Moving or resizing the cell, changing shape, or changing minimum usable contrast clears the background signature. Changing tolerance or mismatch threshold retains it.
+
+The raw histogram is collapsed below the table. It marks selected empty-background peaks with numbered blue circles and pale blue columns. **1** is the strongest selected reference bin, followed by **2** and **3** when present. The table reports their refined angles rather than the centres of the 10° histogram bins.
+
+## Circle versus square
+
+At the same radius/half-width, a circle covers about 79% of a square's area, so it usually has fewer gradients to calculate and may be faster. The square avoids the per-row square-root calculation and may cover a rectangular track section better. There is no universal winner: on a small ROI the difference may be lost in camera capture and Wi-Fi overhead. Compare **analysis time** and sample count on the actual board, and choose the shape that excludes unrelated scenery while retaining useful rail and sleeper texture. For a long track section, a polygon or rectangle may be more appropriate than either shape.
+
+## Throughput estimate and future blocks
+
+The page measures camera acquisition plus the copy into its preview buffer, and separately measures feature extraction plus state comparison for one cell. Its **detector-only speed estimate** uses:
+
+`predicted frames/s = 1,000,000 / (capture-and-copy µs + cell-count × one-cell µs)`
+
+Enter a proposed number of cells for a line-shaped block. This calculation excludes HTTP service and preview transfer, the sketch's deliberate 100 ms capture pacing, radio state messages, and multi-cell bookkeeping. It is an approximation: cells with stronger texture can take longer to analyse than a blank test cell, overlapping cells may revisit pixels, and camera capture time may change under load. The hotspot is still active while the times are measured. The measured page-open fps and the detector-only estimate answer different questions.
+
+The **Compare circle and square** button runs both feature extractors repeatedly on the same cached frame and reports microseconds and sampled pixels for each. It does not change the active sensor or baseline. A generic polygon is not benchmarked yet. A polygon tested point-by-point every frame would add boundary work; one converted to pixel spans at setup time can be processed similarly to a circle or square. For the planned block editor, the simpler model is many small cells along a drawn line, with one block event when any cell has a sustained change. The block clears only when all cells are clear; if none changed but a cell is unknown, the block is unknown.
+
+## Current limits
+
+- The ESP32-CAM's grayscale capture while Wi-Fi is active may be slower or less reliable than JPEG capture on some sensor/board combinations, especially at high resolution. The page reports actual frame rate and capture failures; 10 fps is a measurement goal, not a claim for this sketch.
+- Baseline capture uses one frame. The orientation approach should resist uniform brightness or contrast scaling, but changing light direction, shadows, reflections, saturation, camera movement, and noise can change measured angles. A vehicle with the same dominant angles as the background can be missed. Test these cases before claiming illumination independence.
+- One active ROI is supported. The page transfers raw grayscale frames over the hotspot for preview; this is separate from the intended ESP-NOW state-message path.
+- The default hotspot password and unencrypted HTTP are for local testing only.
+
+Pin maps follow [Espressif's Arduino camera example](https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/camera_pins.h). The [Espressif camera driver](https://github.com/espressif/esp32-camera/blob/master/README.md) documents PSRAM and grayscale/JPEG considerations.
