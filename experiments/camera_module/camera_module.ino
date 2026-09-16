@@ -1,4 +1,4 @@
-#define CAMERA_ANGLE_EXPERIMENT_VERSION "0.7.0"
+#define CAMERA_ANGLE_EXPERIMENT_VERSION "0.12.0"
 
 /*
   Railway camera angle experiment
@@ -73,6 +73,8 @@ uint32_t captureFailures = 0;
 uint32_t processingUs = 0;
 uint32_t analysisUs = 0;
 uint32_t captureUs = 0;
+uint32_t frameGetUs = 0;
+uint32_t frameCopyUs = 0;
 float estimatedCaptureUs = 0;
 float estimatedCellUs = 0;
 float measuredFps = 0;
@@ -82,7 +84,7 @@ struct Region {
   int y = 120;
   int radius = 5;
   int gradientMin = 80;               // Quality floor, not an angle-selection threshold
-  float threshold = 0.30f;
+  float threshold = 0.20f;
   int angleTolerance = 10;
   bool circle = true;
 } region;
@@ -93,6 +95,9 @@ struct Features {
   uint32_t edges = 0;
   uint32_t samples = 0;
   uint32_t graySum = 0;
+  uint32_t whitePixels = 0;
+  uint16_t medianGradient = 0;
+  uint16_t upperGradient = 0;
   float meanGray = 0;
   uint8_t minGray = 255;
   uint8_t maxGray = 0;
@@ -105,10 +110,42 @@ struct Features {
   bool quality = false;
 };
 
+struct CellBreakdown {
+  uint32_t firstPassUs = 0;
+  uint32_t secondPassUs = 0;
+  uint32_t peaksUs = 0;
+  uint32_t compareUs = 0;
+} cellTiming;
+
 Features currentFeatures;
 Features baselineFeatures;
+Features flaggedDiagnostics;
+uint32_t flaggedDiagnosticUs = 0;
+bool hasFlaggedDiagnostics = false;
+struct Projection {
+  uint32_t bucket[MAX_PEAKS + 1] = {}; // Reference peaks, then all other directions.
+};
+struct ReferenceDirection {
+  int16_t x = 0, y = 0; // Q8 unit vector, sign ignored for 0-180 degree edges.
+};
+struct EdgeAnchor {
+  int16_t x = 0, y = 0;
+};
+constexpr int MAX_EDGE_ANCHORS = 2;
+constexpr int ANCHOR_SEARCH_RADIUS = 2;
+EdgeAnchor edgeAnchors[MAX_EDGE_ANCHORS];
+uint8_t edgeAnchorCount = 0;
+uint8_t edgeAnchorsMatched = 0;
+uint8_t edgeAnchorMatchedMask = 0;
+float edgeAnchorScore = 0;
+ReferenceDirection referenceDirection[MAX_PEAKS];
+Projection referenceByTolerance[21];
+Projection liveProjection;
+uint8_t toleranceTanQ8[21];
 bool hasBaseline = false;
+bool exposureUnreliable = false;
 float changeScore = 0;
+float edgeTailScore = 0;
 bool changed = false;
 int changedFrames = 0;
 int clearFrames = 0;
@@ -121,15 +158,22 @@ uint8_t matchedLiveMask = 0;
 // PSRAM preserves frames that the browser's slower polling would otherwise miss.
 struct FrameLog {
   uint32_t attempt, frame, uptimeMs, captureUs, cellUs;
+  uint32_t diagnosticUs;
+  uint32_t getUs, copyUs, firstPassUs, secondPassUs, peaksUs, compareUs;
   uint32_t configRevision, baselineRevision;
   uint16_t x, y, radius, contrastFloor, samples, edges, maxGradient;
-  uint16_t referenceEdges, enterFrames, clearFrames;
+  uint16_t referenceEdges, referenceWhitePixels, liveWhitePixels, enterFrames, clearFrames;
+  uint16_t referenceMedianGradient, referenceUpperGradient;
+  uint16_t liveMedianGradient, liveUpperGradient;
   uint8_t shape, tolerance, captureOk, hasReference, changed;
   uint8_t referenceKind, liveKind, minGray, maxGray;
-  float threshold, score, meanGray, referenceMeanGray;
+  uint8_t projectionMode, exposureUnreliable, anchorCount, anchorsMatched, anchorMatchedMask;
+  int16_t anchorX[MAX_EDGE_ANCHORS], anchorY[MAX_EDGE_ANCHORS];
+  float threshold, score, edgeTailScore, anchorScore, meanGray, referenceMeanGray;
   float referenceAngles[MAX_PEAKS], liveAngles[MAX_PEAKS];
   float referenceShares[MAX_PEAKS], liveShares[MAX_PEAKS];
   uint16_t referenceHist[BINS], liveHist[BINS];
+  uint16_t referenceBucket[MAX_PEAKS + 1], liveBucket[MAX_PEAKS + 1];
 };
 FrameLog *frameLog = nullptr;
 uint16_t logCapacity = 0, logCount = 0, logHead = 0;
@@ -140,7 +184,8 @@ uint8_t featureKind(const Features &f) {
   return f.quality ? 2 : 1;  // oriented or unstructured texture
 }
 const char *kindName(uint8_t kind) {
-  return kind == 0 ? "blank" : kind == 1 ? "texture" : kind == 2 ? "oriented" : "none";
+  return kind == 0 ? "blank" : kind == 1 ? "texture" : kind == 2 ? "oriented"
+    : kind == 4 ? "projected" : "none";
 }
 
 void appendFrameLog(bool captureOk) {
@@ -152,6 +197,15 @@ void appendFrameLog(bool captureOk) {
   entry.uptimeMs = millis();
   entry.captureUs = captureUs;
   entry.cellUs = captureOk ? analysisUs : 0;
+  entry.diagnosticUs = captureOk ? flaggedDiagnosticUs : 0;
+  entry.getUs = frameGetUs;
+  entry.copyUs = frameCopyUs;
+  if (captureOk) {
+    entry.firstPassUs = cellTiming.firstPassUs;
+    entry.secondPassUs = cellTiming.secondPassUs;
+    entry.peaksUs = cellTiming.peaksUs;
+    entry.compareUs = cellTiming.compareUs;
+  }
   entry.configRevision = configRevision;
   entry.baselineRevision = baselineRevision;
   entry.x = region.x; entry.y = region.y; entry.radius = region.radius;
@@ -162,13 +216,35 @@ void appendFrameLog(bool captureOk) {
   entry.captureOk = captureOk;
   entry.hasReference = hasBaseline;
   entry.changed = changed;
+  entry.exposureUnreliable = exposureUnreliable;
   entry.enterFrames = (uint16_t)min(changedFrames, 65535);
   entry.clearFrames = (uint16_t)min(clearFrames, 65535);
   entry.score = hasBaseline && captureOk ? changeScore : 0;
+  entry.edgeTailScore = hasBaseline && captureOk ? edgeTailScore : 0;
+  entry.anchorScore = hasBaseline && captureOk ? edgeAnchorScore : 0;
+  entry.anchorCount = hasBaseline ? edgeAnchorCount : 0;
+  entry.anchorsMatched = hasBaseline && captureOk ? edgeAnchorsMatched : 0;
+  entry.anchorMatchedMask = hasBaseline && captureOk ? edgeAnchorMatchedMask : 0;
+  for (int i = 0; i < MAX_EDGE_ANCHORS; ++i) {
+    entry.anchorX[i] = i < edgeAnchorCount ? edgeAnchors[i].x : -1;
+    entry.anchorY[i] = i < edgeAnchorCount ? edgeAnchors[i].y : -1;
+  }
   entry.referenceKind = hasBaseline ? featureKind(baselineFeatures) : 3;
-  entry.liveKind = captureOk ? featureKind(currentFeatures) : 3;
+  entry.liveKind = captureOk
+    ? (hasBaseline && baselineFeatures.quality && currentFeatures.textured
+       ? 4 : featureKind(currentFeatures)) : 3;
+  entry.projectionMode = hasBaseline && baselineFeatures.quality;
+  if (entry.projectionMode) {
+    for (int i = 0; i <= MAX_PEAKS; ++i) {
+      entry.referenceBucket[i] = referenceByTolerance[region.angleTolerance].bucket[i];
+      if (captureOk) entry.liveBucket[i] = liveProjection.bucket[i];
+    }
+  }
   if (hasBaseline) {
     entry.referenceEdges = baselineFeatures.edges;
+    entry.referenceWhitePixels = baselineFeatures.whitePixels;
+    entry.referenceMedianGradient = baselineFeatures.medianGradient;
+    entry.referenceUpperGradient = baselineFeatures.upperGradient;
     entry.referenceMeanGray = baselineFeatures.meanGray;
     for (int i = 0; i < BINS; ++i)
       entry.referenceHist[i] = baselineFeatures.hist[i];
@@ -180,15 +256,19 @@ void appendFrameLog(bool captureOk) {
   if (captureOk) {
     entry.samples = currentFeatures.samples;
     entry.edges = currentFeatures.edges;
+    entry.liveWhitePixels = currentFeatures.whitePixels;
+    entry.liveMedianGradient = currentFeatures.medianGradient;
+    entry.liveUpperGradient = currentFeatures.upperGradient;
     entry.maxGradient = currentFeatures.maxGradient;
     entry.meanGray = currentFeatures.meanGray;
     entry.minGray = currentFeatures.minGray;
     entry.maxGray = currentFeatures.maxGray;
+    const Features &details = hasFlaggedDiagnostics ? flaggedDiagnostics : currentFeatures;
     for (int i = 0; i < BINS; ++i)
-      entry.liveHist[i] = currentFeatures.hist[i];
+      entry.liveHist[i] = details.hist[i];
     for (int i = 0; i < MAX_PEAKS; ++i) {
-      entry.liveAngles[i] = currentFeatures.peakAngle[i];
-      entry.liveShares[i] = currentFeatures.peakShare[i];
+      entry.liveAngles[i] = details.peakAngle[i];
+      entry.liveShares[i] = details.peakShare[i];
     }
   }
   logHead = (logHead + 1) % logCapacity;
@@ -203,6 +283,21 @@ void gradientAt(const uint8_t *pixels, int p, int &gx, int &gy) {
   gy = -pixels[p - WIDTH - 1] - 2 * pixels[p - WIDTH]
      - pixels[p - WIDTH + 1] + pixels[p + WIDTH - 1]
      + 2 * pixels[p + WIDTH] + pixels[p + WIDTH + 1];
+}
+
+int projectionBucket(int gx, int gy, int tolerance) {
+  int best = MAX_PEAKS;
+  int32_t bestDot = -1;
+  const int32_t tanQ8 = toleranceTanQ8[tolerance];
+  for (int i = 0; i < baselineFeatures.peakCount; ++i) {
+    const int32_t dot = abs(gx * referenceDirection[i].x + gy * referenceDirection[i].y);
+    const int32_t cross = abs(gy * referenceDirection[i].x - gx * referenceDirection[i].y);
+    if (cross * 256 <= dot * tanQ8 && dot > bestDot) {
+      best = i;
+      bestDot = dot;
+    }
+  }
+  return best;
 }
 
 void selectDominantPeaks(Features &f) {
@@ -258,8 +353,12 @@ void selectDominantPeaks(Features &f) {
   f.quality = f.peakCount > 0;
 }
 
-Features analyse(const uint8_t *pixels) {
+Features analyse(const uint8_t *pixels, CellBreakdown *timing, bool projected) {
   Features f;
+  uint16_t magnitudeBins[64] = {};
+  if (projected) liveProjection = Projection();
+  if (timing) *timing = CellBreakdown();
+  const uint32_t firstStartUs = timing ? micros() : 0;
   const int yStart = max(1, region.y - region.radius);
   const int yEnd = min(HEIGHT - 2, region.y + region.radius - (region.circle ? 0 : 1));
   // First pass: find the strongest local gradient. Angle selection then uses
@@ -277,17 +376,32 @@ Features analyse(const uint8_t *pixels) {
       const int p = y * WIDTH + x;
       int gx, gy;
       gradientAt(pixels, p, gx, gy);
+      const int magnitude = abs(gx) + abs(gy);
       ++f.samples;
       const uint8_t gray = pixels[p];
       f.graySum += gray;
       if (gray < f.minGray) f.minGray = gray;
       if (gray > f.maxGray) f.maxGray = gray;
-      f.maxGradient = max(f.maxGradient, abs(gx) + abs(gy));
+      if (gray >= 250) ++f.whitePixels;
+      f.maxGradient = max(f.maxGradient, magnitude);
+      ++magnitudeBins[min(magnitude >> 4, 63)];
     }
   }
+  uint32_t cumulative = 0;
+  for (int bin = 0; bin < 64; ++bin) {
+    cumulative += magnitudeBins[bin];
+    if (!f.medianGradient && cumulative >= (f.samples + 1) / 2)
+      f.medianGradient = bin * 16 + 8;
+    if (cumulative >= (f.samples * 95 + 99) / 100) {
+      f.upperGradient = bin * 16 + 8;
+      break;
+    }
+  }
+  if (timing) timing->firstPassUs = micros() - firstStartUs;
   if (f.samples) f.meanGray = (float)f.graySum / f.samples;
   if (f.maxGradient < region.gradientMin) return f;
   const int relativeMinimum = max(region.gradientMin, f.maxGradient / 4);
+  const uint32_t secondStartUs = timing ? micros() : 0;
   // Second pass: count orientations, not gradient strengths.
   for (int y = yStart; y <= yEnd; ++y) {
     int halfWidth = region.radius;
@@ -302,6 +416,11 @@ Features analyse(const uint8_t *pixels) {
       int gx, gy;
       gradientAt(pixels, p, gx, gy);
       if (abs(gx) + abs(gy) < relativeMinimum) continue;
+      if (projected) {
+        ++liveProjection.bucket[projectionBucket(gx, gy, region.angleTolerance)];
+        ++f.edges;
+        continue;
+      }
       float angle = atan2f((float)gy, (float)gx) * 57.2957795f;
       if (angle < 0) angle += 180.0f;
       if (angle >= 180.0f) angle -= 180.0f;
@@ -312,12 +431,16 @@ Features analyse(const uint8_t *pixels) {
       ++f.edges;
     }
   }
+  if (timing) timing->secondPassUs = micros() - secondStartUs;
   // A thin rail or roof line may occupy only a small fraction of a large
   // cell. Requiring a percentage of cell area forced the contrast floor down
   // until weak background texture was counted as edges.
   if (f.edges < 8) return f;
   f.textured = true;
+  if (projected) return f; // No live peak extraction in the monitored path.
+  const uint32_t peaksStartUs = timing ? micros() : 0;
   selectDominantPeaks(f);
+  if (timing) timing->peaksUs = micros() - peaksStartUs;
   return f;
 }
 
@@ -338,6 +461,108 @@ float histogramDistance(const Features &a, const Features &b) {
                     - (float)bWindow / (4 * b.edges));
   }
   return 0.5f * distance;
+}
+
+float projectionDistance() {
+  if (!baselineFeatures.edges || !currentFeatures.edges) return 1.0f;
+  const Projection &reference = referenceByTolerance[region.angleTolerance];
+  float distance = 0;
+  for (int i = 0; i <= MAX_PEAKS; ++i) {
+    distance += fabsf((float)reference.bucket[i] / baselineFeatures.edges
+                    - (float)liveProjection.bucket[i] / currentFeatures.edges);
+  }
+  return 0.5f * distance;
+}
+
+void prepareReferenceProjection(const uint8_t *pixels) {
+  if (!baselineFeatures.quality) return;
+  for (int i = 0; i < baselineFeatures.peakCount; ++i) {
+    const float radians = baselineFeatures.peakAngle[i] * 0.01745329252f;
+    referenceDirection[i].x = (int16_t)lroundf(cosf(radians) * 256);
+    referenceDirection[i].y = (int16_t)lroundf(sinf(radians) * 256);
+  }
+  const int selectedTolerance = region.angleTolerance;
+  for (int tolerance = 0; tolerance <= 20; ++tolerance) {
+    region.angleTolerance = tolerance;
+    analyse(pixels, nullptr, true);
+    referenceByTolerance[tolerance] = liveProjection;
+  }
+  region.angleTolerance = selectedTolerance;
+  liveProjection = referenceByTolerance[selectedTolerance];
+}
+
+bool insideRegion(int x, int y) {
+  if (x <= 0 || x >= WIDTH - 1 || y <= 0 || y >= HEIGHT - 1) return false;
+  const int dx = x - region.x, dy = y - region.y;
+  return region.circle ? dx * dx + dy * dy <= region.radius * region.radius
+                       : abs(dx) < region.radius && abs(dy) < region.radius;
+}
+
+bool matchesAnchorDirection(int gx, int gy) {
+  const ReferenceDirection &direction = referenceDirection[0];
+  const int32_t dot = abs(gx * direction.x + gy * direction.y);
+  const int32_t cross = abs(gy * direction.x - gx * direction.y);
+  // A small floor tolerates integer gradient noise even when the angle slider is zero.
+  return cross * 256 <= dot * toleranceTanQ8[max(3, region.angleTolerance)];
+}
+
+void captureEdgeAnchors(const uint8_t *pixels) {
+  edgeAnchorCount = 0;
+  edgeAnchorsMatched = 0;
+  edgeAnchorMatchedMask = 0;
+  edgeAnchorScore = 0;
+  if (!baselineFeatures.quality) return;
+  const int minimumMagnitude = max(1, baselineFeatures.maxGradient / 4);
+  const int minimumSeparation = max(5, region.radius / 2);
+  for (int anchor = 0; anchor < MAX_EDGE_ANCHORS; ++anchor) {
+    int bestMagnitude = -1;
+    EdgeAnchor best;
+    for (int y = max(1, region.y - region.radius); y <= min(HEIGHT - 2, region.y + region.radius); ++y) {
+      for (int x = max(1, region.x - region.radius); x <= min(WIDTH - 2, region.x + region.radius); ++x) {
+        if (!insideRegion(x, y)) continue;
+        if (anchor && (x - edgeAnchors[0].x) * (x - edgeAnchors[0].x)
+                     + (y - edgeAnchors[0].y) * (y - edgeAnchors[0].y)
+                     < minimumSeparation * minimumSeparation) continue;
+        int gx, gy;
+        gradientAt(pixels, y * WIDTH + x, gx, gy);
+        const int magnitude = abs(gx) + abs(gy);
+        if (magnitude >= minimumMagnitude && magnitude > bestMagnitude && matchesAnchorDirection(gx, gy)) {
+          bestMagnitude = magnitude;
+          best = {(int16_t)x, (int16_t)y};
+        }
+      }
+    }
+    if (bestMagnitude < 0) break;
+    edgeAnchors[edgeAnchorCount++] = best;
+  }
+}
+
+void compareEdgeAnchors(const uint8_t *pixels) {
+  edgeAnchorsMatched = 0;
+  edgeAnchorMatchedMask = 0;
+  edgeAnchorScore = 0;
+  if (!edgeAnchorCount || !currentFeatures.textured) return;
+  const int minimumMagnitude = max(1, currentFeatures.maxGradient / 4);
+  for (int anchor = 0; anchor < edgeAnchorCount; ++anchor) {
+    bool found = false;
+    for (int dy = -ANCHOR_SEARCH_RADIUS; dy <= ANCHOR_SEARCH_RADIUS && !found; ++dy) {
+      for (int dx = -ANCHOR_SEARCH_RADIUS; dx <= ANCHOR_SEARCH_RADIUS; ++dx) {
+        const int x = edgeAnchors[anchor].x + dx, y = edgeAnchors[anchor].y + dy;
+        if (!insideRegion(x, y)) continue;
+        int gx, gy;
+        gradientAt(pixels, y * WIDTH + x, gx, gy);
+        if (abs(gx) + abs(gy) >= minimumMagnitude && matchesAnchorDirection(gx, gy)) {
+          found = true;
+          break;
+        }
+      }
+    }
+    if (found) {
+      ++edgeAnchorsMatched;
+      edgeAnchorMatchedMask |= 1U << anchor;
+    }
+  }
+  edgeAnchorScore = (float)(edgeAnchorCount - edgeAnchorsMatched) / edgeAnchorCount;
 }
 
 void searchAngleMatches(int reference, uint8_t usedCurrent, int count, float totalDelta,
@@ -369,6 +594,11 @@ void searchAngleMatches(int reference, uint8_t usedCurrent, int count, float tot
 
 void updateChange() {
   changeScore = 0;
+  edgeTailScore = 0;
+  edgeAnchorScore = 0;
+  edgeAnchorsMatched = 0;
+  edgeAnchorMatchedMask = 0;
+  exposureUnreliable = false;
   matchedLiveMask = 0;
   for (int i = 0; i < MAX_PEAKS; ++i) {
     matchedIndex[i] = nearestIndex[i] = -1;
@@ -378,10 +608,29 @@ void updateChange() {
     changedFrames = clearFrames = 0;
     return;
   }
+  // A sudden bright, featureless cell has lost the visual evidence needed to
+  // distinguish glare from a pale vehicle. Suspend transitions and report an
+  // unknown observation instead of treating lost reference edges as occupied
+  // or allowing the existing occupied state to clear.
+  if (currentFeatures.samples && baselineFeatures.samples) {
+    const float liveWhite = (float)currentFeatures.whitePixels / currentFeatures.samples;
+    const float referenceWhite = (float)baselineFeatures.whitePixels / baselineFeatures.samples;
+    const bool brightened = currentFeatures.meanGray >= baselineFeatures.meanGray + 25.0f;
+    const bool clipped = liveWhite >= 0.40f && liveWhite >= referenceWhite + 0.25f;
+    const bool lostDetail = baselineFeatures.textured && !currentFeatures.textured
+      && currentFeatures.maxGradient * 2 < baselineFeatures.maxGradient;
+    if (brightened && (clipped || lostDetail)) {
+      exposureUnreliable = true;
+      changedFrames = clearFrames = 0;
+      return;
+    }
+  }
   if (!baselineFeatures.textured && !currentFeatures.textured) {
     changeScore = 0;
   } else if (baselineFeatures.textured != currentFeatures.textured) {
     changeScore = 1;
+  } else if (baselineFeatures.quality) {
+    changeScore = projectionDistance();
   } else if (!baselineFeatures.quality || !currentFeatures.quality) {
     // Textured cells without a stable dominant direction still have a
     // normalized orientation distribution that can be compared.
@@ -403,6 +652,26 @@ void updateChange() {
       if (matchedIndex[r] >= 0) matchedLiveMask |= 1U << matchedIndex[r];
     const int unionCount = baselineFeatures.peakCount + currentFeatures.peakCount - matches;
     changeScore = 1.0f - (float)matches / unionCount;
+  }
+  // A weakly oriented background such as carpet may retain much the same
+  // angle mix when a narrow object enters. A new concentration of steep edges
+  // is another signal. Comparing upper/median gradient ratios reduces the
+  // effect of uniform contrast scaling; require a real absolute increase too.
+  if (baselineFeatures.textured && currentFeatures.textured &&
+      baselineFeatures.samples >= 64 && currentFeatures.samples >= 64 &&
+      (!baselineFeatures.quality || baselineFeatures.peakShare[0] < 0.40f) &&
+      currentFeatures.upperGradient > baselineFeatures.upperGradient + 40) {
+    const float referenceTail = (float)(baselineFeatures.upperGradient + 8)
+      / (baselineFeatures.medianGradient + 8);
+    const float liveTail = (float)(currentFeatures.upperGradient + 8)
+      / (currentFeatures.medianGradient + 8);
+    if (liveTail > referenceTail)
+      edgeTailScore = 1.0f - referenceTail / liveTail;
+    changeScore = max(changeScore, edgeTailScore);
+  }
+  if (edgeAnchorCount && currentFeatures.textured) {
+    compareEdgeAnchors(grayFrame);
+    changeScore = max(changeScore, edgeAnchorScore);
   }
   // Compare every frame to the fixed empty background, not the previous frame:
   // a stopped vehicle must remain changed.
@@ -474,13 +743,18 @@ bool restartCameraAt(int index) {
   grayFrame = nullptr;
   frameReady = false;
   hasBaseline = false;
+  edgeAnchorCount = 0;
+  exposureUnreliable = false;
   changed = false;
   changedFrames = clearFrames = 0;
   currentFeatures = Features();
   baselineFeatures = Features();
   measuredFps = 0;
   lastCaptureMs = lastAttemptMs = 0;
-  processingUs = analysisUs = captureUs = 0;
+  processingUs = analysisUs = captureUs = frameGetUs = frameCopyUs = 0;
+  cellTiming = CellBreakdown();
+  hasFlaggedDiagnostics = false;
+  flaggedDiagnosticUs = 0;
   estimatedCaptureUs = estimatedCellUs = 0;
   if (!initCameraAt(index)) {
     // Keep the web app usable if a larger mode cannot allocate or initialize.
@@ -501,8 +775,12 @@ bool restartCameraAt(int index) {
 void captureAndAnalyse() {
   lastAttemptMs = millis();
   ++attemptSequence;
+  hasFlaggedDiagnostics = false;
+  flaggedDiagnosticUs = 0;
   const uint32_t startUs = micros();
   camera_fb_t *fb = esp_camera_fb_get();
+  frameGetUs = micros() - startUs;
+  frameCopyUs = 0;
   if (!fb) {
     ++captureFailures;
     captureUs = micros() - startUs;
@@ -519,7 +797,9 @@ void captureAndAnalyse() {
     appendFrameLog(false);
     return;
   }
+  const uint32_t copyStartUs = micros();
   memcpy(grayFrame, fb->buf, PIXELS);
+  frameCopyUs = micros() - copyStartUs;
   esp_camera_fb_return(fb);
   captureUs = micros() - startUs; // Camera acquisition plus preview-buffer copy.
   const uint32_t previousMs = lastCaptureMs;
@@ -531,14 +811,22 @@ void captureAndAnalyse() {
   ++frameId;
   frameReady = true;
   const uint32_t analysisStartUs = micros();
-  currentFeatures = analyse(grayFrame);
+  currentFeatures = analyse(grayFrame, &cellTiming, hasBaseline && baselineFeatures.quality);
+  const uint32_t compareStartUs = micros();
   updateChange();
+  cellTiming.compareUs = micros() - compareStartUs;
   analysisUs = micros() - analysisStartUs;
   processingUs = captureUs + analysisUs;
   estimatedCaptureUs = estimatedCaptureUs
     ? estimatedCaptureUs * 0.8f + captureUs * 0.2f : captureUs;
   estimatedCellUs = estimatedCellUs
     ? estimatedCellUs * 0.8f + analysisUs * 0.2f : analysisUs;
+  if (hasBaseline && baselineFeatures.quality && changeScore >= region.threshold) {
+    const uint32_t diagnosticStartUs = micros();
+    flaggedDiagnostics = analyse(grayFrame, nullptr, false);
+    flaggedDiagnosticUs = micros() - diagnosticStartUs;
+    hasFlaggedDiagnostics = true;
+  }
   appendFrameLog(true);
 }
 
@@ -559,14 +847,14 @@ label{display:block;margin:12px 0}input[type=range]{width:100%}
 button,select{background:#31475a;color:white;border:1px solid #688096;border-radius:5px;padding:8px}
 input[type=number]{background:#10202c;color:white;border:1px solid #688096;border-radius:5px;padding:7px;width:6em}
 button{cursor:pointer}.value{font-variant-numeric:tabular-nums}
-#state{font-size:1.3rem;font-weight:bold}.changed{color:#ffb45d}.clear{color:#72d7a2}
+#state{font-size:1.3rem;font-weight:bold}.changed{color:#ffb45d}.clear{color:#72d7a2}.unknown{color:#ffd37a}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
 th,td{text-align:left;padding:7px 5px;border-bottom:1px solid #405161}
 th{color:#b7c9d8}.match{color:#72d7a2}.miss{color:#ffb45d}
 details{margin-top:16px}summary{cursor:pointer;color:#b7d8f4}
 .log-scroll{overflow-x:auto;max-height:400px;overflow-y:auto}
 .log-scroll table{font-size:12px;white-space:nowrap}
-.log-scroll tr.flagged{background:#563c2d}.log-scroll tr.active{outline:1px solid #ffb45d}
+.log-scroll tr.flagged{background:#563c2d}.log-scroll tr.active{outline:1px solid #ffb45d}.log-scroll tr.unknown{background:#63552b}
 a.download{display:inline-block;background:#31475a;color:white;border:1px solid #688096;border-radius:5px;padding:8px;text-decoration:none}
 @media(max-width:700px){.grid{grid-template-columns:1fr}}
 </style>
@@ -591,21 +879,24 @@ a.download{display:inline-block;background:#31475a;color:white;border:1px solid 
 <label>Radius / half-width: <span id="radiusValue">5</span> px <input id="radius" type="range" min="3" max="50" value="5"></label>
 <label>Minimum usable contrast: <span id="gradientValue">80</span> <input id="gradient" type="range" min="10" max="500" step="10" value="80"></label>
 <label>Angle match tolerance: <span id="toleranceValue">10</span>° <input id="tolerance" type="range" min="0" max="20" step="1" value="10"></label>
-<label>Angle-set mismatch threshold: <span id="thresholdValue">0.30</span> <input id="threshold" type="range" min="0.05" max="1.00" step="0.01" value="0.30"></label>
+<label>Pattern mismatch threshold: <span id="thresholdValue">0.20</span> <input id="threshold" type="range" min="0.05" max="1.00" step="0.01" value="0.20"></label>
 <button id="baseline">Capture empty-track baseline</button>
 <p>Blank cells are valid references: new texture in one is a change. Moving or resizing the cell, or changing its contrast setting, clears the baseline. A 5 px radius circle or half-width square examines roughly 80 or 100 pixels.</p>
 </section><section class="panel">
 <div id="state">No baseline</div>
 <p id="metrics">Waiting for data…</p>
 <h2>Background comparison</h2>
-<table><thead><tr><th>Reference angle</th><th>Live angle</th><th>Difference</th><th>Result</th></tr></thead>
+<table><thead><tr><th>Reference angle</th><th>Live measurement</th><th>Difference</th><th>Result</th></tr></thead>
 <tbody id="angleRows"><tr><td colspan="4">Capture a background reference to begin.</td></tr></tbody></table>
-<p>A blank reference is compared with texture presence. Where there are reliable angles, the percentage beside each is its share of strong gradients. Angles describe the gradient across an edge, so a rail or sleeper line runs 90° from the displayed angle. Angles wrap at 180°: 179° and 1° differ by 2°.</p>
+<p>For an oriented reference, the detector tracks up to three dominant angles. It also stores up to two separated points on the strongest reference edge and looks for a matching gradient within 2 pixels of each point. Blue markers show those points; green means matched and orange means missing. The raw histogram below is recalculated for display and does not affect detection. A blank reference is compared with texture presence. Angles describe the gradient across an edge, so a rail or sleeper line runs 90° from the displayed angle.</p>
 <details><summary>Show raw angle histogram</summary>
 <canvas id="hist" width="540" height="260"></canvas>
-<p>Orange bars: live gradient counts. Blue outlines: background counts. Numbered markers show the selected reference peaks. Counts help diagnose the cell; matching uses the refined angles in the table above.</p>
+<p>Orange bars: live gradient counts. Blue outlines: background counts. Numbered markers show the selected reference peaks. The live histogram is calculated when this page requests diagnostics; the fast detector uses the reference-direction support shown above.</p>
 </details>
 <p id="timing"></p>
+<h3>Last-frame timing breakdown</h3>
+<p id="timingBreakdown">Waiting for a frame…</p>
+<p>The camera wait includes acquisition. The frame copy keeps a preview image for this experiment. Cell passes measure gradient strength, then count qualifying angles; peak selection and state comparison follow.</p>
 </section></div>
 <section class="panel" style="margin-top:18px">
 <h2>Detector-only speed estimate</h2>
@@ -619,9 +910,9 @@ a.download{display:inline-block;background:#31475a;color:white;border:1px solid 
 <section class="panel" style="margin-top:18px">
 <h2>Frame comparison log</h2>
 <p id="logStatus">Loading log…</p>
-<p>Each capture attempt is recorded on the camera. Orange rows met the mismatch threshold; outlined rows reached the reported change state. Download the CSV after reproducing a false alarm. It contains the settings, brightness, gradient counts, selected angles and all angle bins for each frame.</p>
+<p>Each capture attempt is recorded on the camera. Orange rows met the mismatch threshold; outlined rows reached the reported change state; yellow rows had unreliable image detail, so comparison was suspended. Download the CSV after reproducing a false alarm. It contains the settings, brightness, gradient counts, selected angles and diagnostic angle bins.</p>
 <a class="download" href="/log.csv">Download CSV</a> <button id="clearLog">Clear log</button>
-<div class="log-scroll"><table><thead><tr><th>Attempt</th><th>Time s</th><th>Reference → live</th><th>Angle °</th><th>Mean gray</th><th>Edges</th><th>Max gradient</th><th>Score / limit</th><th>Capture µs</th><th>Cell µs</th></tr></thead><tbody id="logRows"></tbody></table></div>
+<div class="log-scroll"><table><thead><tr><th>Attempt</th><th>Time s</th><th>Reference → live</th><th>Angle / support</th><th>Mean gray</th><th>Edges</th><th>Max gradient</th><th>Score / limit</th><th>Capture µs</th><th>Cell µs</th></tr></thead><tbody id="logRows"></tbody></table></div>
 </section>
 </main>
 <script>
@@ -631,6 +922,7 @@ const imageStatus=document.querySelector('#imageStatus');
 const state=document.querySelector('#state');
 const metrics=document.querySelector('#metrics');
 const timing=document.querySelector('#timing');
+const timingBreakdown=document.querySelector('#timingBreakdown');
 const shape=document.querySelector('#shape');
 const radius=document.querySelector('#radius');
 const gradient=document.querySelector('#gradient');
@@ -700,6 +992,10 @@ function overlay(){
   else vctx.rect(x-r,y-r,2*r,2*r);
   vctx.stroke();vctx.beginPath();vctx.moveTo(x-5,y);vctx.lineTo(x+5,y);
   vctx.moveTo(x,y-5);vctx.lineTo(x,y+5);vctx.stroke();
+  if(latestStats?.anchors)for(const anchor of latestStats.anchors){
+    vctx.beginPath();vctx.arc(anchor.x,anchor.y,3,0,Math.PI*2);
+    vctx.strokeStyle=anchor.matched?'#84e3b5':'#ffb45d';vctx.lineWidth=2;vctx.stroke();
+  }
 }
 async function loadFrame(){
   if(frameBusy)return;frameBusy=true;
@@ -769,6 +1065,10 @@ function renderAngleComparison(d){
     addAngleRow('—','—','—','Capture a reference',false);
     return;
   }
+  if(d.exposure_unreliable){
+    addAngleRow('Reference retained','Washed-out image','—','Comparison suspended',false);
+    return;
+  }
   if(!d.reference_textured){
     addAngleRow('Blank background',d.live_textured?'Texture present':'Blank',
       '—',d.live_textured?'New texture':'Same blank background',!d.live_textured);
@@ -776,6 +1076,22 @@ function renderAngleComparison(d){
   }
   if(!d.live_textured){
     addAngleRow('Texture present','Blank','—','Background texture disappeared',false);
+    return;
+  }
+  if(d.projection_mode){
+    for(let i=0;i<d.reference_angles.length;i++){
+      const before=d.reference_buckets[i],now=d.live_buckets[i];
+      const stable=Math.abs(now-before)<0.10;
+      addAngleRow((i+1)+'. '+d.reference_angles[i].toFixed(1)+'°',
+        (now*100).toFixed(0)+'% nearby',((now-before)*100).toFixed(0)+' percentage points',
+        stable?'Stable':'Support shifted (from '+(before*100).toFixed(0)+'%)',stable);
+    }
+    const other=d.reference_buckets.length-1;
+    const otherStable=Math.abs(d.live_buckets[other]-d.reference_buckets[other])<0.10;
+    addAngleRow('Other directions',(d.live_buckets[other]*100).toFixed(0)+'%',
+      ((d.live_buckets[other]-d.reference_buckets[other])*100).toFixed(0)+' percentage points',
+      otherStable?'Stable':'Support shifted (from '+(d.reference_buckets[other]*100).toFixed(0)+'%)',
+      otherStable);
     return;
   }
   if(!d.reference_has_angles||!d.quality){
@@ -836,19 +1152,28 @@ async function loadStats(){
     document.querySelector('#version').textContent=d.version;
     currentResolution=d.resolution;
     if(!resolution.dataset.initialized){resolution.value=d.resolution;resolution.dataset.initialized='1'}
-    state.textContent=!d.ready?'Camera unavailable':d.age_ms>1000?'Camera frame stale':!d.has_baseline?'No baseline':d.changed?'CHANGE DETECTED':'Background-like';
-    state.className=!d.ready||d.age_ms>1000||d.changed?'changed':'clear';
-    metrics.textContent=d.has_baseline
+    state.textContent=!d.ready?'Camera unavailable':d.age_ms>1000?'Camera frame stale':!d.has_baseline?'No baseline':d.exposure_unreliable?'IMAGE UNRELIABLE':d.changed?'CHANGE DETECTED':'Background-like';
+    state.className=d.exposure_unreliable?'unknown':!d.ready||d.age_ms>1000||d.changed?'changed':'clear';
+    metrics.textContent=d.exposure_unreliable
+      ?'Possible overexposure: comparison and state transitions suspended until usable detail returns'
+      :d.has_baseline
       ?'Pattern mismatch '+d.score.toFixed(3)+' / change threshold '+d.threshold.toFixed(2)
-        +(d.reference_has_angles&&d.quality?' · angle tolerance ±'+d.tolerance+'°':'')
+        +(d.edge_tail_score>0?' · new-edge score '+d.edge_tail_score.toFixed(3):'')
+        +(d.anchor_count?' · edge points '+d.anchors_matched+'/'+d.anchor_count+' · position score '+d.anchor_score.toFixed(3):' · no stable edge points')
+        +(d.projection_mode?' · reference-direction tolerance ±'+d.tolerance+'°':'')
       :'Capture a blank or textured background reference';
     renderAngleComparison(d);
     timing.textContent=(d.live_textured?'Textured':'Blank')+' live cell · '
       +d.samples+' sampled pixels · '+d.edges+' strong gradients'
       +' · strongest gradient '+d.max_gradient+' / contrast floor '+d.gradient_min
+      +' · near-white pixels '+(d.white_fraction*100).toFixed(0)+'%'
       +' · '+d.capture_us+' µs capture + copy · '+d.analysis_us+' µs one cell'
       +' · '+d.processing_us+' µs total · '+d.fps.toFixed(1)
       +' fps · '+d.capture_failures+' capture failures';
+    timingBreakdown.textContent='Camera wait '+d.frame_get_us+' µs · frame copy '
+      +d.frame_copy_us+' µs · first cell pass '+d.first_pass_us
+      +' µs · angle pass '+d.second_pass_us+' µs · peak selection '
+      +d.peaks_us+' µs · comparison '+d.compare_us+' µs';
     drawHistogram(d);
   }catch(e){timing.textContent=e.message}
   statsBusy=false;
@@ -866,13 +1191,15 @@ async function loadLog(){
     for(const e of d.rows.slice().reverse()){
       const row=document.createElement('tr');
       if(e.ok&&e.reference!=='none'&&e.score>=e.threshold)row.classList.add('flagged');
+      if(e.exposure_unreliable)row.classList.add('unknown');
       if(e.changed)row.classList.add('active');
       const values=[e.attempt,(e.uptime_ms/1000).toFixed(1),
         e.ok?e.reference+' → '+e.live:'Capture failed',
-        e.reference==='oriented'||e.live==='oriented'
-          ?e.reference_angle.toFixed(1)+' → '+e.live_angle.toFixed(1):'—',
+        e.projection_mode?e.reference_angle.toFixed(1)+'° → '+(e.live_support*100).toFixed(0)+'%'
+          :e.reference==='oriented'||e.live==='oriented'
+            ?e.reference_angle.toFixed(1)+' → '+e.live_angle.toFixed(1):'—',
         e.ok?e.reference_mean_gray.toFixed(1)+' → '+e.mean_gray.toFixed(1):'—',
-        e.edges,e.max_gradient,e.reference==='none'?'—':e.score.toFixed(3)+' / '+e.threshold.toFixed(2),
+        e.edges,e.max_gradient,e.exposure_unreliable?'Unreliable':e.reference==='none'?'—':e.score.toFixed(3)+' / '+e.threshold.toFixed(2)+(e.edge_tail_score?'; edge '+e.edge_tail_score.toFixed(2):'')+(e.anchor_count?'; points '+e.anchors_matched+'/'+e.anchor_count:''),
         e.capture_us,e.cell_us];
       for(const value of values){const cell=document.createElement('td');cell.textContent=value;row.appendChild(cell)}
       logRows.appendChild(row);
@@ -909,6 +1236,10 @@ void handleFrame() {
 }
 
 void handleStats() {
+  // Full angles and histogram are only needed for the diagnostic page. They
+  // are deliberately outside the timed per-frame detector path.
+  const Features displayFeatures = frameReady && hasBaseline && baselineFeatures.quality
+    ? analyse(grayFrame, nullptr, false) : currentFeatures;
   String out;
   out.reserve(1200);
   out = "{\"frame\":" + String(frameId)
@@ -921,6 +1252,12 @@ void handleStats() {
       + ",\"processing_us\":" + String(processingUs)
       + ",\"analysis_us\":" + String(analysisUs)
       + ",\"capture_us\":" + String(captureUs)
+      + ",\"frame_get_us\":" + String(frameGetUs)
+      + ",\"frame_copy_us\":" + String(frameCopyUs)
+      + ",\"first_pass_us\":" + String(cellTiming.firstPassUs)
+      + ",\"second_pass_us\":" + String(cellTiming.secondPassUs)
+      + ",\"peaks_us\":" + String(cellTiming.peaksUs)
+      + ",\"compare_us\":" + String(cellTiming.compareUs)
       + ",\"estimated_capture_us\":" + String(estimatedCaptureUs, 1)
       + ",\"estimated_cell_us\":" + String(estimatedCellUs, 1)
       + ",\"age_ms\":" + String(frameReady ? millis() - lastCaptureMs : 0)
@@ -928,25 +1265,35 @@ void handleStats() {
       + ",\"log_count\":" + String(logCount)
       + ",\"log_capacity\":" + String(logCapacity)
       + ",\"has_baseline\":" + (hasBaseline ? "true" : "false")
+      + ",\"exposure_unreliable\":" + (exposureUnreliable ? "true" : "false")
       + ",\"changed\":" + (changed ? "true" : "false")
       + ",\"score\":" + String(changeScore, 4)
+      + ",\"edge_tail_score\":" + String(edgeTailScore, 4)
+      + ",\"anchor_score\":" + String(edgeAnchorScore, 4)
+      + ",\"anchor_count\":" + String(edgeAnchorCount)
+      + ",\"anchors_matched\":" + String(edgeAnchorsMatched)
       + ",\"threshold\":" + String(region.threshold, 3)
       + ",\"tolerance\":" + String(region.angleTolerance)
-      + ",\"quality\":" + (currentFeatures.quality ? "true" : "false")
+      + ",\"projection_mode\":" + (hasBaseline && baselineFeatures.quality ? "true" : "false")
+      + ",\"quality\":" + (displayFeatures.quality ? "true" : "false")
       + ",\"reference_has_angles\":" + (hasBaseline && baselineFeatures.quality ? "true" : "false")
       + ",\"reference_textured\":" + (hasBaseline && baselineFeatures.textured ? "true" : "false")
       + ",\"live_textured\":" + (currentFeatures.textured ? "true" : "false")
-      + ",\"max_gradient\":" + String(currentFeatures.maxGradient)
+      + ",\"max_gradient\":" + String(displayFeatures.maxGradient)
       + ",\"gradient_min\":" + String(region.gradientMin)
-      + ",\"current_mask\":" + String(currentFeatures.dominantMask)
+      + ",\"current_mask\":" + String(displayFeatures.dominantMask)
       + ",\"baseline_mask\":" + String(hasBaseline ? baselineFeatures.dominantMask : 0)
-      + ",\"samples\":" + String(currentFeatures.samples)
-      + ",\"edges\":" + String(currentFeatures.edges)
+      + ",\"samples\":" + String(displayFeatures.samples)
+      + ",\"edges\":" + String(displayFeatures.edges)
+      + ",\"white_fraction\":" + String(displayFeatures.samples
+          ? (float)displayFeatures.whitePixels / displayFeatures.samples : 0, 3)
+      + ",\"median_gradient\":" + String(displayFeatures.medianGradient)
+      + ",\"upper_gradient\":" + String(displayFeatures.upperGradient)
       + ",\"current\":[";
   for (int i = 0; i < BINS; ++i) {
     if (i) out += ',';
-    out += String(currentFeatures.edges ?
-      (float)currentFeatures.hist[i] / currentFeatures.edges : 0, 4);
+    out += String(displayFeatures.edges ?
+      (float)displayFeatures.hist[i] / displayFeatures.edges : 0, 4);
   }
   out += "],\"baseline\":[";
   for (int i = 0; i < BINS; ++i) {
@@ -954,15 +1301,21 @@ void handleStats() {
     out += String(hasBaseline && baselineFeatures.edges ?
       (float)baselineFeatures.hist[i] / baselineFeatures.edges : 0, 4);
   }
+  out += "],\"anchors\":[";
+  for (int i = 0; i < edgeAnchorCount; ++i) {
+    if (i) out += ',';
+    out += "{\"x\":" + String(edgeAnchors[i].x) + ",\"y\":" + String(edgeAnchors[i].y)
+        + ",\"matched\":" + ((edgeAnchorMatchedMask & (1U << i)) ? "true" : "false") + "}";
+  }
   out += "],\"reference_angles\":[";
   for (int i = 0; i < (hasBaseline ? baselineFeatures.peakCount : 0); ++i) {
     if (i) out += ',';
     out += String(baselineFeatures.peakAngle[i], 1);
   }
   out += "],\"live_angles\":[";
-  for (int i = 0; i < currentFeatures.peakCount; ++i) {
+  for (int i = 0; i < displayFeatures.peakCount; ++i) {
     if (i) out += ',';
-    out += String(currentFeatures.peakAngle[i], 1);
+    out += String(displayFeatures.peakAngle[i], 1);
   }
   out += "],\"reference_shares\":[";
   for (int i = 0; i < (hasBaseline ? baselineFeatures.peakCount : 0); ++i) {
@@ -970,9 +1323,9 @@ void handleStats() {
     out += String(baselineFeatures.peakShare[i], 3);
   }
   out += "],\"live_shares\":[";
-  for (int i = 0; i < currentFeatures.peakCount; ++i) {
+  for (int i = 0; i < displayFeatures.peakCount; ++i) {
     if (i) out += ',';
-    out += String(currentFeatures.peakShare[i], 3);
+    out += String(displayFeatures.peakShare[i], 3);
   }
   out += "],\"match_indices\":[";
   for (int i = 0; i < (hasBaseline ? baselineFeatures.peakCount : 0); ++i) {
@@ -989,6 +1342,18 @@ void handleStats() {
     if (i) out += ',';
     out += String(nearestDelta[i], 1);
   }
+  out += "],\"reference_buckets\":[";
+  for (int i = 0; i <= MAX_PEAKS; ++i) {
+    if (i) out += ',';
+    out += String(hasBaseline && baselineFeatures.quality && baselineFeatures.edges
+      ? (float)referenceByTolerance[region.angleTolerance].bucket[i] / baselineFeatures.edges : 0, 3);
+  }
+  out += "],\"live_buckets\":[";
+  for (int i = 0; i <= MAX_PEAKS; ++i) {
+    if (i) out += ',';
+    out += String(hasBaseline && baselineFeatures.quality && currentFeatures.edges
+      ? (float)liveProjection.bucket[i] / currentFeatures.edges : 0, 3);
+  }
   out += "],\"matched_live_mask\":" + String(matchedLiveMask) + "}";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", out);
@@ -996,14 +1361,15 @@ void handleStats() {
 
 ShapeBench benchmarkShape(bool circle) {
   region.circle = circle;
+  const bool projected = hasBaseline && baselineFeatures.quality;
   const int repeats = region.radius <= 10 ? 100 : (region.radius <= 30 ? 20 : 5);
   volatile uint32_t sink = 0;
-  Features warmup = analyse(grayFrame);
+  Features warmup = analyse(grayFrame, nullptr, projected);
   sink += warmup.edges;
   const uint32_t startUs = micros();
   uint32_t samples = 0;
   for (int i = 0; i < repeats; ++i) {
-    Features result = analyse(grayFrame);
+    Features result = analyse(grayFrame, nullptr, projected);
     samples = result.samples;
     sink += result.edges;
   }
@@ -1018,9 +1384,11 @@ void handleBenchmark() {
     return;
   }
   const bool selectedShape = region.circle;
+  const Projection savedProjection = liveProjection;
   const ShapeBench circle = benchmarkShape(true);
   const ShapeBench square = benchmarkShape(false);
   region.circle = selectedShape;
+  liveProjection = savedProjection;
   const String out = "{\"circle_us\":" + String(circle.microseconds)
       + ",\"circle_samples\":" + String(circle.samples)
       + ",\"square_us\":" + String(square.microseconds)
@@ -1052,6 +1420,7 @@ void handleRegion() {
   if (nx != region.x || ny != region.y || nr != region.radius ||
       ng != region.gradientMin || (shape == "circle") != region.circle) {
     hasBaseline = false;
+    edgeAnchorCount = 0;
     changed = false;
     changedFrames = clearFrames = 0;
     estimatedCellUs = 0;
@@ -1066,9 +1435,11 @@ void handleRegion() {
   region.angleTolerance = angleTolerance;
   if (frameReady) {
     const uint32_t startUs = micros();
-    currentFeatures = analyse(grayFrame);
-    analysisUs = micros() - startUs;
+    currentFeatures = analyse(grayFrame, &cellTiming, hasBaseline && baselineFeatures.quality);
+    const uint32_t compareStartUs = micros();
     updateChange();
+    cellTiming.compareUs = micros() - compareStartUs;
+    analysisUs = micros() - startUs;
   }
   server.send(200, "text/plain", "OK");
 }
@@ -1103,7 +1474,12 @@ void handleBaseline() {
     server.send(409, "text/plain", "Need a fresh camera frame before capturing the reference");
     return;
   }
-  baselineFeatures = currentFeatures;
+  // Recalibration must always measure actual angles, even if the preceding
+  // monitoring frame used only reference-direction projections.
+  baselineFeatures = analyse(grayFrame, nullptr, false);
+  currentFeatures = baselineFeatures;
+  prepareReferenceProjection(grayFrame);
+  captureEdgeAnchors(grayFrame);
   ++baselineRevision;
   hasBaseline = true;
   changed = false;
@@ -1130,8 +1506,15 @@ void handleRecentLog() {
       + ",\"reference\":\"" + kindName(e.referenceKind) + "\""
       + ",\"live\":\"" + kindName(e.liveKind) + "\""
       + ",\"score\":" + String(e.score, 3)
+      + ",\"edge_tail_score\":" + String(e.edgeTailScore, 3)
+      + ",\"anchor_score\":" + String(e.anchorScore, 3)
+      + ",\"anchor_count\":" + String(e.anchorCount)
+      + ",\"anchors_matched\":" + String(e.anchorsMatched)
+      + ",\"anchor_matched_mask\":" + String(e.anchorMatchedMask)
       + ",\"threshold\":" + String(e.threshold, 3)
       + ",\"changed\":" + String(e.changed)
+      + ",\"exposure_unreliable\":" + String(e.exposureUnreliable)
+      + ",\"white_fraction\":" + String(e.samples ? (float)e.liveWhitePixels / e.samples : 0, 3)
       + ",\"mean_gray\":" + String(e.meanGray, 1)
       + ",\"reference_mean_gray\":" + String(e.referenceMeanGray, 1)
       + ",\"max_gradient\":" + String(e.maxGradient)
@@ -1140,6 +1523,8 @@ void handleRecentLog() {
       + ",\"cell_us\":" + String(e.cellUs)
       + ",\"reference_angle\":" + String(e.referenceAngles[0], 1)
       + ",\"live_angle\":" + String(e.liveAngles[0], 1)
+      + ",\"projection_mode\":" + String(e.projectionMode)
+      + ",\"live_support\":" + String(e.edges ? (float)e.liveBucket[0] / e.edges : 0, 3)
       + "}";
   }
   out += "]}";
@@ -1158,7 +1543,11 @@ void handleLogCsv() {
   server.sendHeader("Content-Disposition", "attachment; filename=railway-camera-log.csv");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "text/csv", "");
-  String header = "version,attempt,frame,uptime_ms,capture_ok,config_revision,baseline_revision,has_reference,x,y,radius,shape,contrast_floor,angle_tolerance_deg,change_threshold,reference_kind,live_kind,reference_mean_gray,live_mean_gray,live_min_gray,live_max_gray,live_max_gradient,samples,reference_edges,live_edges,mismatch_score,raw_mismatch,changed,enter_frames,clear_frames,capture_us,cell_us";
+  String header = "version,attempt,frame,uptime_ms,capture_ok,config_revision,baseline_revision,has_reference,x,y,radius,shape,contrast_floor,angle_tolerance_deg,change_threshold,reference_kind,live_kind,reference_mean_gray,live_mean_gray,live_min_gray,live_max_gray,live_max_gradient,samples,reference_edges,live_edges,reference_white_pixels,live_white_pixels,exposure_unreliable,reference_median_gradient,reference_upper_gradient,live_median_gradient,live_upper_gradient,edge_tail_score,anchor_score,anchor_count,anchors_matched,mismatch_score,raw_mismatch,changed,enter_frames,clear_frames,capture_us,cell_us,diagnostic_us,frame_get_us,frame_copy_us,first_pass_us,second_pass_us,peaks_us,compare_us,projection_mode";
+  header += ",anchor_matched_mask,anchor_1_x,anchor_1_y,anchor_2_x,anchor_2_y";
+  for (int i = 0; i <= MAX_PEAKS; ++i) {
+    header += ",reference_bucket_" + String(i) + ",live_bucket_" + String(i);
+  }
   for (int i = 0; i < MAX_PEAKS; ++i) {
     header += ",reference_angle_" + String(i + 1) + ",reference_share_" + String(i + 1)
            + ",live_angle_" + String(i + 1) + ",live_share_" + String(i + 1);
@@ -1185,11 +1574,34 @@ void handleLogCsv() {
     csvValue(line, String(e.minGray)); csvValue(line, String(e.maxGray));
     csvValue(line, String(e.maxGradient)); csvValue(line, String(e.samples));
     csvValue(line, String(e.referenceEdges)); csvValue(line, String(e.edges));
+    csvValue(line, String(e.referenceWhitePixels)); csvValue(line, String(e.liveWhitePixels));
+    csvValue(line, String(e.exposureUnreliable));
+    csvValue(line, String(e.referenceMedianGradient)); csvValue(line, String(e.referenceUpperGradient));
+    csvValue(line, String(e.liveMedianGradient)); csvValue(line, String(e.liveUpperGradient));
+    csvValue(line, String(e.edgeTailScore, 4));
+    csvValue(line, String(e.anchorScore, 4));
+    csvValue(line, String(e.anchorCount));
+    csvValue(line, String(e.anchorsMatched));
     csvValue(line, String(e.score, 4));
     csvValue(line, String(e.captureOk && e.hasReference && e.score >= e.threshold));
     csvValue(line, String(e.changed)); csvValue(line, String(e.enterFrames));
     csvValue(line, String(e.clearFrames)); csvValue(line, String(e.captureUs));
     csvValue(line, String(e.cellUs));
+    csvValue(line, String(e.diagnosticUs));
+    csvValue(line, String(e.getUs)); csvValue(line, String(e.copyUs));
+    csvValue(line, String(e.firstPassUs)); csvValue(line, String(e.secondPassUs));
+    csvValue(line, String(e.peaksUs));
+    csvValue(line, String(e.compareUs));
+    csvValue(line, String(e.projectionMode));
+    csvValue(line, String(e.anchorMatchedMask));
+    for (int anchor = 0; anchor < MAX_EDGE_ANCHORS; ++anchor) {
+      csvValue(line, String(e.anchorX[anchor]));
+      csvValue(line, String(e.anchorY[anchor]));
+    }
+    for (int bucket = 0; bucket <= MAX_PEAKS; ++bucket) {
+      csvValue(line, String(e.referenceBucket[bucket]));
+      csvValue(line, String(e.liveBucket[bucket]));
+    }
     for (int peak = 0; peak < MAX_PEAKS; ++peak) {
       csvValue(line, String(e.referenceAngles[peak], 1));
       csvValue(line, String(e.referenceShares[peak], 3));
@@ -1213,6 +1625,8 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.printf("Railway camera angle experiment v%s\n", CAMERA_ANGLE_EXPERIMENT_VERSION);
+  for (int angle = 0; angle <= 20; ++angle)
+    toleranceTanQ8[angle] = (uint8_t)lroundf(tanf(angle * 0.01745329252f) * 256);
   if (!initCameraAt(0)) Serial.println("Camera unavailable; hotspot will allow retry.");
   for (uint16_t capacity : {1024, 512, 256}) {
     frameLog = (FrameLog *)ps_malloc((size_t)capacity * sizeof(FrameLog));

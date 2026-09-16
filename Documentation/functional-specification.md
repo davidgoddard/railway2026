@@ -23,8 +23,8 @@ A sustained qualifying change makes an ROI occupied. A sustained return to the c
 
 | Component | Responsibilities |
 | --- | --- |
-| Electron application | Pair devices; show setup and diagnostic views; draw and edit ROIs; calibrate; tune thresholds; show live states and faults; deploy configuration. |
-| Camera ESP32-S3 | Capture frames; process its ROIs locally; filter state over time; persist assigned configuration; send state changes and periodic health. |
+| Electron application | Pair devices; store and back up each camera's full-frame empty-layout snapshot; show setup and diagnostic views; draw and edit ROIs; calibrate; tune thresholds; show live states and faults; deploy configuration. |
+| Camera ESP32-S3 | Capture frames; derive and persist compact baseline features for assigned cells; process its ROIs locally; filter state over time; persist assigned configuration; send state changes and periodic health. |
 | Controller ESP32-S3 | Persist the deployed configuration; distribute camera settings; validate ESP-NOW reports; track freshness; publish MQTT state and health without the application. |
 | MQTT broker | Distribute current state and health to external automation clients. |
 
@@ -48,10 +48,16 @@ A wired state link remains an option. I²C has sufficient bandwidth for compact 
 
 1. Pair each camera explicitly and assign a stable device ID. Reports from unpaired devices cannot alter states.
 2. Display a representative camera image with its resolution and orientation. Draw polygonal ROIs around visible track and assign unique IDs and names. Warn about out-of-frame regions; label low-texture cells as blank backgrounds rather than rejecting them. Permit intentional overlap.
-3. With the track empty, calibrate every ROI. Store image dimensions, camera settings, ROI geometry, cell layout, and baseline features. Require recalibration after camera movement, resolution or exposure changes, or ROI geometry changes.
+3. With the whole visible layout empty, capture a full-frame baseline snapshot for each camera and save it in the setup application's project data. Record camera identity, image dimensions, camera settings, image checksum, and revision. Derive each ROI's cell features from that snapshot and persist the compact results on the camera with its ROI geometry and cell layout. Require a new full-frame snapshot after camera movement, resolution or relevant exposure changes.
 4. Show the live change score, state, and recent transitions for threshold tuning. Apply versioned configuration atomically. The controller shows which version each camera has acknowledged.
 5. Keep the controller's configuration and each camera's assignment across power loss. Reject unsupported or oversized configurations with a reason, leaving the last valid version active.
 6. At startup, each ROI is unknown until the camera has valid configuration and enough fresh frames for a decision.
+
+The setup application's full-frame snapshot must survive power loss and remain available for months, including through an export/import or backup workflow so it can be moved to another computer. Adding or changing a sensor or block later derives its baseline from the original snapshot without requiring the layout to be empty again; removing an ROI does not delete the snapshot. The application must show the snapshot and revision so the user can confirm that a newly selected area was empty when it was taken. It verifies the camera identity, image geometry, and relevant settings before use. If the camera was moved or its image geometry changed, the user must capture a new empty-layout snapshot.
+
+During setup, the application sends the saved snapshot, or the necessary lossless pixel regions with their gradient borders, to the camera over the setup Wi-Fi connection. The camera uses the same feature extractor as normal calibration, returns the new cell features for review, and atomically saves its compact configuration and feature data. The full image is not transferred over ESP-NOW or required during normal monitoring. The camera and controller continue to operate with the application closed. Replacing the snapshot is an explicit operation that recalculates affected ROIs and keeps the prior working configuration if deployment fails.
+
+Full-frame persistent storage belongs to the application's project data; cameras only need enough flash for paired identity, configuration, and derived cell features. The ESP32 controller need not store copies of every camera image. The application must report a missing or corrupt snapshot and must not silently substitute a newer occupied view as the empty baseline.
 
 ## Local detection
 
@@ -61,7 +67,13 @@ Production calibration should observe several empty frames per cell and record n
 
 The feature extractor, cell size, aggregation, and thresholds are prototype choices to benchmark on the selected ESP32-S3 board and image sensor. Orientation features may tolerate moderate brightness changes, but cannot make detection lighting independent. Broad scene shifts, severe blur, saturation, and capture failure must lead to unknown when they prevent a reliable comparison. The system must not learn a stationary train into the empty baseline automatically.
 
-The first hardware experiment is [the Arduino camera angle sketch](../experiments/camera_module/README.md). It accepts blank or textured background references. For textured cells it measures 18 gradient-angle bins, refines up to three dominant peak angles, and compares them one-to-one using adjustable tolerance. If no stable peak exists in a textured cell, it compares normalized angle distributions. It reports processing time and frame rate. The blank/texture cutoff, peak selection, tolerance, and persistence periods are provisional and need empty-track and rolling-stock tests.
+Rapid sunlight changes can briefly saturate the camera while automatic exposure settles, making a textured empty cell appear blank. Track near-white pixel fraction, brightness change, and loss of reference detail. If evidence is washed out, report the affected cell or camera view as unknown and suspend enter/clear persistence until fresh usable frames arrive; do not turn missing gradients directly into occupied or clear. Distinguish whole-view lighting disruption from local objects where possible. A pale vehicle can resemble overexposure, so uncertain evidence must remain unknown rather than be silently accepted as empty track. Qualify the thresholds using both sunlight transitions and light-coloured rolling stock.
+
+The first hardware experiment is [the Arduino camera angle sketch](../experiments/camera_module/README.md). It accepts blank or textured background references. At calibration it measures 18 gradient-angle bins and refines up to three dominant directions. For an oriented reference, live frames count strong gradients near each stored direction and in an "other" bucket without calculating an angle for each pixel; the change score compares those bucket shares. If the textured reference has no stable peak, it compares normalized angle distributions. It reports processing time and frame rate. The blank/texture cutoff, direction support, tolerance, and persistence periods are provisional and need empty-track and rolling-stock tests.
+
+Angle proportions alone can miss a narrow object against a weakly patterned background: a carpet test produced a 0.240 angle mismatch while the previous event threshold was 0.30. The experiment now also compares the concentration of strong gradients with the empty baseline for weakly oriented cells, and uses a 0.20 default mismatch threshold with three-frame persistence. Qualify this combination against sudden lighting changes and rolling stock before adopting it in production.
+
+At resolutions where sleepers cannot be resolved, a rail and a carriage can both produce long edges with similar angles. The camera experiment therefore stores up to two separated gradient points on the strongest baseline angle and checks whether a similarly oriented gradient remains near each point in live frames. A missing point contributes to the change score. This uses edge location and direction without comparing baseline and live pixel brightness. Evaluate false changes from small camera shifts and missed changes when a carriage edge happens to replace the rail edge at the same locations and angle.
 
 Each ROI has distinct enter and exit thresholds and configurable persistence periods. Occupied requires a qualifying change across the enter period. Clear requires a sustained return to baseline across the exit period. Brief missing or low-confidence frames cannot clear an occupied area. Defaults will be set from layout tests.
 
