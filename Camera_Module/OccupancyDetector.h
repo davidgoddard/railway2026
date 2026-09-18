@@ -3,6 +3,8 @@
 // CellRuntime and GroupRuntime are the persisted protocol/runtime records.
 class OccupancyDetector {
  public:
+  // Provisional saturation limit; tune from frames captured on the layout.
+  static constexpr uint8_t FRAME_CLIP_PERCENT=20;
   using StateCallback = void (*)(uint32_t id, bool grouped, uint8_t state, uint16_t score);
   void bind(const uint8_t *pixels, uint16_t width, uint16_t height,
             CellRuntime *cells, uint16_t cellCount, GroupRuntime *groups,
@@ -23,6 +25,7 @@ class OccupancyDetector {
   GroupRuntime *groups_=nullptr;
   StateCallback callback_=nullptr;
   uint16_t tanQ8[21]={};
+  uint32_t analysisNumber_=0;
   void emit(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
     if(callback_) callback_(id,grouped,state,score);
   }
@@ -36,7 +39,6 @@ class OccupancyDetector {
                   int offsetX=0,int offsetY=0);
   float histogramDistance(const Feature &a,const Feature &b);
   float projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets);
-  bool exposureUnreliable(const CellRuntime &cell,const Feature &live);
   uint16_t compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets);
   void updateGroups();
 };
@@ -195,17 +197,6 @@ void OccupancyDetector::calibrateCell(CellRuntime &cell) {
 #endif
 }
 
-bool OccupancyDetector::exposureUnreliable(const CellRuntime &cell,const Feature &live) {
-  if(!live.samples || !cell.reference.samples) return false;
-  const float mean=(float)live.graySum/live.samples;
-  const float referenceMean=(float)cell.reference.graySum/cell.reference.samples;
-  const float white=(float)live.whitePixels/live.samples;
-  const float referenceWhite=(float)cell.reference.whitePixels/cell.reference.samples;
-  const bool clipped=white>=0.40f && white>=referenceWhite+0.25f;
-  const bool lostDetail=cell.reference.textured && cell.reference.edges>=16 && !live.textured &&
-    live.maxGradient*2<cell.reference.maxGradient;
-  return mean>=referenceMean+25 && (clipped || lostDetail);
-}
 uint16_t OccupancyDetector::compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
   // Angle histograms from fewer than 16 edges are too sparse to compare reliably.
   // Treat a weak, unoriented reference as clear until the live patch has real detail.
@@ -234,16 +225,35 @@ void OccupancyDetector::updateGroups() {
   }
 }
 void OccupancyDetector::analyseAllCells() {
+  ++analysisNumber_;
+  // The camera source supplies one grayscale byte per pixel. Count saturation
+  // across the whole frame once, before comparing any individual sensor.
+  const uint32_t total=(uint32_t)width_*height_;
+  uint32_t clipped=0;
+  for(uint32_t p=0;p<total;++p) if(pixels_[p]>=250) ++clipped;
+  if(total && clipped*100>=total*FRAME_CLIP_PERCENT) {
+    bool changed=false;
+    for(uint16_t i=0;i<cellCount_;++i) {
+      CellRuntime &cell=cells_[i];
+      cell.enterCount=cell.clearCount=0;
+      cell.scorePermille=0;
+      if(cell.state!=UNKNOWN) {
+        cell.state=UNKNOWN;
+        emit(cell.config.id,false,UNKNOWN,0);
+        changed=true;
+      }
+    }
+    if(changed || analysisNumber_%16==0) DEBUGF(
+      "unreliable frame clipped=%lu/%lu (%lu%%) threshold=%u%%\n",
+      (unsigned long)clipped,(unsigned long)total,
+      (unsigned long)(100UL*clipped/total),FRAME_CLIP_PERCENT);
+    updateGroups();
+    return;
+  }
   for(uint16_t i=0;i<cellCount_;++i) {
     CellRuntime &cell=cells_[i];
     uint16_t buckets[MAX_PEAKS+1]={};
     const Feature live=analyse(cell,false,buckets);
-    if(exposureUnreliable(cell,live)) {
-      // Preserve occupancy while image evidence is unavailable.
-      cell.enterCount=cell.clearCount=0;
-      DEBUGF("unreliable id=%lu overexposure\n",(unsigned long)cell.config.id);
-      continue;
-    }
     cell.scorePermille=compareCell(cell,live,buckets);
     // A one-pixel image shift can replace several edge samples in a small
     // cell. Search neighbouring image positions only when the current score
@@ -257,7 +267,6 @@ void OccupancyDetector::analyseAllCells() {
           if(!dx && !dy) continue;
           uint16_t shiftedBuckets[MAX_PEAKS+1]={};
           const Feature shifted=analyse(cell,false,shiftedBuckets,dx,dy);
-          if(exposureUnreliable(cell,shifted)) continue;
           cell.scorePermille=min(cell.scorePermille,compareCell(cell,shifted,shiftedBuckets));
         }
       }

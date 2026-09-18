@@ -8,6 +8,7 @@ const { createMonitor } = require('./mqtt-monitor');
 
 let win, port, pending, queue = Promise.resolve(), buffer = '', snapshot, refreshTimer, frameTimer, requestedFrameMac = '';
 const configs = new Map(), cameras = new Map(), states = new Map(), cellStates = new Map();
+const healthSamples = new Map();
 let network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null };
 let monitor;
 let monitorStarted = false;
@@ -24,6 +25,14 @@ function diagnosticFromParts(parts, start, at = Date.now()) {
   if (parts.length < start + 6 || !/^[0-9A-F]{8}$/.test(parts[start]) || !/^\d+$/.test(parts[start + 1])) return null;
   return { boot: parts[start], sequence: +parts[start + 1], uptime: +parts[start + 2], code: parts[start + 3], mac: parts[start + 4], detail: parts.slice(start + 5).join(' '), at };
 }
+function updateRadioFromDiagnostic(event) {
+  if (!event || !['WIFI_RADIO', 'CHANNEL_CHANGE'].includes(event.code)) return false;
+  const match = new RegExp(`\\b${event.code === 'CHANNEL_CHANGE' ? 'to' : 'channel'}=(\\d+)`).exec(event.detail);
+  const channel = match ? +match[1] : 0;
+  if (channel < 1 || channel > 13 || network.radioChannel === channel) return false;
+  network.radioChannel = channel;
+  return true;
+}
 async function logs() {
   const rows = await run('LOG');
   const now = rows.find(line => line.startsWith('LOG_NOW '))?.split(' ');
@@ -33,20 +42,25 @@ async function logs() {
     const parts = row.split(' ');
     const at = now && parts[1] === now[1] ? wallNow - ((bridgeUptime - (+parts[3])) >>> 0) : wallNow;
     const event = diagnosticFromParts(parts, 1, at);
-    if (event) send('bridge:diagnostic', event);
+    if (event) { updateRadioFromDiagnostic(event); send('bridge:diagnostic', event); }
   }
+  state();
   return rows.length;
 }
 function handleLine(line) {
   if (!line) return;
   const parts = line.split(' ');
-  if (parts[0] === 'READY') { send('bridge:notice', `Bridge ${parts[2]} connected`); return; }
+  if (parts[0] === 'READY') {
+    const channel = +(/\bchannel=(\d+)/.exec(line)?.[1] || 0);
+    if (channel >= 1 && channel <= 13) network.radioChannel = channel;
+    state(); send('bridge:notice', `Bridge ${parts[2]} connected`); return;
+  }
   if (parts[0] === 'EVENT') {
     const kind = parts[1], mac = parts[2];
     try {
       if (kind === 'CONFIG_ERROR' && parts[3] === '6') clearFrameRequest();
       if (kind === 'WIFI') { network.wifi = parts[2]; network.wifiDetail = parts.slice(3).join(' '); state(); send('bridge:network-event', { service: 'Wi-Fi', status: network.wifi, detail: network.wifiDetail }); }
-      else if (kind === 'DIAG') { const event = diagnosticFromParts(parts, 2); if (event) send('bridge:diagnostic', event); }
+      else if (kind === 'DIAG') { const event = diagnosticFromParts(parts, 2); if (event) { if (updateRadioFromDiagnostic(event)) state(); send('bridge:diagnostic', event); } }
       else if (kind === 'MQTT_STATUS') { network.mqtt = parts[2]; network.mqttDetail = parts.slice(3).join(' '); state(); send('bridge:network-event', { service: 'MQTT broker', status: network.mqtt, detail: network.mqttDetail }); }
       else if (kind === 'SNAP_BEGIN') { snapshot = new Snapshot(parts); send('bridge:progress', { mac, received: 0, total: snapshot.count }); }
       else if (kind === 'SNAP_DATA' && snapshot) { snapshot.add(parts); if (snapshot.offset % 12000 < 180) send('bridge:progress', { mac, received: snapshot.offset, total: snapshot.count }); }
@@ -70,10 +84,18 @@ function handleLine(line) {
         if (parts[3] === 'offline' && requestedFrameMac === mac) { clearFrameRequest();snapshot = null;send('bridge:error', `Camera ${mac} went offline before its frame arrived.`); }
         for (const [key, value] of states) if (value.mac === mac) states.set(key, { ...value, value: 'unknown', score: null, frame: null, at: Date.now() });
         for (const [key, value] of cellStates) if (value.mac === mac) cellStates.set(key, { ...value, value: 'unknown', score: null, frame: null, at: Date.now() });
-        const c = cameras.get(mac); if (c && parts[3] === 'offline') c.online = false;
+        const c = cameras.get(mac); if (c && parts[3] === 'offline') { c.online = false; c.fps = null; healthSamples.delete(mac); }
         state();
       }
-      else if (kind === 'HEALTH') { const c = cameras.get(mac); if (c) { c.baseline = parts[6] === '1'; c.online = true; state(); } }
+      else if (kind === 'HEALTH') { const c = cameras.get(mac); if (c) {
+        const frame = Number(parts[4]), now = Date.now(), snapshotActive = parts[7] === '1';
+        const previous = healthSamples.get(mac);
+        c.fps = Number.isSafeInteger(frame) && previous && !snapshotActive && !previous.snapshotActive &&
+          frame >= previous.frame && now - previous.at >= 1000 && now - previous.at <= 15000
+          ? Math.round((frame - previous.frame) * 10000 / (now - previous.at)) / 10 : null;
+        if (Number.isSafeInteger(frame)) healthSamples.set(mac, { frame, at: now, snapshotActive });
+        c.baseline = parts[6] === '1'; c.snapshotActive = snapshotActive; c.online = true; state();
+      } }
       else if (kind === 'MQTT') send('bridge:mqtt', { topic: parts[2], value: parts.slice(3).join(' '), at: Date.now() });
     } catch (e) { snapshot = null; send('bridge:error', e.message); }
     send('bridge:event', line); return;
@@ -103,7 +125,9 @@ async function refresh() {
   const rows = await run('LIST');
   const next = new Map();
   for (const line of rows) { const row = parseRow(line); if (row?.type === 'camera') next.set(row.mac, row); }
-  cameras.clear(); for (const [mac, camera] of next) cameras.set(mac, camera);
+  const previousCameras = new Map(cameras);
+  cameras.clear(); for (const [mac, camera] of next) cameras.set(mac, { ...camera, fps: previousCameras.get(mac)?.fps ?? null, snapshotActive: previousCameras.get(mac)?.snapshotActive ?? false });
+  for (const mac of healthSamples.keys()) if (!cameras.has(mac)) healthSamples.delete(mac);
   for (const mac of cameras.keys()) {
     const getRows = await run(`GET ${mac}`);
     const config = { revision: 0, cells: [], topics: {}, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 } };
@@ -118,7 +142,7 @@ async function refresh() {
   for (const line of stateRows) { const p = line.split(' '); if (p[0] === 'OUTPUT' && MAC.test(p[1])) { const previous=states.get(`${p[1]}:${p[2]}`);states.set(`${p[1]}:${p[2]}`, { mac: p[1], id: +p[2], value: p[3], score: previous?.value===p[3]?previous.score:null, frame: previous?.value===p[3]?previous.frame:null, at: Date.now() }); } else if (p[0] === 'SENSOR' && MAC.test(p[1])) { const key=`${p[1]}:${p[2]}`,previous=cellStates.get(key);currentCells.add(key);cellStates.set(key,{mac:p[1],id:+p[2],value:p[3],score:previous?.value===p[3]?previous.score:null,frame:previous?.value===p[3]?previous.frame:null,at:Date.now()}); } }
   for (const key of cellStates.keys()) if (!currentCells.has(key)) cellStates.delete(key);
   const statusRows = await run('STATUS');
-  for (const line of statusRows) { const p = line.split(' '); if (p[0] === 'WIFI_STATUS' && !(network.wifi === 'failed' && p[1] === 'disconnected')) { network.wifi = p[1]; network.wifiDetail = p[2] === '-' ? '' : p.slice(2).join(' '); } else if (p[0] === 'MQTT_STATUS' && !(network.mqtt === 'failed' && p[1] === 'disconnected')) { network.mqtt = p[1]; network.mqttDetail = p[2] || ''; } else if (p[0] === 'SAVED_SETTINGS') { network.wifiSaved = p[1] === '1'; network.mqttSaved = p[2] === '1'; } }
+  for (const line of statusRows) { const p = line.split(' '); if (p[0] === 'RADIO_STATUS') { network.radioChannel = +p[1]; network.actualRadioChannel = +p[2]; } else if (p[0] === 'WIFI_STATUS' && !(network.wifi === 'failed' && p[1] === 'disconnected')) { network.wifi = p[1]; network.wifiDetail = p[2] === '-' ? '' : p.slice(2).join(' '); } else if (p[0] === 'MQTT_STATUS' && !(network.mqtt === 'failed' && p[1] === 'disconnected')) { network.mqtt = p[1]; network.mqttDetail = p[2] || ''; } else if (p[0] === 'SAVED_SETTINGS') { network.wifiSaved = p[1] === '1'; network.mqttSaved = p[2] === '1'; } }
   state(); return true;
 }
 async function connect(serialPath) {

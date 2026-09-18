@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.1.4"
+#define CAMERA_MODULE_VERSION "0.1.5"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -411,8 +411,9 @@ uint8_t commitConfig(uint32_t revision) {
   // A change in optics or geometry invalidates the compact baseline.
   if(memcmp(&stagingSettings,&cameraSettings,sizeof(CameraSettings))!=0 || !cameraReady) {
     const CameraSettings previous=cameraSettings;
+    const bool wasReady=cameraReady;
     if(!initCamera(stagingSettings)) {
-      initCamera(previous);
+      if(wasReady) initCamera(previous);
       return ACK_CAMERA_ERROR;
     }
   }
@@ -700,6 +701,8 @@ void setChannel(uint8_t channel) {
     radioChannel=channel;addPeer(BROADCAST_MAC);
     if(bridgeKnown) addPeer(bridgeMac);
     DEBUGF("ESP-NOW channel=%u\n",radioChannel);
+    // Probe each scanned channel instead of relying on one periodic beacon.
+    sendHello();lastHello=millis();
   }
 }
 
@@ -861,7 +864,7 @@ void loop() {
   for(int n=0;n<16 && xQueueReceive(inbox,&message,0)==pdTRUE;++n) handleRadio(message);
   serviceSnapshot();
   serviceDiagnostics();
-  if(cameraReady && !snapshot.active && millis()-lastCapture>=imageSource.captureIntervalMs()) {
+  if(cameraReady && !snapshot.active) {
     if(captureFrame()) {
       detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
       if(baselineReady) detector.analyseAllCells();
@@ -876,5 +879,5 @@ void loop() {
     setChannel(radioChannel==13?1:radioChannel+1);
   }
   if(millis()-lastFullStateRefresh>=30000) { lastFullStateRefresh=millis();queueAllStates(); }
-  delay(1);
+  yield();
 }

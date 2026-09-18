@@ -2,9 +2,14 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
-const { crc32, Snapshot, parseRow, validateConfig, commandsForConfig } = require('./protocol');
+const { DEFAULT_CELL, crc32, Snapshot, parseRow, validateConfig, commandsForConfig } = require('./protocol');
 const { sameCameraConfiguration, alignConfigurationToFrame, frameMatchesConfiguration } = require('./config-match');
 const mac = 'AA:BB:CC:DD:EE:FF';
+test('new production sensors default to one occupancy frame and a 400 score', () => {
+  assert.equal(DEFAULT_CELL.enter, 1);
+  assert.equal(DEFAULT_CELL.threshold, 400);
+  assert.equal(DEFAULT_CELL.clear, 5);
+});
 const config = () => ({ revision: 4, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 }, cells: [
   { id: 1, group: 20, x: 40, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5 },
   { id: 2, group: 20, x: 45, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5 }
@@ -19,10 +24,35 @@ test('builds a complete ordered upload including the MQTT alias', () => {
   assert.equal(commands[3], `COMMIT ${mac}`);
   assert.equal(commands[4], `TOPIC ${mac} 20 706C6174666F726D2D31`);
 });
+test('uploads a camera-wide one-frame occupancy choice for every sensor', () => {
+  const saved = config(), draft = structuredClone(saved);
+  for (const cell of draft.cells) cell.enter = 1;
+  assert.equal(sameCameraConfiguration(draft, saved), false);
+  const commands = commandsForConfig(mac, draft).filter(line => line.startsWith('CELL '));
+  assert.equal(commands.length, 2);
+  assert.ok(commands.every(line => line.endsWith(' 200 1 5')));
+});
+test('uploads a camera-wide mismatch threshold for every sensor', () => {
+  const saved = config(), draft = structuredClone(saved);
+  for (const cell of draft.cells) cell.threshold = 450;
+  assert.equal(sameCameraConfiguration(draft, saved), false);
+  const commands = commandsForConfig(mac, draft).filter(line => line.startsWith('CELL '));
+  assert.equal(commands.length, 2);
+  assert.ok(commands.every(line => line.endsWith(' 450 3 5')));
+  draft.cells[0].threshold = 1001;
+  assert.throws(() => validateConfig(draft), /Invalid sensor thresholds/);
+});
 test('rejects IDs used by another camera and invalid sensor bounds', () => {
   assert.throws(() => validateConfig(config(), [20]), /already used/);
   const c = config(); c.cells[0].x = 320;
   assert.throws(() => validateConfig(c), /outside/);
+});
+test('accepts a one-frame trigger and rejects counts that exceed the camera field', () => {
+  const c = config();
+  c.cells[0].enter = 1;
+  assert.doesNotThrow(() => validateConfig(c));
+  c.cells[0].enter = 256;
+  assert.throws(() => validateConfig(c), /Invalid sensor thresholds/);
 });
 test('a new camera draft can align to an 800 × 600 frame', () => {
   const draft = config();

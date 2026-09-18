@@ -10,10 +10,12 @@
 #endif
 
 #if defined(CAMERA_BOARD_AI_THINKER)
+constexpr const char *CAMERA_BOARD_NAME="AI Thinker ESP32-CAM";
 constexpr int PWDN=32, RESET=-1, XCLK=0, SIOD=26, SIOC=27;
 constexpr int D0=5,D1=18,D2=19,D3=21,D4=36,D5=39,D6=34,D7=35;
 constexpr int VSYNC=25,HREF=23,PCLK=22, STATUS_LED=4; // AI Thinker flash LED
 #else
+constexpr const char *CAMERA_BOARD_NAME="ESP32-S3-EYE";
 constexpr int PWDN=-1, RESET=-1, XCLK=15, SIOD=4, SIOC=5;
 constexpr int D0=11,D1=9,D2=8,D3=10,D4=12,D5=18,D6=17,D7=16;
 constexpr int VSYNC=6,HREF=7,PCLK=13, STATUS_LED=3; // S3-EYE LED: verify board revision
@@ -27,9 +29,6 @@ const Resolution RESOLUTIONS[]={
 
 class ImageSource {
  public:
-  // Minimum time between capture starts. Faster boards can lower this without
-  // changing the detector or the application loop.
-  uint32_t captureIntervalMs() const { return 100; }
   bool begin(const CameraSettings &settings,uint8_t *&framePixels,uint16_t &frameWidth,uint16_t &frameHeight) {
   if(settings.resolution>XGA) return false;
   if(ready_) { esp_camera_deinit();ready_=false; }
@@ -45,7 +44,12 @@ class ImageSource {
   c.ledc_timer=LEDC_TIMER_0;c.ledc_channel=LEDC_CHANNEL_0;
   c.pixel_format=PIXFORMAT_GRAYSCALE;c.frame_size=r.frameSize;
   c.fb_location=CAMERA_FB_IN_PSRAM;c.fb_count=1;c.grab_mode=CAMERA_GRAB_WHEN_EMPTY;
-  if(esp_camera_init(&c)!=ESP_OK) { free(framePixels);framePixels=nullptr;return false; }
+  const esp_err_t error=esp_camera_init(&c);
+  if(error!=ESP_OK) {
+    DEBUGF("camera init failed board=%s sensor_sda=%d sensor_scl=%d error=0x%X\n",
+      CAMERA_BOARD_NAME,SIOD,SIOC,(unsigned)error);
+    free(framePixels);framePixels=nullptr;return false;
+  }
   sensor_t *sensor=esp_camera_sensor_get();
   if(sensor) {
     sensor->set_brightness(sensor,settings.brightness);

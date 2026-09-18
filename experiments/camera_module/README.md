@@ -1,6 +1,6 @@
 # Camera angle experiment
 
-This Arduino sketch runs the detector on the camera board and serves a local web page. It is a getting-started experiment; it does not send ESP-NOW or MQTT messages and does not save sensor settings or a full-frame baseline image across restarts. Its single selected cell is calibrated from the latest frame only. The [functional specification](../../Documentation/functional-specification.md) places the persistent whole-frame snapshot in the setup application's project data so later sensors and blocks can be calibrated from it.
+This Arduino sketch runs the detector on the camera board and serves a local web page. Its historical 0.20 mismatch threshold and three-frame enter setting are separate from the bridge-connected camera module, whose new-sensor defaults are 0.40 and one frame. It is a getting-started experiment; it does not send ESP-NOW or MQTT messages and does not save sensor settings or a full-frame baseline image across restarts. Its single selected cell is calibrated from the latest frame only. The [functional specification](../../Documentation/functional-specification.md) places the persistent whole-frame snapshot in the setup application's project data so later sensors and blocks can be calibrated from it.
 
 ## Hardware and upload
 

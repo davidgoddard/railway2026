@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.3"
+#define BRIDGE_VERSION "0.1.4"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -80,7 +80,7 @@ constexpr uint32_t MQTT_RETRY_MS=30000;
 constexpr uint32_t MQTT_EARLY_RETRY_MS=10000;
 uint8_t mqttStartupFailures=0;
 uint8_t radioChannel=START_CHANNEL;
-uint32_t lastBeacon=0,fastBeaconUntil=0;
+uint32_t lastBeacon=0,fastBeaconUntil=0,lastBeaconFailureLog=0;
 constexpr uint32_t FAST_BEACON_MS=250,NORMAL_BEACON_MS=500,FAST_BEACON_WINDOW_MS=20000;
 QueueHandle_t inbox=nullptr;
 struct Received { uint8_t mac[6]; Packet packet; };
@@ -148,7 +148,12 @@ Packet makePacket(uint8_t type,uint32_t seq,const void *data,size_t length) {
 void broadcastBeacon() {
   uint8_t mac[6]={};esp_wifi_get_mac(WIFI_IF_STA,mac);
   HelloMessage beacon={};memcpy(beacon.mac,mac,6);beacon.channel=radioChannel;
-  Packet p=makePacket(HELLO,sequence++,&beacon,sizeof(beacon));sendPacket(BROADCAST,p);
+  Packet p=makePacket(HELLO,sequence++,&beacon,sizeof(beacon));
+  if(!sendPacket(BROADCAST,p) && millis()-lastBeaconFailureLog>=5000) {
+    lastBeaconFailureLog=millis();
+    char detail[48];snprintf(detail,sizeof(detail),"channel=%u",radioChannel);
+    recordDiagnostic("BEACON_SEND_FAILED","-",detail);
+  }
   lastBeacon=millis();
 }
 void sendSnapshotAck(Camera &c,uint32_t seq) { Packet p=makePacket(SNAPSHOT_ACK,seq,nullptr,0);sendPacket(c.mac,p); }
@@ -337,6 +342,7 @@ void handleRadio(const Received &r) {
     if(memcmp(h.mac,r.mac,6) || h.channel!=radioChannel || !h.width || !h.height) return;
     if(!c) { for(auto &slot:cameras) if(!slot.used) { c=&slot;c->used=true;memcpy(c->mac,r.mac,6);break; } }
     if(!c) return;
+    const bool wasSeen=c->seen;
     char mac[18];macText(c->mac,mac);
     if(!c->seen) {
       Serial.printf("EVENT DISCOVER %s %s\n",mac,c->cells?"configured":"new");if(c->cells) allUnknown(*c);
@@ -348,6 +354,9 @@ void handleRadio(const Received &r) {
     if(c->baseline && !h.baseline && c->cells) allUnknown(*c);
     c->seen=true;c->lastSeen=millis();c->remoteRevision=h.revision;c->baseline=h.baseline;
     addPeer(c->mac);
+    // A scanning camera may only stay on this channel briefly. Answer its
+    // first HELLO while it is still listening here.
+    if(!wasSeen) broadcastBeacon();
     if(c->cells && !c->phase && h.revision!=c->revision) startUpload(*c);
     return;
   }
@@ -450,6 +459,10 @@ void command(char *input) {
   }
   if(!strcmp(cmd,"STATUS")) {
     bool wifiReady=ssid.length() && WiFi.status()==WL_CONNECTED;
+    wifi_second_chan_t secondary=WIFI_SECOND_CHAN_NONE;
+    uint8_t actualChannel=0;
+    esp_wifi_get_channel(&actualChannel,&secondary);
+    Serial.printf("RADIO_STATUS %u %u\n",radioChannel,actualChannel);
     Serial.printf("WIFI_STATUS %s %s\n",wifiReady?"connected":wifiPending?"connecting":"disconnected",
       wifiReady?WiFi.localIP().toString().c_str():"-");
     Serial.printf("MQTT_STATUS %s %d\n",mqtt.connected()?"connected":mqttPending?"connecting":"disconnected",mqtt.state());

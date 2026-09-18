@@ -150,15 +150,15 @@ A score is therefore not a probability that a train is present. It is a **differ
 
 A camera can temporarily produce a bad image because of glare, overexposure or a sudden lighting change. Treating such a frame as genuine occupation evidence can create false transitions.
 
-The firmware therefore checks whether the live area has become substantially brighter than the reference and whether it is also heavily clipped to white or has lost previously visible edge detail. In the current implementation, the mean live brightness must be at least 25 grayscale levels above the reference before this guard can trigger; additional clipping or lost-detail tests must also be satisfied.
+The camera supplies one grayscale value per pixel, rather than separate R, G, and B values. The firmware counts pixels at 250–255 across the **whole frame**. If at least 20% are near white, it treats that frame as overexposed. **20% is provisional and needs measurement on the actual layout.** This is an absolute threshold, so a scene with a large naturally white area can also trigger it. There is no separate exposure-recovery timer: the first frame below this limit is analysed normally.
 
-When the exposure is judged unreliable, the detector does **not** declare the area clear or occupied from that frame. It resets the consecutive-frame counters and preserves the existing state until useful visual evidence returns.
+When a frame is judged overexposed, the detector reports **every sensor as unknown** rather than retaining a potentially stale clear or occupied result. It resets the consecutive-frame counters; useful visual evidence must then satisfy the configured count to establish a new state. The serial log prints the clipped-pixel count and percentage.
 
-> **Teaching point:** "I cannot trust this image" is different from "the track is clear". Preserving the previous state is safer than turning bad camera exposure into a false clear indication.
+> **Teaching point:** "I cannot trust this image" is different from "the track is clear". Reporting unknown avoids presenting a stale occupied or clear state as a fresh observation.
 
 ### 8. Require repeated evidence before changing state
 
-The raw score is deliberately separated from the final state. A single changed frame does not necessarily mean that a train has arrived; it could be noise, motion blur or a brief shadow.
+The raw score is deliberately separated from the final state. A single changed frame does not necessarily mean that a train has arrived; it could be noise, motion blur or a brief shadow. New sensors default to a 400/1000 mismatch threshold and one qualifying frame to occupy, prioritizing prompt detection. More frames can be configured to reject brief false triggers.
 
 The detector therefore uses two persistence counters:
 
@@ -166,7 +166,7 @@ The detector therefore uses two persistence counters:
 2. If the score falls below **70% of the threshold**, the `clear` counter advances. The sensor becomes `CLEAR` only after the configured number of consecutive clear frames.
 3. Scores between those two levels change neither state immediately. This creates hysteresis and prevents rapid toggling around the threshold.
 
-For example, with a threshold of 400, occupation evidence begins at a score of 400, while clear evidence requires a score below 280. If `enterFrames` is 3, three qualifying frames are required before the sensor changes to occupied.
+At the new-sensor defaults, a score of at least 400 occupies the sensor on the first qualifying frame, while clearing requires scores below 280 for five consecutive frames. Existing saved sensors retain their configured threshold and frame counts until changed in the bridge app and saved.
 
 This makes three settings conceptually different:
 

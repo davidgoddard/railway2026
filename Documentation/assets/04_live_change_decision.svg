@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1200" height="650" viewBox="0 0 1200 650" role="img" aria-labelledby="title desc">
   <title id="title">Live angle comparison and sensor state decision</title>
-  <desc id="desc">The detector compares direction shares or an angle histogram, checks one-pixel offsets when a score might affect state, applies an exposure guard, then counts consecutive frames to enter occupied or clear.</desc>
+  <desc id="desc">The detector marks all sensors unknown when at least 20 percent of a grayscale frame is near white. Otherwise it compares direction shares or an angle histogram, checks one-pixel offsets when a score might affect state, then counts consecutive frames to enter occupied or clear.</desc>
   <rect width="1200" height="650" fill="#ffffff"/>
   <text x="58" y="72" font-family="Arial,sans-serif" font-size="34" font-weight="700" fill="#17212b">Live frame: compare angle patterns</text>
   <text x="58" y="107" font-family="Arial,sans-serif" font-size="19" fill="#43515e">The score measures difference from the empty-track reference, not the probability of a train.</text>
@@ -18,7 +18,7 @@
   <g fill="#2478a8"><path d="M328 239l-13-8v16z"/><path d="M620 239l-13-8v16z"/><path d="M912 239l-13-8v16z"/></g>
   <rect x="60" y="363" width="1080" height="90" rx="12" fill="#fff7e7" stroke="#c99b3a"/>
   <text x="82" y="398" font-family="Arial,sans-serif" font-size="22" font-weight="700" fill="#473a24">Exposure guard</text>
-  <text x="82" y="430" font-family="Arial,sans-serif" font-size="18" fill="#473a24">If the cell becomes much brighter and clips or loses detail, hold its state and reset persistence counters.</text>
+  <text x="82" y="430" font-family="Arial,sans-serif" font-size="18" fill="#473a24">If 20% of frame pixels reach 250–255, set all sensors UNKNOWN and reset persistence counters.</text>
   <rect x="60" y="483" width="1080" height="105" rx="12" fill="#f3faf4" stroke="#78a986"/>
   <text x="82" y="521" font-family="Arial,sans-serif" font-size="22" font-weight="700" fill="#234a30">State transition</text>
   <text x="82" y="552" font-family="Arial,sans-serif" font-size="18" fill="#234a30">Score ≥ threshold for enterFrames → OCCUPIED     •     Score &lt; 70% of threshold for clearFrames → CLEAR</text>

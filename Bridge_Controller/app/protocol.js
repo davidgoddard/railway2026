@@ -4,7 +4,7 @@ const zlib = require('node:zlib');
 const RESOLUTIONS = [[320, 240], [640, 480], [800, 600], [1024, 768]];
 const MAC = /^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$/;
 const SLUG = /^[a-z0-9_-]{1,32}$/;
-const DEFAULT_CELL = { radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5 };
+const DEFAULT_CELL = { radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 400, enter: 1, clear: 5 };
 function hex(value) { return Buffer.from(value, 'utf8').toString('hex').toUpperCase() || '-'; }
 function parseRow(line) {
   const p = line.trim().split(/\s+/);
@@ -61,7 +61,7 @@ function validateConfig(config, otherIds = []) {
     if (!Number.isInteger(cell.x) || cell.x < 0 || cell.x >= width || !Number.isInteger(cell.y) || cell.y < 0 || cell.y >= height) throw Error(`Sensor ${cell.id} at ${cell.x}, ${cell.y} is outside the selected ${width} × ${height} image`);
     if (!Number.isInteger(cell.radius) || cell.radius < 3 || cell.radius > 50) throw Error('Sensor radius must be 3–50 px');
     if (cell.shape !== 0 && cell.shape !== 1) throw Error('Invalid sensor shape');
-    if (cell.floor < 10 || cell.floor > 500 || cell.tolerance < 0 || cell.tolerance > 20 || cell.threshold < 50 || cell.threshold > 1000 || cell.enter < 1 || cell.clear < 1) throw Error('Invalid sensor thresholds');
+    if (cell.floor < 10 || cell.floor > 500 || cell.tolerance < 0 || cell.tolerance > 20 || !Number.isInteger(cell.threshold) || cell.threshold < 50 || cell.threshold > 1000 || !Number.isInteger(cell.enter) || cell.enter < 1 || cell.enter > 255 || !Number.isInteger(cell.clear) || cell.clear < 1 || cell.clear > 255) throw Error('Invalid sensor thresholds');
   }
   if (groups.size > 64) throw Error('Camera supports at most 64 blocks');
   for (const cell of cells) {
