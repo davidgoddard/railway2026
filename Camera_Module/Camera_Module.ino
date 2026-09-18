@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.1.0"
+#define CAMERA_MODULE_VERSION "0.1.3"
 #define CAMERA_DEBUG_SERIAL 1
 #define CAMERA_BOARD_AI_THINKER 1
 // #define CAMERA_BOARD_ESP32S3_EYE 1
@@ -8,7 +8,11 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
+#include <esp_system.h>
+#include <miniz.h>
 #include <esp_camera.h>
+#include <LittleFS.h>
+#include <esp_partition.h>
 #include <math.h>
 #include <stddef.h>
 
@@ -50,7 +54,8 @@ enum MessageType : uint8_t {
   HELLO=1, CONFIG_BEGIN=2, CONFIG_CELL=3, CONFIG_COMMIT=4,
   CAPTURE_BASELINE=5, SNAPSHOT_REQUEST=6, ACK=7,
   STATE=8, HEALTH=9, SNAPSHOT_BEGIN=10, SNAPSHOT_CHUNK=11,
-  SNAPSHOT_END=12, SNAPSHOT_ACK=13
+  SNAPSHOT_END=12, SNAPSHOT_ACK=13, DIAGNOSTIC=14, DIAGNOSTIC_ACK=15,
+  HEALTH_ACK=16
 };
 enum AckStatus : uint8_t { ACK_OK=0, ACK_BAD_PAYLOAD=1, ACK_BAD_ORDER=2, ACK_NO_MEMORY=3, ACK_CAMERA_ERROR=4, ACK_BUSY=5 };
 enum CellState : uint8_t { UNKNOWN=0, CLEAR=1, OCCUPIED=2 };
@@ -101,8 +106,27 @@ struct __attribute__((packed)) SnapshotBeginPayload {
   uint32_t frame, bytes, crc;
   uint16_t width,height;
 };
+struct __attribute__((packed)) CompressedSnapshotBeginPayload {
+  SnapshotBeginPayload raw;
+  uint32_t wireBytes,wireCrc;
+  uint8_t codec;
+};
+static_assert(sizeof(SnapshotBeginPayload)==16 && sizeof(CompressedSnapshotBeginPayload)==25,"Snapshot header layout");
 struct __attribute__((packed)) SnapshotChunkPrefix { uint32_t offset; };
 struct __attribute__((packed)) SnapshotEndPayload { uint32_t frame, crc; };
+enum DiagnosticEvent : uint8_t {
+  DIAG_BOOT=1, DIAG_BRIDGE_JOIN=2, DIAG_BRIDGE_REJOIN=3,
+  DIAG_SNAPSHOT_START=4, DIAG_SNAPSHOT_DONE=5,
+  DIAG_SNAPSHOT_SEND_FAILED=6, DIAG_SNAPSHOT_ABORTED=7,
+  DIAG_BASELINE_START=8, DIAG_BASELINE_DONE=9, DIAG_BASELINE_FAILED=10,
+  DIAG_READY=11, DIAG_INIT_FAILED=12,
+  DIAG_CONFIG_BEGIN=13, DIAG_CONFIG_ACK_FAILED=14
+};
+struct __attribute__((packed)) DiagnosticPayload {
+  uint32_t bootId,eventSeq,uptimeMs,frame,detail,offset;
+  uint16_t captureFailures,dropped;
+  uint8_t event,resetReason,channel,operation,outcome;
+};
 static_assert(sizeof(ConfigCellPayload)<=RADIO_PAYLOAD, "Cell message too large");
 
 struct Resolution { framesize_t frameSize; uint16_t width,height; };
@@ -114,11 +138,14 @@ CameraSettings cameraSettings={QVGA,0,0,0,0,0};
 uint16_t frameWidth=320,frameHeight=240;
 uint8_t *framePixels=nullptr;
 bool cameraReady=false, baselineReady=false, configured=false;
+bool storageReady=false;
+uint8_t baselineStorageError=0;
 uint32_t frameNumber=0, configRevision=0, captureFailures=0;
 uint32_t lastHello=0,lastHealth=0,lastCapture=0,nextSeq=1;
 uint8_t localMac[6]={},bridgeMac[6]={};
 bool bridgeKnown=false;
 uint8_t radioChannel=1;
+uint32_t lastBridgeBeacon=0,lastChannelScan=0;
 
 struct Anchor { uint16_t x,y; };
 struct Feature {
@@ -158,8 +185,25 @@ struct SnapshotTransfer {
   bool active=false,waiting=false;
   uint8_t type=0,retries=0;
   uint16_t chunkLength=0;
-  uint32_t offset=0,seq=0,sentAt=0,crc=0;
+  uint32_t offset=0,seq=0,requestSeq=0,sentAt=0,crc=0,wireCrc=0,bytes=0;
+  uint8_t codec=0;
+  uint8_t *encoded=nullptr;
 } snapshot;
+struct RtcDiagnostic { uint32_t magic;uint8_t operation,outcome;uint32_t offset; };
+RTC_DATA_ATTR RtcDiagnostic rtcDiagnostic;
+constexpr uint32_t RTC_DIAG_MAGIC=0x52444941;
+DiagnosticPayload diagnosticQueue[16]={};
+uint8_t diagnosticHead=0,diagnosticCount=0;
+uint16_t diagnosticDropped=0;
+uint32_t diagnosticBootId=0,diagnosticSequence=1,lastDiagnosticSend=0;
+uint8_t diagnosticResetReason=0;
+struct __attribute__((packed)) BaselineHeader {
+  uint32_t magic,revision,bytes,cellsCrc,imageCrc;
+  uint16_t count;
+  CameraSettings settings;
+};
+bool saveBaseline();
+void loadBaseline();
 
 void macText(const uint8_t *mac,char *out) {
   sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
@@ -179,9 +223,9 @@ bool transmit(const uint8_t *dest,uint8_t type,uint32_t seq,const void *data,siz
   if(length) memcpy(packet.payload,data,length);
   return esp_now_send(dest,(uint8_t *)&packet,offsetof(Packet,payload)+length)==ESP_OK;
 }
-void sendAck(const uint8_t *dest,uint32_t seq,uint8_t type,uint8_t status,uint16_t detail=0) {
+bool sendAck(const uint8_t *dest,uint32_t seq,uint8_t type,uint8_t status,uint16_t detail=0) {
   AckPayload payload={type,status,detail};
-  transmit(dest,ACK,seq,&payload,sizeof(payload));
+  return transmit(dest,ACK,seq,&payload,sizeof(payload));
 }
 void sendHello() {
   HelloPayload payload={}; memcpy(payload.mac,localMac,6);
@@ -199,6 +243,20 @@ void sendHealth() {
              frameWidth,frameHeight,(uint16_t)min((uint32_t)65535,millis()-lastCapture),
              (uint8_t)baselineReady,(uint8_t)snapshot.active};
   transmit(bridgeMac,HEALTH,nextSeq++,&payload,sizeof(payload));
+}
+void queueDiagnostic(uint8_t event,uint32_t detail=0,uint32_t offset=0) {
+  if(diagnosticCount==16) { diagnosticHead=(diagnosticHead+1)%16;--diagnosticCount;++diagnosticDropped; }
+  DiagnosticPayload &d=diagnosticQueue[(diagnosticHead+diagnosticCount)%16];
+  d={diagnosticBootId,diagnosticSequence++,millis(),frameNumber,detail,offset,
+     (uint16_t)min(captureFailures,(uint32_t)65535),diagnosticDropped,
+     event,diagnosticResetReason,radioChannel,rtcDiagnostic.operation,rtcDiagnostic.outcome};
+  ++diagnosticCount;
+}
+void serviceDiagnostics() {
+  if(!bridgeKnown || snapshot.active || !diagnosticCount || millis()-lastDiagnosticSend<500) return;
+  const DiagnosticPayload &d=diagnosticQueue[diagnosticHead];
+  transmit(bridgeMac,DIAGNOSTIC,d.eventSeq,&d,sizeof(d));
+  lastDiagnosticSend=millis();
 }
 
 void onReceive(const esp_now_recv_info_t *info,const uint8_t *data,int length) {
@@ -287,9 +345,14 @@ void flushState() {
   }
 }
 void queueAllStates() {
-  for(uint16_t i=0;i<cellCount;++i) if(cells[i].config.groupId==0)
+  for(uint16_t i=0;i<cellCount;++i)
     queueState(cells[i].config.id,false,cells[i].state,cells[i].scorePermille);
-  for(uint16_t i=0;i<groupCount;++i) queueState(groups[i].id,true,groups[i].state,0);
+  for(uint16_t g=0;g<groupCount;++g) {
+    uint16_t score=0;
+    for(uint16_t i=0;i<cellCount;++i)
+      if(cells[i].config.groupId==groups[g].id) score=max(score,cells[i].scorePermille);
+    queueState(groups[g].id,true,groups[g].state,score);
+  }
 }
 
 void gradientAt(const uint8_t *pixels,int p,int &gx,int &gy) {
@@ -380,7 +443,10 @@ Feature analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[MAX_PEAKS+
     if(total>=(f.samples*95+99)/100) { f.upperGradient=i*16+8;break; }
   }
   if(f.maxGradient<cell.config.contrastFloor) return f;
-  const int minimum=max((int)cell.config.contrastFloor,(int)f.maxGradient/4);
+  // Use the saved reference cutoff for live frames. A changing bright pixel
+  // must not move the cutoff for every edge in an otherwise unchanged cell.
+  const int minimum=max((int)cell.config.contrastFloor,
+    (int)(referenceMode?f.maxGradient:cell.reference.maxGradient)/4);
   for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
     if(!insideCell(cell.config,x,y)) continue;
     int gx,gy;gradientAt(framePixels,y*frameWidth+x,gx,gy);
@@ -421,7 +487,7 @@ float projectionDistance(const CellRuntime &cell,const Feature &live,const uint1
 void captureAnchors(CellRuntime &cell) {
   cell.anchorCount=0;
   if(!cell.reference.peakCount) return;
-  const int minMagnitude=max(1,(int)cell.reference.maxGradient/4);
+  const int minMagnitude=max((int)cell.config.contrastFloor,(int)cell.reference.maxGradient/4);
   const int separation=max(5,(int)cell.config.radius/2);
   int x0,x1,y0,y1;bounds(cell.config,x0,x1,y0,y1);
   for(int n=0;n<MAX_ANCHORS;++n) {
@@ -444,7 +510,7 @@ void captureAnchors(CellRuntime &cell) {
 float anchorDistance(const CellRuntime &cell,const Feature &live) {
   if(!cell.anchorCount || !live.textured) return 0;
   int found=0;
-  const int minimum=max(1,(int)live.maxGradient/4);
+  const int minimum=max((int)cell.config.contrastFloor,(int)cell.reference.maxGradient/4);
   for(int n=0;n<cell.anchorCount;++n) {
     bool matched=false;
     for(int dy=-2;dy<=2 && !matched;++dy) for(int dx=-2;dx<=2;++dx) {
@@ -490,14 +556,30 @@ void calibrateCell(CellRuntime &cell) {
   DEBUGF(" anchors=%u\n",cell.anchorCount);
 #endif
 }
+void baselineHeartbeat() {
+  if(millis()-lastHello>=1000) { sendHello();lastHello=millis();delay(2); }
+  if(millis()-lastHealth>=5000) { sendHealth();lastHealth=millis();delay(2); }
+}
 bool captureBaseline() {
-  if(snapshot.active || !captureFrame()) return false;
-  for(uint16_t i=0;i<cellCount;++i) calibrateCell(cells[i]);
+  const uint32_t started=millis();
+  rtcDiagnostic={RTC_DIAG_MAGIC,2,0,0};
+  queueDiagnostic(DIAG_BASELINE_START,configRevision);
+  DEBUGF("baseline capture start revision=%lu frame=%lu\n",(unsigned long)configRevision,(unsigned long)frameNumber);
+  sendHello();lastHello=millis();
+  if(snapshot.active || !captureFrame()) { rtcDiagnostic.outcome=1;queueDiagnostic(DIAG_BASELINE_FAILED,1);rtcDiagnostic.operation=0;return false; }
+  for(uint16_t i=0;i<cellCount;++i) { calibrateCell(cells[i]);baselineHeartbeat(); }
+  if(!saveBaseline()) {
+    const uint32_t freeBytes=storageReady?LittleFS.totalBytes()-LittleFS.usedBytes():0;
+    DEBUGF("baseline flash write failed stage=%u free_bytes=%lu\n",baselineStorageError,(unsigned long)freeBytes);
+    rtcDiagnostic.outcome=2;queueDiagnostic(DIAG_BASELINE_FAILED,200+baselineStorageError,freeBytes);rtcDiagnostic.operation=0;return false;
+  }
   baselineReady=true;
   for(uint16_t i=0;i<groupCount;++i) groups[i].state=CLEAR;
   queueAllStates();
   flashReady();
-  DEBUGF("baseline ready: %u cells frame=%lu\n",cellCount,(unsigned long)frameNumber);
+  sendHello();lastHello=millis();
+  DEBUGF("baseline ready: %u cells frame=%lu duration_ms=%lu\n",cellCount,(unsigned long)frameNumber,(unsigned long)(millis()-started));
+  rtcDiagnostic.outcome=3;queueDiagnostic(DIAG_BASELINE_DONE,millis()-started);rtcDiagnostic.operation=0;
   return true;
 }
 
@@ -508,11 +590,14 @@ bool exposureUnreliable(const CellRuntime &cell,const Feature &live) {
   const float white=(float)live.whitePixels/live.samples;
   const float referenceWhite=(float)cell.reference.whitePixels/cell.reference.samples;
   const bool clipped=white>=0.40f && white>=referenceWhite+0.25f;
-  const bool lostDetail=cell.reference.textured && !live.textured &&
+  const bool lostDetail=cell.reference.textured && cell.reference.edges>=16 && !live.textured &&
     live.maxGradient*2<cell.reference.maxGradient;
   return mean>=referenceMean+25 && (clipped || lostDetail);
 }
 uint16_t compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
+  // Angle histograms from fewer than 16 edges are too sparse to compare reliably.
+  // Treat a weak, unoriented reference as clear until the live patch has real detail.
+  if(!cell.reference.peakCount && cell.reference.edges<16 && live.edges<16) return 0;
   float score=0;
   if(!cell.reference.textured && !live.textured) score=0;
   else if(cell.reference.textured!=live.textured) score=1;
@@ -568,11 +653,16 @@ void analyseAllCells() {
       if(cell.clearCount>=cell.config.clearFrames) cell.state=CLEAR;
     }
     if(old!=cell.state) {
-      DEBUGF("trigger id=%lu group=%lu %s score=%u angles=%u anchors=%u\n",
+      const uint16_t directionScore=cell.reference.peakCount && live.textured?
+        (uint16_t)lroundf(projectionDistance(cell,live,buckets)*1000):0;
+      const uint16_t anchorScore=cell.anchorCount && live.textured?
+        (uint16_t)lroundf(anchorDistance(cell,live)*1000):0;
+      DEBUGF("trigger id=%lu group=%lu %s score=%u direction=%u anchor=%u angles=%u anchors=%u edges=%u/%u max=%u/%u\n",
         (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
-        cell.state==OCCUPIED?"occupied":"clear",cell.scorePermille,
-        cell.reference.peakCount,cell.anchorCount);
-      if(cell.config.groupId==0) queueState(cell.config.id,false,cell.state,cell.scorePermille);
+        cell.state==OCCUPIED?"occupied":"clear",cell.scorePermille,directionScore,anchorScore,
+        cell.reference.peakCount,cell.anchorCount,live.edges,cell.reference.edges,
+        live.maxGradient,cell.reference.maxGradient);
+      queueState(cell.config.id,false,cell.state,cell.scorePermille);
     }
   }
   updateGroups();
@@ -659,33 +749,121 @@ uint32_t crc32(const uint8_t *data,size_t length) {
   }
   return ~crc;
 }
+bool saveBaseline() {
+  baselineStorageError=0;
+  if(!storageReady) { baselineStorageError=1;return false; }
+  const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
+  // Runtime features contain the calibration. The full grayscale frame is not
+  // needed after reboot and made SVGA baselines require two 480 KB flash files.
+  BaselineHeader h={0x52424C31,configRevision,0,
+    crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
+  if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
+  File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
+  bool ok=f.write((const uint8_t *)&h,sizeof(h))==sizeof(h) &&
+    f.write((const uint8_t *)cells,cellsBytes)==cellsBytes;
+  f.close();if(!ok) { baselineStorageError=3;LittleFS.remove("/baseline.tmp");return false; }
+  if(LittleFS.exists("/baseline.bin") && !LittleFS.rename("/baseline.bin","/baseline.bak")) { baselineStorageError=4;LittleFS.remove("/baseline.tmp");return false; }
+  if(!LittleFS.rename("/baseline.tmp","/baseline.bin")) {
+    baselineStorageError=5;
+    if(LittleFS.exists("/baseline.bak")) LittleFS.rename("/baseline.bak","/baseline.bin");
+    return false;
+  }
+  LittleFS.remove("/baseline.bak");return true;
+}
+void loadBaseline() {
+  if(!storageReady) return;
+  if(!LittleFS.exists("/baseline.bin") && LittleFS.exists("/baseline.bak"))
+    LittleFS.rename("/baseline.bak","/baseline.bin");
+  File f=LittleFS.open("/baseline.bin","r");if(!f) return;
+  BaselineHeader h={};
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C31 ||
+     h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
+  const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
+  if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||
+     (h.bytes && h.bytes!=(uint32_t)frameWidth*frameHeight)) { f.close();return; }
+  bool ok=f.read((uint8_t *)cells,cellsBytes)==cellsBytes &&
+    crc32((const uint8_t *)cells,cellsBytes)==h.cellsCrc;
+  if(ok && h.bytes) ok=f.read(framePixels,h.bytes)==h.bytes && crc32(framePixels,h.bytes)==h.imageCrc;
+  f.close();if(!ok) return;
+  uint16_t found=0;
+  for(uint16_t i=0;i<h.count;++i) {
+    cells[i].state=UNKNOWN;cells[i].enterCount=cells[i].clearCount=0;
+    uint32_t id=cells[i].config.groupId;if(!id) continue;
+    bool known=false;for(uint16_t j=0;j<found;++j) if(groups[j].id==id) known=true;
+    if(!known) { if(found>=MAX_GROUPS) return;groups[found++].id=id; }
+  }
+  groupCount=found;for(uint16_t i=0;i<groupCount;++i) groups[i].state=UNKNOWN;
+  cellCount=h.count;configRevision=h.revision;configured=baselineReady=true;
+  queueAllStates();
+  DEBUGF("restored baseline revision=%lu cells=%u\n",(unsigned long)configRevision,cellCount);
+}
 void sendSnapshotPart() {
   if(!snapshot.active || !bridgeKnown) return;
   bool ok=false;
-  const size_t bytes=(size_t)frameWidth*frameHeight;
+  const size_t bytes=snapshot.bytes;
   if(snapshot.type==SNAPSHOT_BEGIN) {
-    SnapshotBeginPayload payload={frameNumber,(uint32_t)bytes,snapshot.crc,frameWidth,frameHeight};
-    ok=transmit(bridgeMac,SNAPSHOT_BEGIN,snapshot.seq,&payload,sizeof(payload));
+    SnapshotBeginPayload raw={frameNumber,(uint32_t)frameWidth*frameHeight,snapshot.crc,frameWidth,frameHeight};
+    if(snapshot.codec) {
+      CompressedSnapshotBeginPayload payload={raw,snapshot.bytes,snapshot.wireCrc,snapshot.codec};
+      ok=transmit(bridgeMac,SNAPSHOT_BEGIN,snapshot.seq,&payload,sizeof(payload));
+    } else ok=transmit(bridgeMac,SNAPSHOT_BEGIN,snapshot.seq,&raw,sizeof(raw));
   } else if(snapshot.type==SNAPSHOT_CHUNK) {
     uint8_t payload[sizeof(SnapshotChunkPrefix)+180];
     memcpy(payload,&snapshot.offset,sizeof(snapshot.offset));
     snapshot.chunkLength=min((size_t)180,bytes-(size_t)snapshot.offset);
-    memcpy(payload+sizeof(SnapshotChunkPrefix),framePixels+snapshot.offset,snapshot.chunkLength);
+    memcpy(payload+sizeof(SnapshotChunkPrefix),(snapshot.encoded?snapshot.encoded:framePixels)+snapshot.offset,snapshot.chunkLength);
     ok=transmit(bridgeMac,SNAPSHOT_CHUNK,snapshot.seq,payload,
                 sizeof(SnapshotChunkPrefix)+snapshot.chunkLength);
   } else if(snapshot.type==SNAPSHOT_END) {
     SnapshotEndPayload payload={frameNumber,snapshot.crc};
     ok=transmit(bridgeMac,SNAPSHOT_END,snapshot.seq,&payload,sizeof(payload));
   }
-  if(ok) { snapshot.waiting=true;snapshot.sentAt=millis(); }
+  snapshot.waiting=ok;
+  snapshot.sentAt=millis();
+  if(!ok) {
+    DEBUGF("snapshot send failed type=%u offset=%lu retry=%u\n",
+      snapshot.type,(unsigned long)snapshot.offset,snapshot.retries);
+    if(snapshot.retries==0) queueDiagnostic(DIAG_SNAPSHOT_SEND_FAILED,snapshot.type,snapshot.offset);
+  }
 }
-bool startSnapshot() {
+bool startSnapshot(uint32_t requestSeq) {
   if(snapshot.active || !framePixels || !frameNumber) return false;
   snapshot=SnapshotTransfer();
-  snapshot.active=true;snapshot.type=SNAPSHOT_BEGIN;snapshot.seq=nextSeq++;
-  snapshot.crc=crc32(framePixels,(size_t)frameWidth*frameHeight);
-  DEBUGF("snapshot frame=%lu %ux%u crc=%08lx; monitoring paused\n",
-    (unsigned long)frameNumber,frameWidth,frameHeight,(unsigned long)snapshot.crc);
+  snapshot.active=true;snapshot.type=SNAPSHOT_BEGIN;snapshot.seq=nextSeq++;snapshot.requestSeq=requestSeq;
+  const size_t rawBytes=(size_t)frameWidth*frameHeight;
+  snapshot.crc=crc32(framePixels,rawBytes);
+  snapshot.bytes=rawBytes;snapshot.wireCrc=snapshot.crc;
+  const uint32_t compressStarted=millis();
+  uint8_t *compressed=(uint8_t *)ps_malloc(rawBytes);
+  tdefl_compressor *compressor=(tdefl_compressor *)ps_malloc(sizeof(tdefl_compressor));
+  if(compressed && compressor) {
+    size_t inputOffset=0,outputOffset=0;
+    const tdefl_status started=tdefl_init(compressor,nullptr,nullptr,1|TDEFL_GREEDY_PARSING_FLAG);
+    tdefl_status result=started;
+    while(result==TDEFL_STATUS_OKAY && outputOffset<rawBytes) {
+      size_t inputBytes=min((size_t)16384,rawBytes-inputOffset);
+      size_t outputBytes=rawBytes-outputOffset;
+      const tdefl_flush flush=inputOffset+inputBytes==rawBytes?TDEFL_FINISH:TDEFL_NO_FLUSH;
+      result=tdefl_compress(compressor,framePixels+inputOffset,&inputBytes,
+        compressed+outputOffset,&outputBytes,flush);
+      inputOffset+=inputBytes;outputOffset+=outputBytes;
+      baselineHeartbeat();delay(1);
+      if(millis()-compressStarted>6000) break;
+      if(result==TDEFL_STATUS_OKAY && !inputBytes && !outputBytes) break;
+    }
+    const uint32_t compressMs=millis()-compressStarted;
+    if(result==TDEFL_STATUS_DONE && inputOffset==rawBytes && outputOffset<rawBytes*9/10 &&
+       (rawBytes-outputOffset)*1000UL>compressMs*20000UL) {
+      snapshot.encoded=compressed;snapshot.bytes=outputOffset;
+      snapshot.wireCrc=crc32(compressed,outputOffset);snapshot.codec=1;
+    } else free(compressed);
+  } else free(compressed);
+  free(compressor);
+  rtcDiagnostic={RTC_DIAG_MAGIC,1,0,0};
+  queueDiagnostic(DIAG_SNAPSHOT_START,(uint32_t)frameWidth*frameHeight);
+  DEBUGF("snapshot frame=%lu %ux%u raw=%lu wire=%lu codec=%u compress_ms=%lu; monitoring paused\n",
+    (unsigned long)frameNumber,frameWidth,frameHeight,(unsigned long)rawBytes,
+    (unsigned long)snapshot.bytes,snapshot.codec,(unsigned long)(millis()-compressStarted));
   sendSnapshotPart();
   return true;
 }
@@ -696,23 +874,32 @@ void acceptSnapshotAck(uint32_t seq) {
     snapshot.type=SNAPSHOT_CHUNK;
   } else if(snapshot.type==SNAPSHOT_CHUNK) {
     snapshot.offset+=snapshot.chunkLength;
-    if(snapshot.offset>=(size_t)frameWidth*frameHeight) snapshot.type=SNAPSHOT_END;
+    rtcDiagnostic.offset=snapshot.offset;
+    if(snapshot.offset>=snapshot.bytes) snapshot.type=SNAPSHOT_END;
   } else {
     DEBUGF("snapshot complete frame=%lu bytes=%lu\n",(unsigned long)frameNumber,
       (unsigned long)((size_t)frameWidth*frameHeight));
-    snapshot.active=false;return;
+    rtcDiagnostic.outcome=3;queueDiagnostic(DIAG_SNAPSHOT_DONE,(uint32_t)frameWidth*frameHeight,snapshot.offset);rtcDiagnostic.operation=0;
+    free(snapshot.encoded);snapshot.encoded=nullptr;snapshot.active=false;return;
   }
   snapshot.seq=nextSeq++;
   sendSnapshotPart();
 }
 void serviceSnapshot() {
   if(!snapshot.active) return;
-  if(!snapshot.waiting) { sendSnapshotPart();return; }
   if(millis()-snapshot.sentAt<SNAP_TIMEOUT_MS) return;
   if(snapshot.retries++>=8) {
-    DEBUGF("snapshot aborted at offset=%lu after retries\n",(unsigned long)snapshot.offset);
-    snapshot.active=false;
+    DEBUGF("snapshot aborted at offset=%lu after %s retries\n",
+      (unsigned long)snapshot.offset,snapshot.waiting?"ack":"send");
+    free(snapshot.encoded);snapshot.encoded=nullptr;snapshot.active=false;
+    rtcDiagnostic.outcome=snapshot.waiting?2:1;
+    queueDiagnostic(DIAG_SNAPSHOT_ABORTED,snapshot.type,snapshot.offset);rtcDiagnostic.operation=0;
     return;
+  }
+  if(snapshot.type==SNAPSHOT_BEGIN && snapshot.codec && snapshot.retries>=3) {
+    free(snapshot.encoded);snapshot.encoded=nullptr;
+    snapshot.bytes=(uint32_t)frameWidth*frameHeight;snapshot.wireCrc=snapshot.crc;snapshot.codec=0;
+    DEBUGLN("compressed snapshot not acknowledged; falling back to raw frame");
   }
   sendSnapshotPart();
 }
@@ -727,20 +914,46 @@ bool decodeMac(const char *text,uint8_t *mac) {
 bool setBridge(const uint8_t *mac) {
   if(sameMac(mac,BROADCAST_MAC) || sameMac(mac,localMac) || !addPeer(mac)) return false;
   memcpy(bridgeMac,mac,6);bridgeKnown=true;
+  lastBridgeBeacon=millis();
   char name[18];macText(mac,name);
   DEBUGF("bridge %s paired for this boot\n",name);
+  queueDiagnostic(DIAG_BRIDGE_JOIN,configRevision);
   queueAllStates();
   return true;
 }
 uint32_t lastBaselineSeq=0;
+uint32_t lastConfigBeginSeq=0;
 uint8_t lastBaselineStatus=ACK_BAD_ORDER;
+void setChannel(uint8_t channel);
 void handleRadio(const Received &message) {
   const Packet &p=message.packet;
+  if(p.type==HELLO && p.length==sizeof(HelloPayload)) {
+    HelloPayload beacon;memcpy(&beacon,p.payload,sizeof(beacon));
+    if(memcmp(beacon.mac,message.mac,6)!=0 || beacon.channel!=radioChannel ||
+       beacon.width!=0 || beacon.height!=0 ||
+       sameMac(message.mac,localMac)) return;
+    if(!bridgeKnown) setBridge(message.mac);
+    if(sameMac(message.mac,bridgeMac)) {
+      if(lastBridgeBeacon && millis()-lastBridgeBeacon>12000) queueDiagnostic(DIAG_BRIDGE_REJOIN,millis()-lastBridgeBeacon);
+      lastBridgeBeacon=millis();
+    }
+    return;
+  }
   if(!bridgeKnown) {
     if(p.type!=CONFIG_BEGIN) return;
     if(!setBridge(message.mac)) return;
   }
   if(!sameMac(message.mac,bridgeMac)) return;
+  // Snapshot/config acknowledgements also prove the bridge is still on this channel.
+  lastBridgeBeacon=millis();
+  if(p.type==HEALTH_ACK) return;
+  if(p.type==DIAGNOSTIC_ACK) {
+    uint32_t bootId=0;if(p.length==sizeof(bootId)) memcpy(&bootId,p.payload,sizeof(bootId));
+    if(diagnosticCount && bootId==diagnosticBootId && p.seq==diagnosticQueue[diagnosticHead].eventSeq) {
+      diagnosticHead=(diagnosticHead+1)%16;--diagnosticCount;
+    }
+    return;
+  }
   if(p.type==SNAPSHOT_ACK) {
     if(p.length==0) acceptSnapshotAck(p.seq);
     return;
@@ -748,7 +961,12 @@ void handleRadio(const Received &message) {
   if(p.type==CONFIG_BEGIN) {
     if(p.length!=sizeof(ConfigBeginPayload)) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
     ConfigBeginPayload value;memcpy(&value,p.payload,sizeof(value));
-    sendAck(message.mac,p.seq,p.type,beginConfig(value));
+    if(p.seq!=lastConfigBeginSeq) {
+      lastConfigBeginSeq=p.seq;
+      queueDiagnostic(DIAG_CONFIG_BEGIN,value.revision,p.seq);
+    }
+    const uint8_t result=beginConfig(value);
+    if(!sendAck(message.mac,p.seq,p.type,result)) queueDiagnostic(DIAG_CONFIG_ACK_FAILED,result,p.seq);
   } else if(p.type==CONFIG_CELL) {
     if(p.length!=sizeof(ConfigCellPayload)) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
     ConfigCellPayload value;memcpy(&value,p.payload,sizeof(value));
@@ -767,7 +985,13 @@ void handleRadio(const Received &message) {
     sendAck(message.mac,p.seq,p.type,lastBaselineStatus);
   } else if(p.type==SNAPSHOT_REQUEST) {
     if(p.length!=0) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
-    if(!startSnapshot()) sendAck(message.mac,p.seq,p.type,ACK_BUSY);
+    if(snapshot.active) {
+      sendAck(message.mac,p.seq,p.type,p.seq==snapshot.requestSeq?ACK_OK:ACK_BUSY);
+    } else {
+      const bool ready=framePixels && frameNumber;
+      sendAck(message.mac,p.seq,p.type,ready?ACK_OK:ACK_BUSY);
+      if(ready) startSnapshot(p.seq);
+    }
   }
 }
 
@@ -815,7 +1039,7 @@ char serialLine[180];size_t serialLength=0;
 void handleSerialLine(char *line) {
   char *command=strtok(line," \t");if(!command) return;
   if(strcmp(command,"H")==0) {
-    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast tolerance threshold_permille enter clear | A commit | R baseline | F raw frame | X clear config");
+    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast tolerance threshold_permille enter clear | A commit | R baseline | F raw frame | X clear RAM config | Z FORMAT LittleFS");
   } else if(strcmp(command,"I")==0) printInfo();
   else if(strcmp(command,"P")==0) {
     char *value=strtok(nullptr," \t");uint8_t mac[6];
@@ -860,6 +1084,16 @@ void handleSerialLine(char *line) {
   else if(strcmp(command,"X")==0) {
     cellCount=groupCount=0;baselineReady=configured=stagingOpen=false;
     stateHead=stateCount=0;DEBUGLN("configuration cleared from RAM");
+  } else if(strcmp(command,"Z")==0) {
+    char *confirmation=strtok(nullptr," \t");
+    if(!confirmation || strcmp(confirmation,"FORMAT")!=0 || snapshot.active || stagingOpen) {
+      DEBUGLN("Z FORMAT required; camera must be idle");
+    } else {
+      LittleFS.end();storageReady=false;
+      if(LittleFS.format()) storageReady=LittleFS.begin(false);
+      baselineReady=false;queueAllStates();
+      DEBUGLN(storageReady?"LittleFS formatted; capture a new baseline":"LittleFS format failed");
+    }
   } else DEBUGLN("unknown command; H for help");
 }
 void pollSerial() {
@@ -875,6 +1109,15 @@ void pollSerial() {
   }
 }
 
+bool blankStorage(const esp_partition_t *partition) {
+  uint8_t bytes[256];
+  for(size_t offset=0;offset<partition->size;offset+=sizeof(bytes)) {
+    size_t count=min(sizeof(bytes),(size_t)partition->size-offset);
+    if(esp_partition_read(partition,offset,bytes,count)!=ESP_OK) return false;
+    for(size_t i=0;i<count;++i) if(bytes[i]!=0xFF) return false;
+  }
+  return true;
+}
 void setup() {
   pinMode(STATUS_LED,OUTPUT);digitalWrite(STATUS_LED,LOW);
   Serial.begin(115200);delay(200);
@@ -891,12 +1134,26 @@ void setup() {
     tanQ8[degree]=(uint16_t)lroundf(tanf(degree*0.01745329252f)*256);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+  diagnosticBootId=esp_random();diagnosticResetReason=(uint8_t)esp_reset_reason();
+  const uint32_t previousOperation=rtcDiagnostic.magic==RTC_DIAG_MAGIC
+    ? ((uint32_t)rtcDiagnostic.operation<<8)|rtcDiagnostic.outcome : 0;
+  const uint32_t previousOffset=rtcDiagnostic.magic==RTC_DIAG_MAGIC?rtcDiagnostic.offset:0;
+  rtcDiagnostic={RTC_DIAG_MAGIC,0,0,0};
+  queueDiagnostic(DIAG_BOOT,previousOperation,previousOffset);
   esp_wifi_get_mac(WIFI_IF_STA,localMac);
   esp_wifi_set_channel(radioChannel,WIFI_SECOND_CHAN_NONE);
   if(esp_now_init()!=ESP_OK) { DEBUGLN("ESP-NOW init failed");return; }
   esp_now_register_recv_cb(onReceive);
   addPeer(BROADCAST_MAC);
+  const esp_partition_t *storage=esp_partition_find_first(ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_SPIFFS,"spiffs");
+  bool freshStorage=storage && blankStorage(storage);
+  storageReady=storage && LittleFS.begin(freshStorage);
+  if(!storage) DEBUGLN("LittleFS partition missing");
+  if(!storageReady) DEBUGLN("LittleFS unavailable; persistent baseline disabled");
+  else if(freshStorage) DEBUGLN("LittleFS initialized");
   initCamera(cameraSettings);
+  loadBaseline();
+  queueDiagnostic(cameraReady?DIAG_READY:DIAG_INIT_FAILED,configRevision);
   printInfo();
   DEBUGLN("Send H for USB commands. Configuration and baseline are volatile.");
 }
@@ -907,12 +1164,18 @@ void loop() {
   Received message;
   for(int n=0;n<16 && xQueueReceive(inbox,&message,0)==pdTRUE;++n) handleRadio(message);
   serviceSnapshot();
+  serviceDiagnostics();
   if(cameraReady && !snapshot.active && millis()-lastCapture>=100) {
     if(captureFrame()) analyseAllCells();
   }
   flushState();
   if(millis()-lastHello>=HELLO_MS) { lastHello=millis();sendHello(); }
   if(millis()-lastHealth>=HEALTH_MS) { lastHealth=millis();sendHealth(); }
+  // A router channel change can move the bridge. Search until its beacon reappears.
+  if(!snapshot.active && millis()-lastBridgeBeacon>18000 && millis()-lastChannelScan>=1400) {
+    lastChannelScan=millis();
+    setChannel(radioChannel==13?1:radioChannel+1);
+  }
   static uint32_t lastRefresh=0;
   if(millis()-lastRefresh>=30000) { lastRefresh=millis();queueAllStates(); }
   delay(1);

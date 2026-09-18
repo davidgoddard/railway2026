@@ -1,1 +1,5 @@
 .DS_Store
+Bridge_Controller/node_modules/
+Bridge_Controller/dist/
+Bridge_Controller/.electron-gyp/
+Bridge_Controller/.cache/

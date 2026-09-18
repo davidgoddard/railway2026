@@ -46,6 +46,8 @@ A wired state link remains an option. I²C has sufficient bandwidth for compact 
 
 ## Configuration workflow
 
+**Prototype implementation note:** The current bridge stores camera cell assignments in its LittleFS partition and exposes them through a USB serial command protocol. The current camera stores its explicitly captured grayscale baseline image and derived features in its own LittleFS partition. The Electron editor and historical-image redeployment workflow below remain future work; the prototype does not yet send an older saved image back to a camera after sensor edits.
+
 1. Pair each camera explicitly and assign a stable device ID. Reports from unpaired devices cannot alter states.
 2. Display a representative camera image with its resolution and orientation. Draw polygonal ROIs around visible track and assign unique IDs and names. Warn about out-of-frame regions; label low-texture cells as blank backgrounds rather than rejecting them. Permit intentional overlap.
 3. With the whole visible layout empty, capture a full-frame baseline snapshot for each camera and save it in the setup application's project data. Record camera identity, image dimensions, camera settings, image checksum, and revision. Derive each ROI's cell features from that snapshot and persist the compact results on the camera with its ROI geometry and cell layout. Require a new full-frame snapshot after camera movement, resolution or relevant exposure changes.

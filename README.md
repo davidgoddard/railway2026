@@ -2,13 +2,13 @@
 
 An experimental toolkit for detecting occupation on a **model railway** using cameras instead of track or rolling-stock modifications. A camera watches selected parts of the layout and compares each new frame with an empty-track reference. The intended output is a clear, occupied, or unknown state for each virtual sensor or block.
 
-This repository contains a browser-based camera algorithm experiment and a first multi-cell camera firmware sketch. The bridge controller, MQTT publishing, and setup application described below are planned work; the new camera protocol has not yet been tested with a bridge.
+This repository contains a browser-based camera algorithm experiment, a multi-cell camera firmware sketch, and a first ESP32 bridge controller. A first Electron setup application is in `Bridge_Controller`. The camera-to-bridge protocol has not yet been tested on hardware.
 
 ## Intended system
 
 ```text
 Camera modules                         Controller                 Layout automation
-ESP32-S3, local frame processing  →   ESP32-S3              →   MQTT broker and clients
+ESP32-S3, local frame processing  →   ESP32-C3 SuperMini     →   MQTT broker and clients
 compact state over ESP-NOW             state and health bridge
 
 Setup application and temporary Wi-Fi hotspot: configuration, preview, diagnostics
@@ -43,7 +43,7 @@ The [camera module experiment](experiments/camera_module/README.md) runs on an A
 
 The experiment uses one cell and does **not** yet send ESP-NOW or MQTT messages, persist settings, or implement drawn blocks. Its baseline is captured from one frame, and its classification thresholds still need testing on actual track and rolling stock.
 
-The separate [Camera Module firmware](Camera_Module/README.md) accepts up to 300 configured cells, combines cells into block groups, reports state over ESP-NOW, and provides USB configuration and snapshot commands. Its configuration and baseline are currently volatile, and the bridge side of its protocol still needs implementation.
+The separate [Camera Module firmware](Camera_Module/README.md) accepts up to 300 configured cells, combines cells into block groups, reports state over ESP-NOW, and provides USB configuration and snapshot commands. It now saves an explicitly captured baseline and its configuration to camera flash. The [bridge controller](Bridge_Controller/README.md) stores each camera assignment, uploads it over ESP-NOW, forwards state to MQTT, and exposes USB setup commands.
 
 ### Try it
 
@@ -65,7 +65,7 @@ The sketch version appears at the top of the `.ino` file, on the web page, and i
 
 1. Collect logs from stationary empty track under changing daylight, artificial light, and camera exposure; tune false-change behaviour before treating the algorithm as reliable.
 2. Test resolution, frame rate, PSRAM use, and cell count on the chosen ESP32-S3 camera hardware.
-3. Test the multi-cell block logic, snapshot transfer, and ESP-NOW state reporting against a bridge on real hardware.
-4. Implement configuration persistence, authenticated pairing, controller MQTT publishing, and the setup application according to the functional specification.
+3. Test the multi-cell block logic, snapshot transfer, persistence, and ESP-NOW state reporting against the bridge on real hardware.
+4. Test and package the Electron setup application on macOS and Windows hardware, and add authenticated pairing according to the functional specification.
 
 The specification deliberately marks unresolved design choices and acceptance scenarios. Results from the camera experiment should update it as the hardware and algorithm are validated.

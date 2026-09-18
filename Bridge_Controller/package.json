@@ -1,0 +1,38 @@
+{
+  "name": "railway-bridge-controller",
+  "version": "0.1.0",
+  "private": true,
+  "description": "USB setup and monitor app for the Railway ESP32 bridge",
+  "main": "app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test app/*.test.js",
+    "pack:mac": "electron-builder --mac dmg zip",
+    "pack:win": "electron-builder --win nsis zip"
+  },
+  "dependencies": {
+    "serialport": "^13.0.0"
+  },
+  "devDependencies": {
+    "electron": "^41.7.1",
+    "electron-builder": "^26.0.0"
+  },
+  "build": {
+    "appId": "uk.railway.bridgecontroller",
+    "productName": "Railway Bridge Controller",
+    "files": [
+      "app/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "node_modules/@serialport/**/*",
+      "node_modules/serialport/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.utilities"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}
