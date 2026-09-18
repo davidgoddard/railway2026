@@ -1,7 +1,13 @@
-#define CAMERA_MODULE_VERSION "0.1.3"
+#define CAMERA_MODULE_VERSION "0.1.4"
 #define CAMERA_DEBUG_SERIAL 1
+// Override these in the build flags for another supported camera board.
+#if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define CAMERA_BOARD_ESP32S3_EYE 1
+#else
 #define CAMERA_BOARD_AI_THINKER 1
-// #define CAMERA_BOARD_ESP32S3_EYE 1
+#endif
+#endif
 
 // Railway camera firmware. ESP-NOW uses the Wi-Fi radio without an IP network.
 #include <Arduino.h>
@@ -10,27 +16,13 @@
 #include <esp_now.h>
 #include <esp_system.h>
 #include <miniz.h>
-#include <esp_camera.h>
 #include <LittleFS.h>
 #include <esp_partition.h>
 #include <math.h>
 #include <stddef.h>
 
-#if defined(CAMERA_BOARD_AI_THINKER) && defined(CAMERA_BOARD_ESP32S3_EYE)
-#error Select one camera board
-#endif
-#if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
-#error Select a camera board and add its pin map
-#endif
-
-#if defined(CAMERA_BOARD_AI_THINKER)
-constexpr int PWDN=32, RESET=-1, XCLK=0, SIOD=26, SIOC=27;
-constexpr int D0=5,D1=18,D2=19,D3=21,D4=36,D5=39,D6=34,D7=35;
-constexpr int VSYNC=25,HREF=23,PCLK=22, STATUS_LED=4; // AI Thinker flash LED
-#else
-constexpr int PWDN=-1, RESET=-1, XCLK=15, SIOD=4, SIOC=5;
-constexpr int D0=11,D1=9,D2=8,D3=10,D4=12,D5=18,D6=17,D7=16;
-constexpr int VSYNC=6,HREF=7,PCLK=13, STATUS_LED=3; // S3-EYE LED: verify board revision
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+#error ESP32-P4 needs a board-specific image source and ESP-NOW transport via a companion radio
 #endif
 
 #if CAMERA_DEBUG_SERIAL
@@ -129,11 +121,8 @@ struct __attribute__((packed)) DiagnosticPayload {
 };
 static_assert(sizeof(ConfigCellPayload)<=RADIO_PAYLOAD, "Cell message too large");
 
-struct Resolution { framesize_t frameSize; uint16_t width,height; };
-const Resolution RESOLUTIONS[]={
-  {FRAMESIZE_QVGA,320,240},{FRAMESIZE_VGA,640,480},
-  {FRAMESIZE_SVGA,800,600},{FRAMESIZE_XGA,1024,768}
-};
+#include "ImageSource.h"
+ImageSource imageSource;
 CameraSettings cameraSettings={QVGA,0,0,0,0,0};
 uint16_t frameWidth=320,frameHeight=240;
 uint8_t *framePixels=nullptr;
@@ -142,10 +131,12 @@ bool storageReady=false;
 uint8_t baselineStorageError=0;
 uint32_t frameNumber=0, configRevision=0, captureFailures=0;
 uint32_t lastHello=0,lastHealth=0,lastCapture=0,nextSeq=1;
+uint32_t lastFullStateRefresh=0;
 uint8_t localMac[6]={},bridgeMac[6]={};
 bool bridgeKnown=false;
 uint8_t radioChannel=1;
-uint32_t lastBridgeBeacon=0,lastChannelScan=0;
+uint32_t lastBridgeBeacon=0,lastChannelScan=0,lastBridgeBeaconSeq=0;
+constexpr uint32_t BRIDGE_SEARCH_AFTER_MS=5000,CHANNEL_DWELL_MS=600;
 
 struct Anchor { uint16_t x,y; };
 struct Feature {
@@ -161,6 +152,8 @@ struct Feature {
 struct CellRuntime {
   CellConfig config={};
   Feature reference={};
+  // Retained only to read baselines written by earlier firmware revisions.
+  // OccupancyDetector never uses these saved edge locations.
   Anchor anchors[MAX_ANCHORS]={};
   uint8_t anchorCount=0;
   uint8_t state=UNKNOWN,enterCount=0,clearCount=0;
@@ -273,45 +266,17 @@ void onReceive(const esp_now_recv_info_t *info,const uint8_t *data,int length) {
 void flashReady() {
   for(int i=0;i<2;++i) { digitalWrite(STATUS_LED,HIGH);delay(120);digitalWrite(STATUS_LED,LOW);delay(120); }
 }
+// The board adapter owns the camera driver; the rest of the sketch sees grayscale frames.
 bool initCamera(const CameraSettings &settings) {
-  if(settings.resolution>XGA) return false;
-  if(cameraReady) { esp_camera_deinit();cameraReady=false; }
-  free(framePixels);framePixels=nullptr;
-  const Resolution &r=RESOLUTIONS[settings.resolution];
-  frameWidth=r.width;frameHeight=r.height;
-  framePixels=(uint8_t *)ps_malloc((size_t)r.width*r.height);
-  if(!framePixels) return false;
-  camera_config_t c={};
-  c.pin_pwdn=PWDN;c.pin_reset=RESET;c.pin_xclk=XCLK;c.pin_sccb_sda=SIOD;c.pin_sccb_scl=SIOC;
-  c.pin_d0=D0;c.pin_d1=D1;c.pin_d2=D2;c.pin_d3=D3;c.pin_d4=D4;c.pin_d5=D5;c.pin_d6=D6;c.pin_d7=D7;
-  c.pin_vsync=VSYNC;c.pin_href=HREF;c.pin_pclk=PCLK;c.xclk_freq_hz=20000000;
-  c.ledc_timer=LEDC_TIMER_0;c.ledc_channel=LEDC_CHANNEL_0;
-  c.pixel_format=PIXFORMAT_GRAYSCALE;c.frame_size=r.frameSize;
-  c.fb_location=CAMERA_FB_IN_PSRAM;c.fb_count=1;c.grab_mode=CAMERA_GRAB_WHEN_EMPTY;
-  if(esp_camera_init(&c)!=ESP_OK) { free(framePixels);framePixels=nullptr;return false; }
-  sensor_t *sensor=esp_camera_sensor_get();
-  if(sensor) {
-    sensor->set_brightness(sensor,settings.brightness);
-    sensor->set_contrast(sensor,settings.contrast);
-    sensor->set_saturation(sensor,settings.saturation);
-    sensor->set_vflip(sensor,settings.vflip);
-    sensor->set_hmirror(sensor,settings.hmirror);
-  }
-  cameraSettings=settings;cameraReady=true;
-  DEBUGF("camera %ux%u grayscale ready\n",frameWidth,frameHeight);
-  return true;
+  const bool ok=imageSource.begin(settings,framePixels,frameWidth,frameHeight);
+  cameraReady=ok;
+  if(ok) cameraSettings=settings;
+  return ok;
 }
 bool captureFrame() {
   if(!cameraReady || !framePixels) return false;
   lastCapture=millis();
-  camera_fb_t *fb=esp_camera_fb_get();
-  const size_t bytes=(size_t)frameWidth*frameHeight;
-  if(!fb) { ++captureFailures;return false; }
-  const bool valid=fb->format==PIXFORMAT_GRAYSCALE && fb->width==frameWidth &&
-    fb->height==frameHeight && fb->len>=bytes;
-  if(valid) memcpy(framePixels,fb->buf,bytes);
-  esp_camera_fb_return(fb);
-  if(!valid) { ++captureFailures;return false; }
+  if(!imageSource.capture(framePixels,frameWidth,frameHeight)) { ++captureFailures;return false; }
   ++frameNumber;return true;
 }
 
@@ -355,207 +320,9 @@ void queueAllStates() {
   }
 }
 
-void gradientAt(const uint8_t *pixels,int p,int &gx,int &gy) {
-  gx=-pixels[p-frameWidth-1]+pixels[p-frameWidth+1]
-     -2*pixels[p-1]+2*pixels[p+1]
-     -pixels[p+frameWidth-1]+pixels[p+frameWidth+1];
-  gy=-pixels[p-frameWidth-1]-2*pixels[p-frameWidth]-pixels[p-frameWidth+1]
-     +pixels[p+frameWidth-1]+2*pixels[p+frameWidth]+pixels[p+frameWidth+1];
-}
-bool insideCell(const CellConfig &c,int x,int y) {
-  if(x<=0 || x>=frameWidth-1 || y<=0 || y>=frameHeight-1) return false;
-  const int dx=x-(int)c.x,dy=y-(int)c.y;
-  return c.shape==0 ? dx*dx+dy*dy<=c.radius*c.radius
-                    : abs(dx)<c.radius && abs(dy)<c.radius;
-}
-void bounds(const CellConfig &c,int &x0,int &x1,int &y0,int &y1) {
-  x0=max(1,(int)c.x-c.radius);x1=min((int)frameWidth-2,(int)c.x+c.radius);
-  y0=max(1,(int)c.y-c.radius);y1=min((int)frameHeight-2,(int)c.y+c.radius);
-}
-uint16_t tanQ8[21]={};
-bool nearDirection(const CellRuntime &cell,int peak,int gx,int gy,int tolerance) {
-  const int32_t dot=abs(gx*cell.directionX[peak]+gy*cell.directionY[peak]);
-  const int32_t cross=abs(gy*cell.directionX[peak]-gx*cell.directionY[peak]);
-  return cross*256<=dot*tanQ8[constrain(tolerance,0,20)];
-}
-uint8_t directionBucket(const CellRuntime &cell,int gx,int gy) {
-  int32_t bestDot=-1;uint8_t best=MAX_PEAKS;
-  for(uint8_t peak=0;peak<cell.reference.peakCount;++peak) {
-    if(!nearDirection(cell,peak,gx,gy,cell.config.angleTolerance)) continue;
-    const int32_t dot=abs(gx*cell.directionX[peak]+gy*cell.directionY[peak]);
-    if(dot>bestDot) { bestDot=dot;best=peak; }
-  }
-  return best;
-}
-void selectPeaks(Feature &f) {
-  uint32_t support[BINS]={};
-  for(int i=0;i<BINS;++i) support[i]=f.hist[(i+BINS-1)%BINS]+f.hist[i]+f.hist[(i+1)%BINS];
-  uint32_t selected=0,primary=0;
-  for(int peak=0;peak<MAX_PEAKS;++peak) {
-    int best=-1;uint32_t count=0;
-    for(int bin=0;bin<BINS;++bin) {
-      bool close=false;
-      for(int delta=-2;delta<=2;++delta)
-        if(selected&(1UL<<((bin+delta+BINS)%BINS))) close=true;
-      if(!close && support[bin]>count) { best=bin;count=support[bin]; }
-    }
-    if(best<0 || count<6) break;
-    if(peak==0) { if(count*4<f.edges) break;primary=count; }
-    else if(count*5<f.edges || count*2<primary) break;
-    selected|=1UL<<best;
-    const float centre=best*10.0f+5.0f;
-    float total=0;
-    for(int delta=-1;delta<=1;++delta) {
-      const int bin=(best+delta+BINS)%BINS;
-      if(!f.hist[bin]) continue;
-      float mean=f.angleSum[bin]/f.hist[bin];
-      while(mean-centre>90) mean-=180;
-      while(mean-centre< -90) mean+=180;
-      total+=mean*f.hist[bin];
-    }
-    float refined=total/count;
-    if(refined<0) refined+=180;
-    if(refined>=180) refined-=180;
-    f.peakAngle[f.peakCount]=refined;
-    f.peakShare[f.peakCount]=(float)count/f.edges;
-    ++f.peakCount;
-  }
-}
-Feature analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[MAX_PEAKS+1]) {
-  Feature f={};
-  uint16_t magnitudes[64]={};
-  memset(buckets,0,(MAX_PEAKS+1)*sizeof(uint16_t));
-  int x0,x1,y0,y1;bounds(cell.config,x0,x1,y0,y1);
-  for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
-    if(!insideCell(cell.config,x,y)) continue;
-    const int p=y*frameWidth+x;
-    int gx,gy;gradientAt(framePixels,p,gx,gy);
-    const int magnitude=abs(gx)+abs(gy);
-    ++f.samples;f.graySum+=framePixels[p];
-    if(framePixels[p]>=250) ++f.whitePixels;
-    f.maxGradient=max(f.maxGradient,(uint16_t)magnitude);
-    ++magnitudes[min(magnitude>>4,63)];
-  }
-  uint32_t total=0;
-  for(int i=0;i<64;++i) {
-    total+=magnitudes[i];
-    if(!f.medianGradient && total>=(f.samples+1)/2) f.medianGradient=i*16+8;
-    if(total>=(f.samples*95+99)/100) { f.upperGradient=i*16+8;break; }
-  }
-  if(f.maxGradient<cell.config.contrastFloor) return f;
-  // Use the saved reference cutoff for live frames. A changing bright pixel
-  // must not move the cutoff for every edge in an otherwise unchanged cell.
-  const int minimum=max((int)cell.config.contrastFloor,
-    (int)(referenceMode?f.maxGradient:cell.reference.maxGradient)/4);
-  for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
-    if(!insideCell(cell.config,x,y)) continue;
-    int gx,gy;gradientAt(framePixels,y*frameWidth+x,gx,gy);
-    if(abs(gx)+abs(gy)<minimum) continue;
-    ++f.edges;
-    if(!referenceMode && cell.reference.peakCount) {
-      ++buckets[directionBucket(cell,gx,gy)];
-    } else {
-      float angle=atan2f((float)gy,(float)gx)*57.2957795f;
-      if(angle<0) angle+=180;
-      if(angle>=180) angle-=180;
-      const int bin=min((int)(angle/10),BINS-1);
-      ++f.hist[bin];f.angleSum[bin]+=angle;
-    }
-  }
-  f.textured=f.edges>=8;
-  if(referenceMode && f.textured) selectPeaks(f);
-  return f;
-}
-float histogramDistance(const Feature &a,const Feature &b) {
-  if(!a.edges || !b.edges) return 1;
-  float sum=0;
-  for(int i=0;i<BINS;++i) {
-    const int am=a.hist[(i+BINS-1)%BINS]+2*a.hist[i]+a.hist[(i+1)%BINS];
-    const int bm=b.hist[(i+BINS-1)%BINS]+2*b.hist[i]+b.hist[(i+1)%BINS];
-    sum+=fabsf((float)am/(4*a.edges)-(float)bm/(4*b.edges));
-  }
-  return min(1.0f,0.5f*sum);
-}
-float projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
-  if(!cell.reference.edges || !live.edges) return 1;
-  float sum=0;
-  for(int i=0;i<=MAX_PEAKS;++i)
-    sum+=fabsf((float)cell.referenceBuckets[i]/cell.reference.edges
-             -(float)buckets[i]/live.edges);
-  return min(1.0f,0.5f*sum);
-}
-void captureAnchors(CellRuntime &cell) {
-  cell.anchorCount=0;
-  if(!cell.reference.peakCount) return;
-  const int minMagnitude=max((int)cell.config.contrastFloor,(int)cell.reference.maxGradient/4);
-  const int separation=max(5,(int)cell.config.radius/2);
-  int x0,x1,y0,y1;bounds(cell.config,x0,x1,y0,y1);
-  for(int n=0;n<MAX_ANCHORS;++n) {
-    int best=-1;Anchor point={};
-    for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
-      if(!insideCell(cell.config,x,y)) continue;
-      if(n && (x-cell.anchors[0].x)*(x-cell.anchors[0].x)
-             +(y-cell.anchors[0].y)*(y-cell.anchors[0].y)<separation*separation) continue;
-      int gx,gy;gradientAt(framePixels,y*frameWidth+x,gx,gy);
-      const int magnitude=abs(gx)+abs(gy);
-      if(magnitude>=minMagnitude && magnitude>best &&
-         nearDirection(cell,0,gx,gy,max(3,(int)cell.config.angleTolerance))) {
-        best=magnitude;point={(uint16_t)x,(uint16_t)y};
-      }
-    }
-    if(best<0) break;
-    cell.anchors[cell.anchorCount++]=point;
-  }
-}
-float anchorDistance(const CellRuntime &cell,const Feature &live) {
-  if(!cell.anchorCount || !live.textured) return 0;
-  int found=0;
-  const int minimum=max((int)cell.config.contrastFloor,(int)cell.reference.maxGradient/4);
-  for(int n=0;n<cell.anchorCount;++n) {
-    bool matched=false;
-    for(int dy=-2;dy<=2 && !matched;++dy) for(int dx=-2;dx<=2;++dx) {
-      const int x=cell.anchors[n].x+dx,y=cell.anchors[n].y+dy;
-      if(!insideCell(cell.config,x,y)) continue;
-      int gx,gy;gradientAt(framePixels,y*frameWidth+x,gx,gy);
-      if(abs(gx)+abs(gy)>=minimum &&
-         nearDirection(cell,0,gx,gy,max(3,(int)cell.config.angleTolerance))) {
-        matched=true;break;
-      }
-    }
-    if(matched) ++found;
-  }
-  return (float)(cell.anchorCount-found)/cell.anchorCount;
-}
-void calibrateCell(CellRuntime &cell) {
-  uint16_t unused[MAX_PEAKS+1]={};
-  cell.reference=analyse(cell,true,unused);
-  memset(cell.referenceBuckets,0,sizeof(cell.referenceBuckets));
-  cell.anchorCount=0;
-  for(int peak=0;peak<cell.reference.peakCount;++peak) {
-    const float radians=cell.reference.peakAngle[peak]*0.01745329252f;
-    cell.directionX[peak]=(int16_t)lroundf(cosf(radians)*256);
-    cell.directionY[peak]=(int16_t)lroundf(sinf(radians)*256);
-  }
-  // Calculate baseline buckets with the same projected assignment as live frames.
-  if(cell.reference.peakCount) {
-    int x0,x1,y0,y1;bounds(cell.config,x0,x1,y0,y1);
-    const int minimum=max((int)cell.config.contrastFloor,(int)cell.reference.maxGradient/4);
-    for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
-      if(!insideCell(cell.config,x,y)) continue;
-      int gx,gy;gradientAt(framePixels,y*frameWidth+x,gx,gy);
-      if(abs(gx)+abs(gy)>=minimum) ++cell.referenceBuckets[directionBucket(cell,gx,gy)];
-    }
-    captureAnchors(cell);
-  }
-  cell.state=CLEAR;cell.enterCount=cell.clearCount=0;cell.scorePermille=0;
-  DEBUGF("base id=%lu group=%lu centre=(%u,%u) r=%u edges=%u angles=%u",
-    (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
-    cell.config.x,cell.config.y,cell.config.radius,cell.reference.edges,cell.reference.peakCount);
-#if CAMERA_DEBUG_SERIAL
-  for(int i=0;i<cell.reference.peakCount;++i) DEBUGF(" %.1fdeg",cell.reference.peakAngle[i]);
-  DEBUGF(" anchors=%u\n",cell.anchorCount);
-#endif
-}
+#include "OccupancyDetector.h"
+OccupancyDetector detector;
+
 void baselineHeartbeat() {
   if(millis()-lastHello>=1000) { sendHello();lastHello=millis();delay(2); }
   if(millis()-lastHealth>=5000) { sendHealth();lastHealth=millis();delay(2); }
@@ -567,7 +334,12 @@ bool captureBaseline() {
   DEBUGF("baseline capture start revision=%lu frame=%lu\n",(unsigned long)configRevision,(unsigned long)frameNumber);
   sendHello();lastHello=millis();
   if(snapshot.active || !captureFrame()) { rtcDiagnostic.outcome=1;queueDiagnostic(DIAG_BASELINE_FAILED,1);rtcDiagnostic.operation=0;return false; }
-  for(uint16_t i=0;i<cellCount;++i) { calibrateCell(cells[i]);baselineHeartbeat(); }
+  detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+  for(uint16_t i=0;i<cellCount;++i) {
+    // Retain the flash record layout, but do not save old edge locations.
+    memset(cells[i].anchors,0,sizeof(cells[i].anchors));cells[i].anchorCount=0;
+    detector.calibrateCell(cells[i]);baselineHeartbeat();
+  }
   if(!saveBaseline()) {
     const uint32_t freeBytes=storageReady?LittleFS.totalBytes()-LittleFS.usedBytes():0;
     DEBUGF("baseline flash write failed stage=%u free_bytes=%lu\n",baselineStorageError,(unsigned long)freeBytes);
@@ -581,91 +353,6 @@ bool captureBaseline() {
   DEBUGF("baseline ready: %u cells frame=%lu duration_ms=%lu\n",cellCount,(unsigned long)frameNumber,(unsigned long)(millis()-started));
   rtcDiagnostic.outcome=3;queueDiagnostic(DIAG_BASELINE_DONE,millis()-started);rtcDiagnostic.operation=0;
   return true;
-}
-
-bool exposureUnreliable(const CellRuntime &cell,const Feature &live) {
-  if(!live.samples || !cell.reference.samples) return false;
-  const float mean=(float)live.graySum/live.samples;
-  const float referenceMean=(float)cell.reference.graySum/cell.reference.samples;
-  const float white=(float)live.whitePixels/live.samples;
-  const float referenceWhite=(float)cell.reference.whitePixels/cell.reference.samples;
-  const bool clipped=white>=0.40f && white>=referenceWhite+0.25f;
-  const bool lostDetail=cell.reference.textured && cell.reference.edges>=16 && !live.textured &&
-    live.maxGradient*2<cell.reference.maxGradient;
-  return mean>=referenceMean+25 && (clipped || lostDetail);
-}
-uint16_t compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
-  // Angle histograms from fewer than 16 edges are too sparse to compare reliably.
-  // Treat a weak, unoriented reference as clear until the live patch has real detail.
-  if(!cell.reference.peakCount && cell.reference.edges<16 && live.edges<16) return 0;
-  float score=0;
-  if(!cell.reference.textured && !live.textured) score=0;
-  else if(cell.reference.textured!=live.textured) score=1;
-  else if(cell.reference.peakCount) score=projectionDistance(cell,live,buckets);
-  else score=histogramDistance(cell.reference,live);
-  if(cell.reference.textured && live.textured && cell.reference.samples>=64 &&
-     live.samples>=64 && (!cell.reference.peakCount || cell.reference.peakShare[0]<0.40f) &&
-     live.upperGradient>cell.reference.upperGradient+40) {
-    const float refTail=(float)(cell.reference.upperGradient+8)/(cell.reference.medianGradient+8);
-    const float liveTail=(float)(live.upperGradient+8)/(live.medianGradient+8);
-    if(liveTail>refTail) score=max(score,1.0f-refTail/liveTail);
-  }
-  if(cell.anchorCount && live.textured) score=max(score,anchorDistance(cell,live));
-  return (uint16_t)constrain((int)lroundf(score*1000),0,1000);
-}
-void updateGroups() {
-  for(uint16_t g=0;g<groupCount;++g) {
-    bool occupied=false,unknown=false;
-    uint16_t score=0;
-    for(uint16_t i=0;i<cellCount;++i) if(cells[i].config.groupId==groups[g].id) {
-      if(cells[i].state==OCCUPIED) occupied=true;
-      if(cells[i].state==UNKNOWN) unknown=true;
-      score=max(score,cells[i].scorePermille);
-    }
-    const uint8_t next=occupied?OCCUPIED:unknown?UNKNOWN:CLEAR;
-    if(next!=groups[g].state) {
-      groups[g].state=next;
-      queueState(groups[g].id,true,next,score);
-    }
-  }
-}
-void analyseAllCells() {
-  if(!baselineReady) return;
-  for(uint16_t i=0;i<cellCount;++i) {
-    CellRuntime &cell=cells[i];
-    uint16_t buckets[MAX_PEAKS+1]={};
-    const Feature live=analyse(cell,false,buckets);
-    if(exposureUnreliable(cell,live)) {
-      // Preserve occupancy while image evidence is unavailable.
-      cell.enterCount=cell.clearCount=0;
-      DEBUGF("unreliable id=%lu overexposure\n",(unsigned long)cell.config.id);
-      continue;
-    }
-    cell.scorePermille=compareCell(cell,live,buckets);
-    const uint8_t old=cell.state;
-    if(cell.scorePermille>=cell.config.thresholdPermille) {
-      cell.enterCount=min((int)cell.enterCount+1,255);
-      cell.clearCount=0;
-      if(cell.enterCount>=cell.config.enterFrames) cell.state=OCCUPIED;
-    } else if(cell.scorePermille<(uint16_t)(cell.config.thresholdPermille*0.7f)) {
-      cell.clearCount=min((int)cell.clearCount+1,255);
-      cell.enterCount=0;
-      if(cell.clearCount>=cell.config.clearFrames) cell.state=CLEAR;
-    }
-    if(old!=cell.state) {
-      const uint16_t directionScore=cell.reference.peakCount && live.textured?
-        (uint16_t)lroundf(projectionDistance(cell,live,buckets)*1000):0;
-      const uint16_t anchorScore=cell.anchorCount && live.textured?
-        (uint16_t)lroundf(anchorDistance(cell,live)*1000):0;
-      DEBUGF("trigger id=%lu group=%lu %s score=%u direction=%u anchor=%u angles=%u anchors=%u edges=%u/%u max=%u/%u\n",
-        (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
-        cell.state==OCCUPIED?"occupied":"clear",cell.scorePermille,directionScore,anchorScore,
-        cell.reference.peakCount,cell.anchorCount,live.edges,cell.reference.edges,
-        live.maxGradient,cell.reference.maxGradient);
-      queueState(cell.config.id,false,cell.state,cell.scorePermille);
-    }
-  }
-  updateGroups();
 }
 
 bool validSettings(const CameraSettings &s) {
@@ -918,7 +605,7 @@ bool setBridge(const uint8_t *mac) {
   char name[18];macText(mac,name);
   DEBUGF("bridge %s paired for this boot\n",name);
   queueDiagnostic(DIAG_BRIDGE_JOIN,configRevision);
-  queueAllStates();
+  queueAllStates();lastFullStateRefresh=millis();
   return true;
 }
 uint32_t lastBaselineSeq=0;
@@ -932,10 +619,20 @@ void handleRadio(const Received &message) {
     if(memcmp(beacon.mac,message.mac,6)!=0 || beacon.channel!=radioChannel ||
        beacon.width!=0 || beacon.height!=0 ||
        sameMac(message.mac,localMac)) return;
+    const uint32_t now=millis();
+    const bool newBridge=!bridgeKnown;
+    const bool missedBridge=lastBridgeBeacon && now-lastBridgeBeacon>1500;
+    const bool bridgeRestarted=lastBridgeBeaconSeq && (int32_t)(p.seq-lastBridgeBeaconSeq)<0;
     if(!bridgeKnown) setBridge(message.mac);
     if(sameMac(message.mac,bridgeMac)) {
-      if(lastBridgeBeacon && millis()-lastBridgeBeacon>12000) queueDiagnostic(DIAG_BRIDGE_REJOIN,millis()-lastBridgeBeacon);
-      lastBridgeBeacon=millis();
+      if(lastBridgeBeacon && now-lastBridgeBeacon>12000) queueDiagnostic(DIAG_BRIDGE_REJOIN,now-lastBridgeBeacon);
+      lastBridgeBeacon=now;lastBridgeBeaconSeq=p.seq;
+      if(newBridge || missedBridge || bridgeRestarted) {
+        if(!newBridge) { queueAllStates();lastFullStateRefresh=now; }
+        // Reply promptly, with a short random offset so several cameras do not answer together.
+        lastHello=now-HELLO_MS+(esp_random()%200);
+        lastHealth=now-HEALTH_MS+250+(esp_random()%200);
+      }
     }
     return;
   }
@@ -1015,10 +712,10 @@ void printInfo() {
     (unsigned long)captureFailures,stateCount);
   for(uint16_t i=0;i<cellCount;++i) {
     const CellRuntime &c=cells[i];
-    DEBUGF("[%u] id=%lu group=%lu (%u,%u) r=%u %s angle0=%.1f angles=%u anchors=%u score=%u state=%u\n",
+    DEBUGF("[%u] id=%lu group=%lu (%u,%u) r=%u %s angle0=%.1f angles=%u score=%u state=%u\n",
       i,(unsigned long)c.config.id,(unsigned long)c.config.groupId,c.config.x,c.config.y,
       c.config.radius,c.config.shape?"square":"circle",c.reference.peakAngle[0],
-      c.reference.peakCount,c.anchorCount,c.scorePermille,c.state);
+      c.reference.peakCount,c.scorePermille,c.state);
   }
 #endif
 }
@@ -1130,8 +827,7 @@ void setup() {
   if(!cells || !staging || !stateQueue || !inbox) { DEBUGLN("allocation failed");return; }
   memset(cells,0,sizeof(CellRuntime)*MAX_CELLS);
   memset(staging,0,sizeof(CellRuntime)*MAX_CELLS);
-  for(int degree=0;degree<=20;++degree)
-    tanQ8[degree]=(uint16_t)lroundf(tanf(degree*0.01745329252f)*256);
+  detector.begin();
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   diagnosticBootId=esp_random();diagnosticResetReason=(uint8_t)esp_reset_reason();
@@ -1165,18 +861,20 @@ void loop() {
   for(int n=0;n<16 && xQueueReceive(inbox,&message,0)==pdTRUE;++n) handleRadio(message);
   serviceSnapshot();
   serviceDiagnostics();
-  if(cameraReady && !snapshot.active && millis()-lastCapture>=100) {
-    if(captureFrame()) analyseAllCells();
+  if(cameraReady && !snapshot.active && millis()-lastCapture>=imageSource.captureIntervalMs()) {
+    if(captureFrame()) {
+      detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+      if(baselineReady) detector.analyseAllCells();
+    }
   }
   flushState();
   if(millis()-lastHello>=HELLO_MS) { lastHello=millis();sendHello(); }
   if(millis()-lastHealth>=HEALTH_MS) { lastHealth=millis();sendHealth(); }
   // A router channel change can move the bridge. Search until its beacon reappears.
-  if(!snapshot.active && millis()-lastBridgeBeacon>18000 && millis()-lastChannelScan>=1400) {
+  if(!snapshot.active && millis()-lastBridgeBeacon>BRIDGE_SEARCH_AFTER_MS && millis()-lastChannelScan>=CHANNEL_DWELL_MS) {
     lastChannelScan=millis();
     setChannel(radioChannel==13?1:radioChannel+1);
   }
-  static uint32_t lastRefresh=0;
-  if(millis()-lastRefresh>=30000) { lastRefresh=millis();queueAllStates(); }
+  if(millis()-lastFullStateRefresh>=30000) { lastFullStateRefresh=millis();queueAllStates(); }
   delay(1);
 }
