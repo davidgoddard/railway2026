@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="600" viewBox="0 0 1200 600" role="img" aria-labelledby="title desc">
+  <title id="title">Empty-track baseline calibration</title>
+  <desc id="desc">A grayscale cell is reduced to strong gradients, up to three dominant directions, and normalized direction counts. No edge positions are stored for matching.</desc>
+  <rect width="1200" height="600" fill="#ffffff"/>
+  <text x="60" y="76" font-family="Arial,sans-serif" font-size="34" font-weight="700" fill="#17212b">Empty-track baseline: record angle patterns</text>
+  <text x="60" y="112" font-family="Arial,sans-serif" font-size="19" fill="#43515e">One clear frame establishes the reference for each configured cell.</text>
+  <g font-family="Arial,sans-serif" text-anchor="middle" fill="#17212b">
+    <rect x="48" y="175" width="230" height="112" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>
+    <text x="163" y="220" font-size="22" font-weight="700">Cell pixels</text><text x="163" y="249" font-size="16">inside circle or square</text>
+    <rect x="345" y="175" width="230" height="112" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>
+    <text x="460" y="215" font-size="22" font-weight="700">Strong gradients</text><text x="460" y="245" font-size="16">Sobel strength ≥ cutoff</text>
+    <rect x="642" y="175" width="230" height="112" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>
+    <text x="757" y="215" font-size="22" font-weight="700">Angle peaks</text><text x="757" y="245" font-size="16">up to 3 if supported</text>
+    <rect x="939" y="175" width="213" height="112" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>
+    <text x="1045" y="215" font-size="22" font-weight="700">Reference shares</text><text x="1045" y="245" font-size="16">peaks + other angles</text>
+  </g>
+  <g stroke="#2478a8" stroke-width="4" fill="none" stroke-linecap="round"><path d="M284 231h50"/><path d="M581 231h50"/><path d="M878 231h50"/></g>
+  <g fill="#2478a8"><path d="M335 231l-13-8v16z"/><path d="M632 231l-13-8v16z"/><path d="M929 231l-13-8v16z"/></g>
+  <rect x="52" y="357" width="1096" height="150" rx="12" fill="#f6f8fa" stroke="#b8c6ce"/>
+  <text x="78" y="400" font-family="Arial,sans-serif" font-size="24" font-weight="700" fill="#17212b">Saved per cell</text>
+  <text x="78" y="437" font-family="Arial,sans-serif" font-size="18" fill="#253643">Edge count and strongest gradient • brightness and clipping statistics • peak angles and direction shares</text>
+  <text x="78" y="471" font-family="Arial,sans-serif" font-size="18" fill="#253643">If no stable peak is found, save the full 18-bin angle histogram for comparison.</text>
+  <text x="60" y="555" font-family="Arial,sans-serif" font-size="17" fill="#43515e">Edge locations are not matched. The old baseline record layout remains readable for compatibility.</text>
+</svg>
