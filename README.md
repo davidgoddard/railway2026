@@ -1,4 +1,4 @@
-# Railway camera occupancy toolkit
+# Model Railway Occupancy toolkit using Cameras
 
 An experimental toolkit for detecting occupation on a **model railway** using cameras instead of track or rolling-stock modifications. A camera watches selected parts of the layout and compares each new frame with an empty-track reference. The intended output is a clear, occupied, or unknown state for each virtual sensor or block.
 

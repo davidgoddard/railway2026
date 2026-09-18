@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
 const { crc32, Snapshot, parseRow, validateConfig, commandsForConfig } = require('./protocol');
-const { sameCameraConfiguration, alignConfigurationToFrame } = require('./config-match');
+const { sameCameraConfiguration, alignConfigurationToFrame, frameMatchesConfiguration } = require('./config-match');
 const mac = 'AA:BB:CC:DD:EE:FF';
 const config = () => ({ revision: 4, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 }, cells: [
   { id: 1, group: 20, x: 40, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5 },
@@ -24,14 +24,22 @@ test('rejects IDs used by another camera and invalid sensor bounds', () => {
   const c = config(); c.cells[0].x = 320;
   assert.throws(() => validateConfig(c), /outside/);
 });
-test('saved 800 × 600 frame keeps a sensor at 231, 511 valid when saving', () => {
+test('a new camera draft can align to an 800 × 600 frame', () => {
   const draft = config();
+  draft.revision = 0;
   draft.cells[0].x = 231;
   draft.cells[0].y = 511;
   assert.throws(() => validateConfig(draft), /outside the selected 320 × 240 image/);
   assert.equal(alignConfigurationToFrame(draft, { width: 800, height: 600 }), true);
   assert.equal(draft.settings.resolution, 2);
   assert.doesNotThrow(() => validateConfig(draft));
+});
+test('an old cached frame does not match the bridge configuration', () => {
+  const saved = config();
+  assert.equal(frameMatchesConfiguration(saved, { width: 800, height: 600 }), false);
+  assert.equal(frameMatchesConfiguration(saved, { width: 320, height: 240 }), true);
+  assert.equal(saved.settings.resolution, 0);
+  assert.equal(sameCameraConfiguration(structuredClone(saved), saved), true);
 });
 test('assembles and checks grayscale snapshot CRC and offset', () => {
   const bytes = Buffer.alloc(320 * 240, 127), checksum = crc32(bytes).toString(16).toUpperCase().padStart(8, '0');

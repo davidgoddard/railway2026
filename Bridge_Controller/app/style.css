@@ -111,3 +111,18 @@ canvas{max-height:100%}
 .diagnostic-row:last-child{border-bottom:0}
 .diagnostic-row strong,.diagnostic-row span{display:block;font-size:12px}
 .diagnostic-row span{color:#9db2bf;margin-top:3px}
+.monitor-settings{margin-bottom:16px}
+.monitor-settings form{display:grid;grid-template-columns:2fr 90px 1.5fr 1fr 1fr auto auto;gap:9px;align-items:end}
+.monitor-settings form label{min-width:0;margin:0}
+.monitor-settings form input{width:100%;margin-top:5px}
+.monitor-settings form button{height:38px;padding:7px 10px}
+.monitor-settings p{margin:12px 0 0}
+#viewer-status.connected{color:#46dfb6}#viewer-status.error{color:#ffb48d}
+.state-badge.stale{background:#354052;color:#d6c39d}
+.viewer-sensors{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:0 20px;padding:0 20px}
+.viewer-sensors .state-row{min-width:0}.viewer-sensors .state-row>div{min-width:0}.viewer-sensors small{overflow-wrap:anywhere}
+.viewer-empty{padding:14px 0;color:#8da2b6;font-size:12px}
+#viewer-history .viewer-empty{margin:0;padding:14px 20px}
+#viewer-history{max-height:260px}
+#monitor-cameras{padding:16px}
+@media(max-width:1200px){.monitor-settings form{grid-template-columns:repeat(3,minmax(0,1fr))}}

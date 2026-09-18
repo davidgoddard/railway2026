@@ -77,8 +77,11 @@ uint32_t wifiPendingAt=0,mqttPendingAt=0;
 uint16_t brokerPort=1883;
 uint32_t sequence=1,lastMqttAttempt=0,lastWifiAttempt=0;
 constexpr uint32_t MQTT_RETRY_MS=30000;
+constexpr uint32_t MQTT_EARLY_RETRY_MS=10000;
+uint8_t mqttStartupFailures=0;
 uint8_t radioChannel=START_CHANNEL;
-uint32_t lastBeacon=0;
+uint32_t lastBeacon=0,fastBeaconUntil=0;
+constexpr uint32_t FAST_BEACON_MS=250,NORMAL_BEACON_MS=500,FAST_BEACON_WINDOW_MS=20000;
 QueueHandle_t inbox=nullptr;
 struct Received { uint8_t mac[6]; Packet packet; };
 char line[1100]; size_t lineLength=0;
@@ -142,10 +145,35 @@ Packet makePacket(uint8_t type,uint32_t seq,const void *data,size_t length) {
   Packet p={};p.magic=MAGIC;p.version=VERSION;p.type=type;p.seq=seq;p.length=length;
   if(length) memcpy(p.payload,data,length);return p;
 }
+void broadcastBeacon() {
+  uint8_t mac[6]={};esp_wifi_get_mac(WIFI_IF_STA,mac);
+  HelloMessage beacon={};memcpy(beacon.mac,mac,6);beacon.channel=radioChannel;
+  Packet p=makePacket(HELLO,sequence++,&beacon,sizeof(beacon));sendPacket(BROADCAST,p);
+  lastBeacon=millis();
+}
 void sendSnapshotAck(Camera &c,uint32_t seq) { Packet p=makePacket(SNAPSHOT_ACK,seq,nullptr,0);sendPacket(c.mac,p); }
 void publish(const String &suffix,const String &value,bool retained=true) {
   if(mqtt.connected()) mqtt.publish((topic+suffix).c_str(),value.c_str(),retained);
   Serial.printf("EVENT MQTT %s %s\n",(topic+suffix).c_str(),value.c_str());
+}
+void clearArea(const String &name) {
+  String full=topic+"/areas/"+name+"/state";
+  if(mqtt.connected()) mqtt.publish(full.c_str(),"",true); // Empty retained payload deletes the broker's saved topic.
+  Serial.printf("EVENT MQTT_REMOVED %s\n",full.c_str());
+}
+bool activeAreaName(const String &name) {
+  for(const auto &c:cameras) if(c.used) for(uint16_t i=0;i<c.count;++i) {
+    uint32_t id=c.cells[i].group?c.cells[i].group:c.cells[i].id;
+    if(areaName(id)==name) return true;
+  }
+  return false;
+}
+void onMqttMessage(char *receivedTopic,uint8_t *payload,unsigned int length) {
+  String prefix=topic+"/areas/",full(receivedTopic);
+  if(!full.startsWith(prefix) || !full.endsWith("/state") || length==0) return;
+  String name=full.substring(prefix.length(),full.length()-6);
+  if(!name.length() || name.length()>32 || name.indexOf('/')>=0 || activeAreaName(name)) return;
+  clearArea(name);
 }
 const char *stateName(uint8_t state) { return state==CLEAR?"clear":state==OCCUPIED?"occupied":"unknown"; }
 bool isReported(const Camera &c,uint32_t id) {
@@ -220,7 +248,7 @@ bool saveStaged(Camera &c) {
       bool earlier=false,still=false;
       for(uint16_t j=0;j<i;++j) if((oldCells[j].group?oldCells[j].group:oldCells[j].id)==id) earlier=true;
       for(uint16_t j=0;j<c.count;++j) if((c.cells[j].group?c.cells[j].group:c.cells[j].id)==id) still=true;
-      if(!earlier && !still) { publish(areaSuffix(id),"unknown");LittleFS.remove(topicPath(id)); }
+      if(!earlier && !still) { clearArea(areaName(id));LittleFS.remove(topicPath(id)); }
     }
     free(oldCells);c.staged=nullptr;return true;
   }
@@ -425,6 +453,7 @@ void command(char *input) {
     Serial.printf("WIFI_STATUS %s %s\n",wifiReady?"connected":wifiPending?"connecting":"disconnected",
       wifiReady?WiFi.localIP().toString().c_str():"-");
     Serial.printf("MQTT_STATUS %s %d\n",mqtt.connected()?"connected":mqttPending?"connecting":"disconnected",mqtt.state());
+    Serial.printf("SAVED_SETTINGS %u %u\n",prefs.getString("ssid","").length()?1u:0u,prefs.getString("broker","").length()?1u:0u);
     Serial.println("OK STATUS");return;
   }
   if(!strcmp(cmd,"FORGET_WIFI")) {
@@ -438,6 +467,7 @@ void command(char *input) {
     mqtt.setServer(broker.c_str(),brokerPort);
     radioChannel=START_CHANNEL;
     esp_wifi_set_channel(START_CHANNEL,WIFI_SECOND_CHAN_NONE);
+    fastBeaconUntil=millis()+FAST_BEACON_WINDOW_MS;broadcastBeacon();
     lastWifiConnected=false;lastMqttConnected=false;
     Serial.println("OK FORGET_WIFI");
     Serial.println("EVENT WIFI disconnected");
@@ -511,11 +541,10 @@ void command(char *input) {
       if(id!=(uint32_t)parsed && areaName(id)==name) { Serial.println("ERR TOPIC duplicate");return; }
     }
     String old=areaName((uint32_t)parsed);
-    if(old!=name) publish("/areas/"+old+"/state","unknown");
-    if(name==String(parsed)) { LittleFS.remove(topicPath((uint32_t)parsed));Serial.println("OK TOPIC");return; }
+    if(name==String(parsed)) { LittleFS.remove(topicPath((uint32_t)parsed));if(old!=name) { clearArea(old);publishSnapshot(*c); }Serial.println("OK TOPIC");return; }
     File f=LittleFS.open(topicPath((uint32_t)parsed),"w");
     if(!f || f.print(name)!=name.length()) { if(f) f.close();Serial.println("ERR TOPIC storage");return; }
-    f.close();Serial.println("OK TOPIC");return;
+    f.close();if(old!=name) { clearArea(old);publishSnapshot(*c); }Serial.println("OK TOPIC");return;
   }
   if(!strcmp(cmd,"BEGIN")) {
     long v[8];for(int i=0;i<8;++i) { char *a=strtok_r(nullptr," \r\n",&saveptr);if(!number(a,v[i],i==0?1:i==1?0:i>=3&&i<=5?-2:0,i==0?2147483647:i==1?MAX_CELLS:i==2?3:i>=3&&i<=5?2:1)) { Serial.println("ERR BEGIN args");return; } }
@@ -585,16 +614,19 @@ void serviceNetwork() {
   }
   if(wifiConnected!=lastWifiConnected) {
     lastWifiConnected=wifiConnected;
+    if(wifiConnected) { lastMqttAttempt=0;mqttStartupFailures=0; }
     char detail[75];snprintf(detail,sizeof(detail),"status=%s channel=%u",wifiConnected?"connected":"disconnected",wifiConnected?WiFi.channel():radioChannel);
     recordDiagnostic("WIFI_RADIO","-",detail);
     if(!wifiPending && !reportedWifi) Serial.printf("EVENT WIFI %s%s\n",wifiConnected?"connected":"disconnected",
       wifiConnected?(String(" ")+WiFi.localIP().toString()).c_str():"");
   }
-  if(ssid.length() && !wifiConnected && !wifiPending && now-lastWifiAttempt>15000) { lastWifiAttempt=now;WiFi.begin(ssid.c_str(),password.c_str()); }
+  if(ssid.length() && !wifiConnected && !wifiPending && now-lastWifiAttempt>15000) { lastWifiAttempt=now;recordDiagnostic("WIFI_RETRY","-");WiFi.begin(ssid.c_str(),password.c_str()); }
   if(wifiConnected && radioChannel!=WiFi.channel()) {
     char detail[75];snprintf(detail,sizeof(detail),"from=%u to=%u",radioChannel,WiFi.channel());
     recordDiagnostic("CHANNEL_CHANGE","-",detail);
     radioChannel=WiFi.channel();
+    fastBeaconUntil=now+FAST_BEACON_WINDOW_MS;
+    broadcastBeacon();
   }
   if(mqttPending && now-mqttPendingAt>30000) {
     mqttPending=false;Serial.printf("EVENT MQTT_STATUS failed %s\n",mqttError(mqtt.state()));
@@ -606,16 +638,20 @@ void serviceNetwork() {
     if(lastMqttConnected) { lastMqttConnected=false;Serial.println("EVENT MQTT_STATUS disconnected"); }
     return;
   }
-  if(!mqtt.connected() && (lastMqttAttempt==0 || now-lastMqttAttempt>=(mqttPending?5000:MQTT_RETRY_MS))) {
+  const uint32_t mqttRetryInterval=mqttPending?5000:mqttStartupFailures<2?MQTT_EARLY_RETRY_MS:MQTT_RETRY_MS;
+  if(!mqtt.connected() && (lastMqttAttempt==0 || now-lastMqttAttempt>=mqttRetryInterval)) {
     lastMqttAttempt=now;String id="railway-"+String((uint32_t)ESP.getEfuseMac(),HEX);
+    recordDiagnostic("MQTT_RETRY","-");
     if(mqtt.connect(id.c_str(),mqttUser.c_str(),mqttPass.c_str(),(topic+"/controller/health").c_str(),1,true,"offline")) {
       if(mqttPending) {
         prefs.putString("broker",broker);prefs.putUShort("port",brokerPort);prefs.putString("topic",topic);
         prefs.putString("user",mqttUser);prefs.putString("mqttPass",mqttPass);mqttPending=false;
       }
       Serial.println("EVENT MQTT_STATUS connected");lastMqttConnected=true;
+      mqttStartupFailures=0;
+      mqtt.subscribe((topic+"/areas/+/state").c_str());
       publish("/controller/health","online");for(auto &c:cameras) if(c.used) publishSnapshot(c);
-    }
+    } else { if(mqttStartupFailures<2) ++mqttStartupFailures;char detail[32];snprintf(detail,sizeof(detail),"state=%d",mqtt.state());recordDiagnostic("MQTT_CONNECT_FAILED","-",detail); }
   }
   if(!mqtt.connected() && lastMqttConnected) { lastMqttConnected=false;Serial.printf("EVENT MQTT_STATUS disconnected %d\n",mqtt.state()); }
   mqtt.loop();
@@ -626,31 +662,54 @@ void setup() {
   prefs.begin("railway",false);ssid=prefs.getString("ssid","");password=prefs.getString("pass","");
   broker=prefs.getString("broker","");brokerPort=prefs.getUShort("port",1883);topic=prefs.getString("topic","railway/home");
   mqttUser=prefs.getString("user","");mqttPass=prefs.getString("mqttPass","");
+  { char detail[48];snprintf(detail,sizeof(detail),"wifi_saved=%u mqtt_saved=%u",ssid.length()?1u:0u,broker.length()?1u:0u);recordDiagnostic("SETTINGS_LOADED","-",detail); }
   net.setConnectionTimeout(2000);mqtt.setSocketTimeout(2);
   mqtt.setServer(broker.c_str(),brokerPort);mqtt.setBufferSize(512);
+  mqtt.setCallback(onMqttMessage);
   const esp_partition_t *storage=esp_partition_find_first(ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_SPIFFS,"spiffs");
   bool freshStorage=storage && blankStorage(storage);
   bool storageReady=storage && LittleFS.begin(freshStorage);
   if(!storage) Serial.println("ERR storage partition_missing");
   if(!storageReady) Serial.println("ERR storage mount");
   else { if(freshStorage) Serial.println("EVENT STORAGE initialized"); }
-  if(storageReady) { File root=LittleFS.open("/");File f=root.openNextFile();while(f) {
-    String name=f.name();
-    if(name.length()==18 && name.startsWith("/c") && name.endsWith(".bak")) {
-      String live=name.substring(0,14);if(!LittleFS.exists(live)) LittleFS.rename(name,live);
+  if(storageReady) {
+    // File.name() is only the basename on Arduino-ESP32; saved assignments use absolute paths.
+    File root=LittleFS.open("/");File f=root.openNextFile();
+    while(f) {
+      String name=f.path();if(!name.startsWith("/")) name="/"+name;
+      if(name.length()==18 && name.startsWith("/c") && name.endsWith(".bak")) {
+        String live=name.substring(0,14);
+        if(!LittleFS.exists(live) && !LittleFS.rename(name,live)) Serial.printf("ERR storage backup_restore %s\n",name.c_str());
+      }
+      f=root.openNextFile();
     }
-    if(name.length()==14 && name.startsWith("/c")) {
-      uint8_t mac[6];String hex=name.substring(2);char printable[18];
-      snprintf(printable,sizeof(printable),"%c%c:%c%c:%c%c:%c%c:%c%c:%c%c",hex[0],hex[1],hex[2],hex[3],hex[4],hex[5],hex[6],hex[7],hex[8],hex[9],hex[10],hex[11]);
-      if(parseMac(printable,mac)) for(auto &c:cameras) if(!c.used) { if(load(c,name)) { c.used=true;memcpy(c.mac,mac,6); }break; }
-    }f=root.openNextFile(); } }
+    root.close();
+    root=LittleFS.open("/");f=root.openNextFile();
+    while(f) {
+      String name=f.path();if(!name.startsWith("/")) name="/"+name;
+      if(name.length()==14 && name.startsWith("/c")) {
+        uint8_t mac[6];String hex=name.substring(2);char printable[18];
+        snprintf(printable,sizeof(printable),"%c%c:%c%c:%c%c:%c%c:%c%c:%c%c:%c%c",hex[0],hex[1],hex[2],hex[3],hex[4],hex[5],hex[6],hex[7],hex[8],hex[9],hex[10],hex[11]);
+        if(parseMac(printable,mac)) for(auto &c:cameras) if(!c.used) {
+          if(load(c,name)) { c.used=true;memcpy(c.mac,mac,6);Serial.printf("EVENT STORAGE camera_loaded %s revision=%lu cells=%u\n",printable,(unsigned long)c.revision,c.count); }
+          else Serial.printf("ERR storage camera_load %s\n",name.c_str());
+          break;
+        }
+      }
+      f=root.openNextFile();
+    }
+    root.close();
+  }
   WiFi.mode(WIFI_STA);WiFi.setSleep(false);
   if(ssid.length()) WiFi.begin(ssid.c_str(),password.c_str());
   else esp_wifi_set_channel(START_CHANNEL,WIFI_SECOND_CHAN_NONE);
   inbox=xQueueCreate(32,sizeof(Received));
   if(esp_now_init()!=ESP_OK) Serial.println("ERR esp_now init");
   else esp_now_register_recv_cb(onReceive);
+  if(WiFi.status()==WL_CONNECTED) radioChannel=WiFi.channel();
   addPeer(BROADCAST);
+  fastBeaconUntil=millis()+FAST_BEACON_WINDOW_MS;
+  broadcastBeacon();
   Serial.printf("READY bridge %s channel=%u\n",BRIDGE_VERSION,radioChannel);
 }
 void loop() {
@@ -682,11 +741,8 @@ void loop() {
     if(c.phase && !c.pendingType) nextUpload(c);
   }
   serviceNetwork();
-  if(millis()-lastBeacon>=1000) {
-    lastBeacon=millis();
-    uint8_t mac[6]={};esp_wifi_get_mac(WIFI_IF_STA,mac);
-    HelloMessage beacon={};memcpy(beacon.mac,mac,6);beacon.channel=radioChannel;
-    Packet p=makePacket(HELLO,sequence++,&beacon,sizeof(beacon));sendPacket(BROADCAST,p);
-  }
+  const uint32_t beaconNow=millis();
+  const uint32_t beaconInterval=(int32_t)(fastBeaconUntil-beaconNow)>0?FAST_BEACON_MS:NORMAL_BEACON_MS;
+  if(beaconNow-lastBeacon>=beaconInterval) broadcastBeacon();
   delay(1);
 }

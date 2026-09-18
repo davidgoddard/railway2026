@@ -1,13 +1,16 @@
 'use strict';
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, safeStorage } = require('electron');
 const { SerialPort } = require('serialport');
 const path = require('node:path');
 const { parseRow, Snapshot, validateConfig, commandsForConfig, MAC } = require('./protocol');
 const { saveFrame, loadFrame } = require('./frame-cache');
+const { createMonitor } = require('./mqtt-monitor');
 
 let win, port, pending, queue = Promise.resolve(), buffer = '', snapshot, refreshTimer, frameTimer, requestedFrameMac = '';
 const configs = new Map(), cameras = new Map(), states = new Map(), cellStates = new Map();
-let network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '' };
+let network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null };
+let monitor;
+let monitorStarted = false;
 function frameDirectory() { return path.join(app.getPath('userData'), 'camera-frames'); }
 function send(type, payload) { if (win && !win.isDestroyed()) win.webContents.send(type, payload); }
 function state() { send('bridge:state', { connected: !!port?.isOpen, path: port?.path || '', cameras: [...cameras.values()], configs: Object.fromEntries(configs), states: Object.fromEntries(states), cellStates: Object.fromEntries(cellStates), network }); }
@@ -115,7 +118,7 @@ async function refresh() {
   for (const line of stateRows) { const p = line.split(' '); if (p[0] === 'OUTPUT' && MAC.test(p[1])) { const previous=states.get(`${p[1]}:${p[2]}`);states.set(`${p[1]}:${p[2]}`, { mac: p[1], id: +p[2], value: p[3], score: previous?.value===p[3]?previous.score:null, frame: previous?.value===p[3]?previous.frame:null, at: Date.now() }); } else if (p[0] === 'SENSOR' && MAC.test(p[1])) { const key=`${p[1]}:${p[2]}`,previous=cellStates.get(key);currentCells.add(key);cellStates.set(key,{mac:p[1],id:+p[2],value:p[3],score:previous?.value===p[3]?previous.score:null,frame:previous?.value===p[3]?previous.frame:null,at:Date.now()}); } }
   for (const key of cellStates.keys()) if (!currentCells.has(key)) cellStates.delete(key);
   const statusRows = await run('STATUS');
-  for (const line of statusRows) { const p = line.split(' '); if (p[0] === 'WIFI_STATUS' && !(network.wifi === 'failed' && p[1] === 'disconnected')) { network.wifi = p[1]; network.wifiDetail = p[2] === '-' ? '' : p.slice(2).join(' '); } else if (p[0] === 'MQTT_STATUS' && !(network.mqtt === 'failed' && p[1] === 'disconnected')) { network.mqtt = p[1]; network.mqttDetail = p[2] || ''; } }
+  for (const line of statusRows) { const p = line.split(' '); if (p[0] === 'WIFI_STATUS' && !(network.wifi === 'failed' && p[1] === 'disconnected')) { network.wifi = p[1]; network.wifiDetail = p[2] === '-' ? '' : p.slice(2).join(' '); } else if (p[0] === 'MQTT_STATUS' && !(network.mqtt === 'failed' && p[1] === 'disconnected')) { network.mqtt = p[1]; network.mqttDetail = p[2] || ''; } else if (p[0] === 'SAVED_SETTINGS') { network.wifiSaved = p[1] === '1'; network.mqttSaved = p[2] === '1'; } }
   state(); return true;
 }
 async function connect(serialPath) {
@@ -141,14 +144,17 @@ async function connect(serialPath) {
 async function disconnect() {
   clearInterval(refreshTimer); clearFrameRequest();failPending('Bridge disconnected');
   if (port?.isOpen) await new Promise(resolve => port.close(() => resolve()));
-  port = null; snapshot = null; cameras.clear(); configs.clear(); states.clear(); cellStates.clear(); network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '' }; state();
+  port = null; snapshot = null; cameras.clear(); configs.clear(); states.clear(); cellStates.clear(); network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null }; state();
 }
 function createWindow() {
   win = new BrowserWindow({ width: 1440, height: 900, minWidth: 1080, minHeight: 700, backgroundColor: '#0c1420', title: 'Railway Bridge Controller', webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   win.loadFile(path.join(__dirname, 'index.html'));
-  win.webContents.on('did-finish-load', state);
+  win.webContents.on('did-finish-load', () => { state(); if (!monitorStarted) { monitorStarted = true; monitor.load(); } else monitor.notify(); });
 }
 app.whenReady().then(() => {
+  monitor = createMonitor(app.getPath('userData'), safeStorage, send);
+  ipcMain.handle('monitor-save', (_, settings) => monitor.save(settings));
+  ipcMain.handle('monitor-forget', () => monitor.forget());
   ipcMain.handle('ports', () => SerialPort.list().then(list => list.map(p => ({ path: p.path, manufacturer: p.manufacturer || '', vendorId: p.vendorId || '', productId: p.productId || '' }))));
   ipcMain.handle('connect', (_, serialPath) => connect(serialPath));
   ipcMain.handle('disconnect', disconnect);
@@ -175,3 +181,4 @@ app.whenReady().then(() => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('before-quit', () => monitor?.stop());

@@ -26,6 +26,11 @@ function alignConfigurationToFrame(draft, frame) {
   draft.settings.resolution = resolution;
   return true;
 }
+function frameMatchesConfiguration(config, frame) {
+  const dimensions = [[320, 240], [640, 480], [800, 600], [1024, 768]];
+  const expected = dimensions[config?.settings?.resolution];
+  return !!expected && expected[0] === frame?.width && expected[1] === frame?.height;
+}
 
-if (typeof module === 'object' && module.exports) module.exports = { sameCameraConfiguration, alignConfigurationToFrame };
-else Object.assign(window, { sameCameraConfiguration, alignConfigurationToFrame });
+if (typeof module === 'object' && module.exports) module.exports = { sameCameraConfiguration, alignConfigurationToFrame, frameMatchesConfiguration };
+else Object.assign(window, { sameCameraConfiguration, alignConfigurationToFrame, frameMatchesConfiguration });
