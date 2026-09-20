@@ -1,22 +1,38 @@
-# Model Railway Occupancy toolkit using Cameras
+# Camera-based Model Railway Occupancy Detection
 
-An experimental toolkit for detecting occupation on a **model railway** using cameras instead of track or rolling-stock modifications. A camera watches selected parts of the layout and compares each new frame with an empty-track reference. The intended output is a clear, occupied, or unknown state for each virtual sensor or block.
+Monitor model railway occupancy using cameras, without modifying the track or rolling stock. Each camera compares selected areas of the layout with an empty-track baseline and reports **clear**, **occupied**, or **unknown** states for virtual sensors and blocks. A bridge publishes these states to an MQTT broker for use by railway control software such as JMRI.
 
-This repository contains a browser-based camera algorithm experiment, a multi-cell camera firmware sketch, and a first ESP32 bridge controller. A first Electron setup application is in `Bridge_Controller`. The camera-to-bridge protocol has not yet been tested on hardware.
+## System overview
 
-## Intended system
+The system has three components:
+
+- **Camera modules:** ESP32 cameras that process images locally and report sensor and block states wirelessly over ESP-NOW.
+- **Bridge controller:** an ESP32-C3 module that connects the cameras to your Wi-Fi network and MQTT broker, and provides a USB connection for setup.
+- **Setup application:** the [web app](https://davidgoddard.github.io/railway2026/) or the [desktop app](Bridge_Controller/README.md), used to configure cameras, define sensors and blocks, and view their states.
 
 ```text
-Camera modules                         Controller                 Layout automation
-ESP32-S3, local frame processing  →   ESP32-C3 SuperMini     →   MQTT broker and clients
-compact state over ESP-NOW             state and health bridge
-
-Setup application and temporary Wi-Fi hotspot: configuration, preview, diagnostics
+Camera modules                  Bridge controller             Railway control software
+Local image processing   →      ESP32-C3 SuperMini     →      MQTT broker and clients
+                         ESP-NOW                       Wi-Fi
+                                      ↑
+                                     USB
+                                      ↑
+                               Setup application
 ```
 
-Each camera will process images locally and report compact state and health messages over ESP-NOW. The controller will publish those states to MQTT. The first multi-cell sketch also supports an on-demand grayscale snapshot over ESP-NOW for setup and diagnosis; it pauses monitoring during this slow transfer. The [draft functional specification](Documentation/functional-specification.md) defines the proposed state model, network modes, failure handling, MQTT contract, and performance guardrails.
+Camera modules need power and communicate with the bridge without data cables. After configuration, the bridge also needs only power; the setup computer can be disconnected.
 
-The target is **at least 10 fresh, analysed frames per second** at a resolution that makes rails and sleepers distinguishable, under the intended cell load and with the radio active. This is a target to test on hardware, not a measured capability of the current sketch.
+## Getting started
+
+1. Install the [camera firmware](Camera_Module/README.md) and [bridge firmware](Bridge_Controller/README.md), following their hardware and upload instructions. Supported camera pin maps cover the AI Thinker ESP32-CAM and ESP32-S3-EYE; other ESP32-S3 camera boards require a matching pin map. ESP32-P4 is not currently supported.
+2. Mount and power each camera so that the monitored track is clearly visible. Keep the camera fixed and provide consistent lighting.
+3. Connect the bridge to your computer by USB. Open the [web setup app](https://davidgoddard.github.io/railway2026/) in desktop Chrome or Edge, choose its USB device, and connect to the bridge. The desktop app is also available; see the [bridge guide](Bridge_Controller/README.md).
+4. Select each discovered camera, fetch a frame, and draw sensor areas over the track. Combine sensors into blocks where needed, then save the configuration.
+5. With all monitored track clear, capture an empty-track baseline for each camera.
+6. Configure the bridge's Wi-Fi and MQTT connection. Check sensor and block transitions with your rolling stock in the setup app and in your railway control software.
+7. Leave the cameras and bridge powered for normal operation. Reconnect the setup app whenever you need to change settings or inspect the system.
+
+Detection response time depends on the camera board, image resolution, sensor size and count, and configured persistence settings. Check performance with your layout and train speeds when positioning sensors. Fetching a setup snapshot pauses camera monitoring during the transfer.
 
 ## Why consider cameras?
 
@@ -27,9 +43,9 @@ Traditional model railway detection works well, but its cost and installation ef
 | DCC track-current sensing | [About £30 for a four-block detector board](https://www.coastaldcc.co.uk/products/rr-cirkits/feedback/), plus sensing coils and feedback hardware | Detects current-drawing stock within electrically isolated track sections. Requires track wiring and suitable loads in stock to be detected. |
 | Reed switch and magnet | [About £0.85 for a bare switch and £0.24–£0.36 per small magnet](https://www.railwayscenics.com/reed-switches-magnets-c-20_27_69.html) | Cheap point detection, but needs a switch and wiring at each location and a magnet on each vehicle that should trigger it. A passing pulse does not itself prove a whole block remains occupied. |
 | Infrared sensor or break beam | [About £3.50 for a reflective sensor](https://thepihut.com/products/infrared-proximity-sensor) or [£5.20 for a break-beam pair](https://thepihut.com/products/ir-break-beam-sensor-5mm-leds) | Detects at a particular position without altering rolling stock; needs mounting, power, and wiring at each sensing point. Reflective readings depend on the target and environment. |
-| ESP32 camera module | Modules are advertised at **around £5 each**; one [ESP32-S3 camera listing is £5.95](https://www.fruugo.co.uk/search?brand=Unbranded&merchantId=24938&pageSize=128&sorting=nameasc&whcat=3416) | One mounted camera could cover multiple virtual sensors and blocks without cutting rails or attaching magnets. It still needs power, a mount, a controller, and reliable sightlines and lighting. |
+| ESP32 camera module | Modules are advertised at **around £5 each**; one [ESP32-S3 camera listing is £5.95](https://www.fruugo.co.uk/search?brand=Unbranded&merchantId=24938&pageSize=128&sorting=nameasc&whcat=3416) | One mounted camera can cover multiple virtual sensors and blocks without cutting rails or attaching magnets. It still needs power, a mount, a controller, and reliable sightlines and lighting. |
 
-The camera approach may reduce hardware and wiring **per monitored area** when one view covers several locations. Its full installed cost and reliability are unproven: camera count, usable field of view, resolution, processing capacity, shadows, and occlusion must be measured on a real layout. Current sensing, reed switches, and infrared remain useful where their detection properties fit better.
+One camera can reduce hardware and wiring **per monitored area** when its view covers several locations. Plan camera coverage around sightlines, image detail, lighting, and processing capacity. Include power supplies, mounts, and the bridge when comparing installed costs. Current sensing, reed switches, and infrared are also useful where their detection properties suit the layout.
 
 ## How the camera firmware detects changes
 
@@ -67,7 +83,7 @@ This has two benefits. First, one camera can monitor several independent locatio
 
 The edge calculation uses a 3×3 neighbourhood around each pixel, so the outermost image border is deliberately excluded. That guarantees that the algorithm can safely inspect the neighbouring pixels above, below and to either side of every analysed point.
 
-> **Teaching point:** a sensor area is similar to a virtual electronic detector drawn on the camera image. Moving something elsewhere in the picture should not affect that sensor.
+> A sensor area is similar to a virtual electronic detector drawn on the camera image. Moving something elsewhere in the picture should not affect that sensor.
 
 ### 2. Convert brightness changes into edges
 
@@ -92,7 +108,7 @@ For live frames, that second term comes from the **saved baseline**, rather than
 
 For retained edges, the algorithm also measures direction from 0° to 180°. Opposite gradient signs represent the same physical edge direction, so an edge has an orientation rather than a one-way heading. When a full orientation histogram is needed, directions are accumulated into 18 bins of 10° each.
 
-> **Teaching point:** the detector is interested less in the exact shade of a rail or sleeper and more in the pattern of strong lines and boundaries visible in the area.
+> The detector is interested less in the exact shade of a rail or sleeper and more in the pattern of strong lines and boundaries visible in the area.
 
 ### 3. Capture an empty-track baseline
 
@@ -112,7 +128,7 @@ A sensor is treated as having useful texture once at least eight qualifying edge
 
 Once dominant directions have been found, the reference edges are projected into a small set of buckets: one bucket for each dominant direction plus a catch-all bucket for edges that do not fit them. This gives the live detector a compact description such as "most strong edges still run approximately along these rail directions" without requiring pixel-for-pixel alignment.
 
-> **Teaching point:** the baseline is a fingerprint of the clear scene. It records the important structure of the image, not a photographic copy that must match exactly.
+> The baseline is a fingerprint of the clear scene. It records the important structure of the image, not a photographic copy that must match exactly.
 
 ### 4. Build the same features for each live frame
 
@@ -140,7 +156,7 @@ The normalized comparison produces a value between 0 and 1, which the firmware e
 1000   = very strong difference from the baseline
 ```
 
-The configured `thresholdPermille` decides how much difference is required before a frame counts as evidence for occupation.
+The configured `thresholdPermille` decides how much difference is required before a frame counts as evidence of occupancy.
 
 ![Live angle comparison, one-pixel tolerance, and state transitions](Documentation/assets/04_live_change_decision.svg)
 
@@ -148,13 +164,13 @@ A score is therefore not a probability that a train is present. It is a **differ
 
 ### 7. Reject obviously unreliable exposure changes
 
-A camera can temporarily produce a bad image because of glare, overexposure or a sudden lighting change. Treating such a frame as genuine occupation evidence can create false transitions.
+A camera can temporarily produce a bad image because of glare, overexposure or a sudden lighting change. Treating such a frame as evidence of occupancy can create false transitions.
 
-The camera supplies one grayscale value per pixel, rather than separate R, G, and B values. The firmware counts pixels at 250–255 across the **whole frame**. If at least 20% are near white, it treats that frame as overexposed. **20% is provisional and needs measurement on the actual layout.** This is an absolute threshold, so a scene with a large naturally white area can also trigger it. There is no separate exposure-recovery timer: the first frame below this limit is analysed normally.
+The camera supplies one grayscale value per pixel, rather than separate R, G, and B values. The firmware counts pixels at 250–255 across the **whole frame**. If at least 20% are near white, it treats that frame as overexposed. This is an absolute threshold, so a scene with a large naturally white area can also trigger it. There is no separate exposure-recovery timer: the first frame below this limit is analysed normally.
 
 When a frame is judged overexposed, the detector reports **every sensor as unknown** rather than retaining a potentially stale clear or occupied result. It resets the consecutive-frame counters; useful visual evidence must then satisfy the configured count to establish a new state. The serial log prints the clipped-pixel count and percentage.
 
-> **Teaching point:** "I cannot trust this image" is different from "the track is clear". Reporting unknown avoids presenting a stale occupied or clear state as a fresh observation.
+> "I cannot trust this image" is different from "the track is clear". Reporting unknown avoids presenting a stale occupied or clear state as a fresh observation.
 
 ### 8. Require repeated evidence before changing state
 
@@ -184,39 +200,22 @@ The multi-cell firmware can associate several sensors with the same group or blo
 
 The reported group score is the highest score among its member sensors. This makes a block conservative: one occupied member is enough to make the complete block occupied.
 
-### What the algorithm is good at—and what still needs testing
+### Placement, lighting, and diagnostics
 
-The approach is designed to tolerate small grayscale variations better than direct image subtraction and to make use of strong railway geometry such as rails, sleepers and vehicle outlines. It should also allow one camera to service many independent virtual sensors.
+The detector uses railway geometry such as rails, sleepers, and vehicle outlines to identify changes while tolerating small grayscale variations. Each camera monitors several independent sensor areas.
 
-It is still an experimental detector, not a proven lighting-independent sensor. Shadows, reflections, large lighting changes, camera movement, scenery movement, occlusion, low-texture areas and unsuitable sensor placement can all reduce reliability. The thresholds and persistence values therefore need to be validated using logs from the actual layout, lighting, camera position and rolling stock that will be used in service.
+Reliable detection depends on clear sightlines, stable camera mounting, suitable sensor placement, and consistent lighting. Shadows, reflections, camera or scenery movement, occlusion, and low-texture areas can affect results. Check both clear and occupied states with the rolling stock and lighting used on your layout, and adjust thresholds and persistence settings as needed. Recapture the baseline after changing the camera view or sensor configuration.
 
-The production camera prints baseline peak angles and, on a state transition, the cell ID, final score, edge counts and strongest gradients over USB serial when debug output is enabled. The setup app shows individual cell states over a fetched still frame, but it does not yet show a per-frame score history or the angle distributions that caused a trigger. The separate browser experiment has more detailed angle histograms and timing logs. Use those diagnostics with empty-track and rolling-stock recordings to tune placement and thresholds.
+With debug output enabled, the camera reports baseline peak angles over USB serial. On a state transition, it reports the cell ID, change score, edge counts, and strongest gradients. The setup app displays live sensor states over the most recently fetched still frame; the image itself is not a live video feed. Use these diagnostics to tune sensor placement and thresholds.
 
-The [camera module firmware](Camera_Module/README.md) contains this multi-cell detector, reports states to the [bridge controller](Bridge_Controller/README.md), and saves an explicitly captured baseline to camera flash. The browser experiment below is a separate sketch for exploring the ideas and may use different scoring rules.
+The [camera guide](Camera_Module/README.md) describes configuration, baseline storage, and detector behaviour. The [bridge guide](Bridge_Controller/README.md) covers MQTT, setup controls, connection history, and troubleshooting.
 
-### Try the browser experiment
-
-1. Install the Espressif ESP32 Arduino core, select the appropriate camera board, and enable PSRAM.
-2. Open `experiments/camera_module/camera_module.ino` in Arduino IDE and upload it. The default pin map is for the AI Thinker ESP32-CAM.
-3. Join the `Railway-Angle-Lab` Wi-Fi hotspot and open `http://192.168.4.1/`. The experiment's default password is documented in the [camera guide](experiments/camera_module/README.md); change it in the sketch before use near other people.
-4. Select a resolution, position a cell, and capture a reference while the area is empty. Change what the cell sees, then inspect the comparison and log.
-
-The sketch version appears at the top of the `.ino` file, on the web page, and in Serial Monitor, so an uploaded build can be identified. For hardware and upload details, calibration steps, algorithm behaviour, and known limitations, see the [camera experiment guide](experiments/camera_module/README.md).
-
-## Repository layout
+## Reference documentation
 
 | Path | Contents |
 | --- | --- |
-| [`Documentation/functional-specification.md`](Documentation/functional-specification.md) | Draft goals, architecture, behaviour, guardrails, and open decisions. |
-| [`experiments/camera_module/`](experiments/camera_module/) | Arduino camera sketch and experiment instructions. |
-| [`Camera_Module/`](Camera_Module/) | Multi-cell camera firmware and detector implementation. |
-| [`Bridge_Controller/`](Bridge_Controller/) | Bridge firmware and setup application. |
-
-## Next steps
-
-1. Collect logs from stationary empty track under changing daylight, artificial light, and camera exposure; tune false-change behaviour before treating the algorithm as reliable.
-2. Test resolution, frame rate, PSRAM use, and cell count on the chosen ESP32-S3 camera hardware.
-3. Test the multi-cell block logic, snapshot transfer, persistence, and ESP-NOW state reporting against the bridge on real hardware.
-4. Test and package the Electron setup application on macOS and Windows hardware, and add authenticated pairing according to the functional specification.
-
-The specification deliberately marks unresolved design choices and acceptance scenarios. Results from the camera experiment should update it as the hardware and algorithm are validated.
+| [`Camera_Module/`](Camera_Module/) | Camera firmware, supported hardware, installation, and detector configuration. |
+| [`Bridge_Controller/`](Bridge_Controller/) | Bridge firmware, desktop setup application, MQTT configuration, and troubleshooting. |
+| [`Web_App/`](Web_App/) | Browser setup application and browser-specific capabilities and limitations. |
+| [`Documentation/functional-specification.md`](Documentation/functional-specification.md) | Design reference, including proposed behaviour and open design decisions. |
+| [`experiments/camera_module/`](experiments/camera_module/) | Separate development tool for inspecting angle histograms and timing; its scoring rules may differ from the camera firmware. |
