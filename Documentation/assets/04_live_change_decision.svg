@@ -6,7 +6,7 @@
   <text x="58" y="107" font-family="Arial,sans-serif" font-size="19" fill="#43515e">The score measures difference from the empty-track reference, not the probability of a train.</text>
   <g font-family="Arial,sans-serif" text-anchor="middle" fill="#17212b">
     <rect x="45" y="175" width="242" height="128" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>
-    <text x="166" y="219" font-size="21" font-weight="700">Baseline + live</text><text x="166" y="250" font-size="16">direction shares</text><text x="166" y="275" font-size="16">or 18-bin histograms</text>
+    <text x="166" y="219" font-size="21" font-weight="700">Baseline + live</text><text x="166" y="250" font-size="16">up to 10 direction shares</text><text x="166" y="275" font-size="16">or 36-bin histograms</text>
     <rect x="337" y="175" width="242" height="128" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>
     <text x="458" y="219" font-size="21" font-weight="700">Angle mismatch</text><text x="458" y="250" font-size="16">normalized to 0–1000</text><text x="458" y="275" font-size="16">texture change = 1000</text>
     <rect x="629" y="175" width="242" height="128" rx="12" fill="#eef7fa" stroke="#29434e" stroke-width="2"/>

@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.1.5"
+#define CAMERA_MODULE_VERSION "0.1.6"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -38,7 +38,7 @@ constexpr uint8_t PROTOCOL_VERSION=1;
 constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
-constexpr uint8_t MAX_PEAKS=3, BINS=18, MAX_ANCHORS=2;
+constexpr uint8_t MAX_PEAKS=10, BINS=36, MAX_ANCHORS=2;
 constexpr uint32_t HELLO_MS=2000, HEALTH_MS=5000, SNAP_TIMEOUT_MS=250;
 constexpr uint8_t BROADCAST_MAC[6]={255,255,255,255,255,255};
 

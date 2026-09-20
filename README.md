@@ -1,5 +1,7 @@
 # Camera-based Model Railway Occupancy Detection
 
+**WARNING** This repo is still in development and is not yet suitable for download or use.
+
 Monitor model railway occupancy using cameras, without modifying the track or rolling stock. Each camera compares selected areas of the layout with an empty-track baseline and reports **clear**, **occupied**, or **unknown** states for virtual sensors and blocks. A bridge publishes these states to an MQTT broker for use by railway control software such as JMRI.
 
 ## System overview
@@ -49,7 +51,7 @@ One camera can reduce hardware and wiring **per monitored area** when its view c
 
 ## How the camera firmware detects changes
 
-The detector does **not** ask whether every live pixel is identical to the reference image. That would be too sensitive to normal camera noise, small exposure changes, and gradual lighting drift. Instead, each configured sensor area is reduced to a compact description of its **edge directions**: the proportions of strong brightness transitions at each angle. The baseline records up to three well-supported directions; a cell without stable peaks uses the full angle distribution.
+The detector does **not** ask whether every live pixel is identical to the reference image. That would be too sensitive to normal camera noise, small exposure changes, and gradual lighting drift. Instead, each configured sensor area is reduced to a compact description of its **edge directions**: the proportions of strong brightness transitions at each angle. The baseline records up to ten well-supported directions; a cell without stable peaks uses the full angle distribution.
 
 A useful way to think about the process is:
 
@@ -106,7 +108,7 @@ Not every gradient is retained. The firmware calculates an edge cutoff using the
 
 For live frames, that second term comes from the **saved baseline**, rather than being recalculated from the live frame. This is important: a newly introduced bright object should not be allowed to raise the threshold that is being used to detect that same object.
 
-For retained edges, the algorithm also measures direction from 0° to 180°. Opposite gradient signs represent the same physical edge direction, so an edge has an orientation rather than a one-way heading. When a full orientation histogram is needed, directions are accumulated into 18 bins of 10° each.
+For retained edges, the algorithm also measures direction from 0° to 180°. Opposite gradient signs represent the same physical edge direction, so an edge has an orientation rather than a one-way heading. When a full orientation histogram is needed, directions are accumulated into 36 bins of 5° each.
 
 > The detector is interested less in the exact shade of a rail or sleeper and more in the pattern of strong lines and boundaries visible in the area.
 
@@ -121,10 +123,10 @@ For each sensor, the baseline includes measurements such as:
 - number of sampled pixels and detected edges;
 - maximum gradient strength, used to set the edge cutoff;
 - mean brightness and the number of almost-white pixels;
-- up to three dominant edge directions;
+- up to ten supported edge directions;
 - the proportion of edges assigned to those directions, including an “other directions” bucket.
 
-A sensor is treated as having useful texture once at least eight qualifying edges are found. If a clear reference contains strong repeated geometry—rails are a good example—the orientation histogram normally contains obvious peaks. The firmware searches for up to three sufficiently strong, sufficiently separated peaks and refines their angles using neighbouring histogram bins.
+A sensor is treated as having useful texture once at least eight qualifying edges are found. If a clear reference contains strong repeated geometry—rails are a good example—the orientation histogram normally contains obvious peaks. The firmware searches for up to ten sufficiently supported, separated directions and refines their angles using neighbouring histogram bins. This retains weaker sleeper, ballast, and rail-surface structure that a vehicle must also reproduce to match the empty scene.
 
 Once dominant directions have been found, the reference edges are projected into a small set of buckets: one bucket for each dominant direction plus a catch-all bucket for edges that do not fit them. This gives the live detector a compact description such as "most strong edges still run approximately along these rail directions" without requiring pixel-for-pixel alignment.
 
@@ -135,7 +137,7 @@ Once dominant directions have been found, the reference edges are projected into
 Once a baseline exists, each new frame is analysed using the same sensor geometry and gradient cutoff rules. The comparison method depends on what was found in the reference:
 
 - **Reference with dominant directions:** live edges are assigned to the saved direction buckets and the proportions are compared.
-- **Textured reference without reliable dominant peaks:** the smoothed 18-bin orientation histograms are compared instead.
+- **Textured reference without reliable dominant peaks:** the smoothed 36-bin orientation histograms are compared instead.
 - **Very weak reference and very weak live image:** the area is treated as unchanged rather than manufacturing a large score from sparse data.
 - **One image textured and the other not:** this is treated as a strong change unless both frames have fewer than 16 edges and the baseline has no stable peak.
 
@@ -206,7 +208,7 @@ The detector uses railway geometry such as rails, sleepers, and vehicle outlines
 
 Reliable detection depends on clear sightlines, stable camera mounting, suitable sensor placement, and consistent lighting. Shadows, reflections, camera or scenery movement, occlusion, and low-texture areas can affect results. Check both clear and occupied states with the rolling stock and lighting used on your layout, and adjust thresholds and persistence settings as needed. Recapture the baseline after changing the camera view or sensor configuration.
 
-With debug output enabled, the camera reports baseline peak angles over USB serial. On a state transition, it reports the cell ID, change score, edge counts, and strongest gradients. The setup app displays live sensor states over the most recently fetched still frame; the image itself is not a live video feed. Use these diagnostics to tune sensor placement and thresholds.
+With debug output enabled, the camera reports baseline peak angles over USB serial. On a state transition, it reports the cell ID, change score, edge counts, and strongest gradients. When a sensor is selected, the setup app magnifies its raw pixels without smoothing and overlays the physical line directions found by the same baseline analysis used on the camera. Move or resize the sensor until the clear-track crop includes useful secondary texture such as sleepers or ballast, then save and capture the baseline. The setup app also displays live sensor states over the most recently fetched still frame; the image itself is not a live video feed.
 
 The [camera guide](Camera_Module/README.md) describes configuration, baseline storage, and detector behaviour. The [bridge guide](Bridge_Controller/README.md) covers MQTT, setup controls, connection history, and troubleshooting.
 

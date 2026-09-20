@@ -77,20 +77,22 @@ uint8_t OccupancyDetector::directionBucket(const CellRuntime &cell,int gx,int gy
 void OccupancyDetector::selectPeaks(Feature &f) {
   uint32_t support[BINS]={};
   for(int i=0;i<BINS;++i) support[i]=f.hist[(i+BINS-1)%BINS]+f.hist[i]+f.hist[(i+1)%BINS];
-  uint32_t selected=0,primary=0;
+  uint64_t selected=0;uint32_t primary=0;
   for(int peak=0;peak<MAX_PEAKS;++peak) {
     int best=-1;uint32_t count=0;
     for(int bin=0;bin<BINS;++bin) {
       bool close=false;
-      for(int delta=-2;delta<=2;++delta)
-        if(selected&(1UL<<((bin+delta+BINS)%BINS))) close=true;
+      // With five-degree bins, merge immediately adjacent bins into one
+      // direction but retain nearby secondary texture such as sleepers.
+      for(int delta=-1;delta<=1;++delta)
+        if(selected&(1ULL<<((bin+delta+BINS)%BINS))) close=true;
       if(!close && support[bin]>count) { best=bin;count=support[bin]; }
     }
-    if(best<0 || count<6) break;
-    if(peak==0) { if(count*4<f.edges) break;primary=count; }
-    else if(count*5<f.edges || count*2<primary) break;
-    selected|=1UL<<best;
-    const float centre=best*10.0f+5.0f;
+    if(best<0 || count<3) break;
+    if(peak==0) { if(count*20<3*f.edges) break;primary=count; }
+    else if(count*20<f.edges || count*4<primary) break;
+    selected|=1ULL<<best;
+    const float centre=best*5.0f+2.5f;
     float total=0;
     for(int delta=-1;delta<=1;++delta) {
       const int bin=(best+delta+BINS)%BINS;
@@ -142,7 +144,7 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
       float angle=atan2f((float)gy,(float)gx)*57.2957795f;
       if(angle<0) angle+=180;
       if(angle>=180) angle-=180;
-      const int bin=min((int)(angle/10),BINS-1);
+      const int bin=min((int)(angle/5),BINS-1);
       ++f.hist[bin];f.angleSum[bin]+=angle;
     }
   }

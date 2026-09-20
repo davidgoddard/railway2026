@@ -125,4 +125,5 @@ canvas{max-height:100%}
 #viewer-history .viewer-empty{margin:0;padding:14px 20px}
 #viewer-history{max-height:260px}
 #monitor-cameras{padding:16px}
+.cell-analysis{display:grid;grid-template-columns:132px 1fr;gap:13px;align-items:start;margin-bottom:9px}.cell-analysis canvas{display:block;width:132px;height:132px;max-width:none;max-height:none;background:#08131d;border:1px solid #365066;border-radius:7px;image-rendering:pixelated}.cell-analysis strong,.cell-analysis span{display:block}.cell-analysis strong{font-size:12px}.cell-analysis span{margin-top:4px;color:#8da2b6;font-size:10px;line-height:1.4}.cell-angle-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.cell-angle-list i{display:inline-flex;align-items:center;gap:4px;padding:3px 5px;border-radius:5px;background:#1c3040;color:#cfe2ec;font-size:9px;font-style:normal}.cell-angle-list b{width:7px;height:7px;border-radius:50%;display:inline-block}
 @media(max-width:1200px){.monitor-settings form{grid-template-columns:repeat(3,minmax(0,1fr))}}

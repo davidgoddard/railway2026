@@ -2194,7 +2194,7 @@ z
     </g>
    </g>
    <g id="text_19">
-    <!-- 18 bins × 10° -->
+    <!-- Historical generated label covered below by the current 36-bin label. -->
     <g transform="translate(929.916797 424.8) scale(0.15 -0.15)">
      <defs>
       <path id="DejaVuSans-Bold-31" d="M 750 831
@@ -2719,6 +2719,8 @@ z
    </g>
   </g>
  </g>
+ <rect x="900" y="399" width="210" height="34" fill="#ffffff"/>
+ <text x="1005" y="424" text-anchor="middle" font-family="DejaVu Sans,Arial,sans-serif" font-size="15" font-weight="700" fill="#17212b">36 bins × 5°</text>
  <defs>
   <clipPath id="p6b75e9e2dc">
    <rect x="10.8" y="10.8" width="1152" height="648"/>
