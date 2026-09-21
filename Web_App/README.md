@@ -40,6 +40,8 @@ The web application loads the pinned MQTT.js browser bundle from jsDelivr. Witho
 
 Viewer settings are stored in browser `localStorage`, including any entered password. Use non-sensitive development credentials until secure credential handling is implemented.
 
+Fetched grayscale frames are rendered as soon as their transfer and CRC checks complete, then cached as binary data in browser IndexedDB. Older number-array frame caches in `localStorage` are migrated when read. This avoids blocking the page while serializing hundreds of thousands of pixels at SVGA or XGA resolution.
+
 ## GitHub Pages
 
 The directory has no build step. Publish `Web_App` as the Pages source or copy its static contents to the configured Pages directory. The application must remain on HTTPS for Web Serial and secure MQTT WebSockets.
