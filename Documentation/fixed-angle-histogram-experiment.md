@@ -1,8 +1,8 @@
-# Fixed-angle histogram experiment
+# Fixed-angle histogram detector
 
-This document applies to the `experiment/fixed-angle-histogram` branch. It is an experimental detector, not the implementation on `main`.
+This document records the fixed-angle detector adopted on `main`. The project remains under active development and the detector still requires broader layout testing.
 
-## What changes
+## Algorithm
 
 Every qualifying gradient is assigned by its physical line direction to the nearest of nine fixed centres at 0°, 20°, …, 160°. Each direction therefore covers a 20-degree range; the 0° bucket wraps across 180°. Each direction retains three coarse position bands, giving 27 normalized buckets per sensor. There is no dominant-direction threshold, perpendicular search, or catch-all `Other` direction.
 
@@ -17,7 +17,7 @@ The fetched-frame preview displays all nine bucket centres and percentages. Line
 
 ## Compatibility
 
-- Camera firmware identifies itself as `0.2.0-fixed-histogram`.
+- Camera firmware identifies itself as `0.2.0`.
 - The analysis packet size is unchanged. Configuration packets now carry an immutable sensor creation revision, and calibration requests carry the bridge's last successful auto-size revision; flash the matching bridge and camera firmware together.
 - The baseline magic changes, so the camera safely rejects baselines made by `main` or an earlier experiment build and requires a new baseline.
 - The saved `angleTolerance` setting is ignored by this experiment.
@@ -25,8 +25,8 @@ The fetched-frame preview displays all nine bucket centres and percentages. Line
 ## Suggested comparison procedure
 
 1. Record the current firmware version, sensor geometry, threshold, and several clear/obstructed **Compare now** scores before flashing.
-2. Flash the camera from this branch. The existing bridge firmware remains compatible.
-3. Reload the setup page from this branch, reconnect, and capture a fresh empty baseline.
+2. Flash the matching current camera and bridge firmware.
+3. Reload the current setup page, reconnect, and capture a fresh empty baseline.
 4. Leave the track clear and collect repeated scores under the expected lighting range.
 5. Add representative rolling stock and collect scores at several positions.
 6. Set each sensor threshold above its highest credible clear score and below its lowest obstruction score. For the earlier 208-to-145-edge example, begin testing near 250 rather than assuming the production default of 400.
@@ -34,4 +34,4 @@ The fetched-frame preview displays all nine bucket centres and percentages. Line
 
 After the first run, the setup applications offer `new` or `all`. `new` auto-sizes only sensors whose immutable creation revision is newer than the last successful auto-size, so later manual radius or threshold tuning is preserved. `all` intentionally recalculates every sensor. Both choices rebuild the empty baseline for the complete configuration.
 
-Hard 20-degree boundaries are deliberately retained in this first experiment. If otherwise stable lines wander between neighbouring buckets, the next refinement should use overlapping or softly weighted adjacent buckets.
+Hard 20-degree boundaries are deliberately retained in this version. If otherwise stable lines wander between neighbouring buckets, a future refinement may use overlapping or softly weighted adjacent buckets.

@@ -23,9 +23,9 @@ Opening `index.html` directly with `file://` is not supported because Web Serial
 - Sensor creation, movement, deletion, block painting and block extension.
 - Live per-sensor overlays and combined block output monitoring.
 - Camera settings, per-sensor persistence settings and mismatch thresholds.
-- Fetched-frame texture preview using the same Scharr and direction-family rules as the camera.
-- On-demand camera baseline comparison with direction/position buckets.
-- Ten-second fixed-centre automatic radius and threshold calibration.
+- Fetched-frame texture preview using the camera's Scharr gradients and nine fixed 20° direction buckets.
+- On-demand camera baseline comparison with 27 direction/position buckets and proportional edge-count change.
+- Ten-second fixed-centre automatic radius and threshold calibration for new sensors only or all sensors.
 - Bridge Wi-Fi and MQTT configuration.
 - Diagnostics, USB MQTT events and local state history.
 - Direct MQTT state monitoring when the broker exposes MQTT over WebSockets.

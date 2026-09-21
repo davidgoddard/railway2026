@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.9-created-revisions"
+#define BRIDGE_VERSION "0.1.9"
 
 #include <Arduino.h>
 #include <WiFi.h>

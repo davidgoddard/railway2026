@@ -45,7 +45,7 @@ Every camera target must provide:
 
 The same `OccupancyDetector` is used on every target. Hardware-specific image acquisition belongs in `ImageSource`; the detector, cell configuration, baseline comparison, persistence rules, and sensor messages do not change. The current image-source implementations support the AI Thinker ESP32-CAM and ESP32-S3-EYE DVP pin maps. Another DVP board needs its own verified pin map. A different camera interface needs an `ImageSource` adapter that produces the same grayscale buffer contract.
 
-The setup application can auto-size all saved sensors in one ten-second empty-track calibration. Each current radius is treated as a maximum, several nested radii are tested at the fixed user-selected centre, and the camera returns the smallest stable choice plus an individual clear-state threshold. The bridge persists the resulting revision and the app redraws the selected sizes.
+The setup application can auto-size sensors in one ten-second empty-track calibration. Each current radius is treated as a maximum, five nested radii are tested at the fixed user-selected centre, and the camera returns the smallest stable choice plus an individual clear-state threshold. After the first run, users can tune only sensors added since the last successful auto-size or deliberately retune all sensors. The bridge persists sensor creation revisions and the last auto-size revision, so later manual radius and threshold adjustments are not mistaken for new sensors.
 
 ESP32-P4 camera hardware is capable of DVP, MIPI-CSI, SPI, and USB camera input through Espressif's [ESP Video components](https://docs.espressif.com/projects/esp-video-components/en/latest/esp32p4/Get_Started/index.html). It does not use the legacy `esp_camera` path used by the current ESP32 and S3 adapters. P4 boards also require a radio companion. Stock ESP-Hosted provides ordinary Wi-Fi through common P4 companion arrangements, but the existing railway camera protocol also requires ESP-NOW. P4 support must therefore include both an ESP Video image-source adapter and a verified route through companion firmware for the ESP-NOW packets.
 
@@ -95,7 +95,7 @@ The C6 image is flashed separately through the board's ESP32-C6 UART header whil
 2. Mount and power each camera so that the monitored track is clearly visible. Keep the camera fixed and provide consistent lighting.
 3. Connect the bridge to your computer by USB. Open the [web setup app](https://davidgoddard.github.io/railway2026/) in desktop Chrome or Edge, choose its USB device, and connect to the bridge. The desktop app is also available; see the [bridge guide](Bridge_Controller/README.md).
 4. Select each discovered camera, fetch a frame, and draw sensor areas over the track. Combine sensors into blocks where needed, then save the configuration.
-5. With all monitored track clear, run **Auto-size empty track** for each camera. This tests several fixed-centre radii for every sensor during one shared ten-second run, stores conservative individual thresholds, and creates the compatible baseline. Manual baseline capture remains available when sensor sizes and thresholds are already settled.
+5. With all monitored track clear, run **Auto-size empty track** for each camera. Choose **new sensors only** for an initial run or after adding sensors; choose **all sensors** only when you intend to replace every automatically chosen radius and threshold. The shared ten-second run also creates the compatible baseline. Manual baseline capture remains available when sensor sizes and thresholds are already settled.
 6. Configure the bridge's Wi-Fi and MQTT connection. Check sensor and block transitions with your rolling stock in the setup app and in your railway control software.
 7. Leave the cameras and bridge powered for normal operation. Reconnect the setup app whenever you need to change settings or inspect the system.
 
@@ -116,7 +116,7 @@ One camera can reduce hardware and wiring **per monitored area** when its view c
 
 ## How the camera firmware detects changes
 
-The detector does **not** ask whether every live pixel is identical to the reference image. That would be too sensitive to normal camera noise, small exposure changes, and gradual lighting drift. Instead, each configured sensor area is reduced to a compact description of its **edge directions**: the proportions of strong brightness transitions at each angle. The baseline records up to ten well-supported directions; a cell without stable peaks uses the full angle distribution.
+The detector does **not** ask whether every live pixel is identical to the reference image. That would be too sensitive to normal camera noise, small exposure changes, and gradual lighting drift. Instead, each configured sensor area is reduced to 27 proportions: nine fixed physical-line directions at 20° intervals, each divided into three coarse position bands. The detector also records the total number of strong gradients so an obstruction cannot appear unchanged merely by preserving a dominant direction.
 
 A useful way to think about the process is:
 
@@ -173,7 +173,7 @@ Not every gradient is retained. The firmware calculates an edge cutoff using the
 
 For live frames, that second term comes from the **saved baseline**, rather than being recalculated from the live frame. This is important: a newly introduced bright object should not be allowed to raise the threshold that is being used to detect that same object.
 
-For retained edges, the algorithm also measures direction from 0° to 180°. Opposite gradient signs represent the same physical edge direction, so an edge has an orientation rather than a one-way heading. When a full orientation histogram is needed, directions are accumulated into 36 bins of 5° each.
+For retained edges, the algorithm also measures physical line direction from 0° to 180°. Opposite gradient signs represent the same physical line, so an edge has an orientation rather than a one-way heading. Each edge is assigned to the nearest fixed direction bucket centred at 0°, 20°, …, 160°; the 0° bucket wraps across 180°.
 
 > The detector is interested less in the exact shade of a rail or sleeper and more in the pattern of strong lines and boundaries visible in the area.
 
@@ -181,31 +181,25 @@ For retained edges, the algorithm also measures direction from 0° to 180°. Opp
 
 A baseline is captured when the monitored area is in its known **clear** condition. The camera captures three consecutive fresh frames and forms their per-pixel mean before calculating any gradients. This reduces random sensor and exposure noise in the reference. The firmware then analyses every configured sensor and stores compact measurements rather than retaining the complete mean image for normal comparison.
 
-![Baseline calibration stores edge directions and normalized angle counts](Documentation/assets/03_baseline_calibration.svg)
-
 For each sensor, the baseline includes measurements such as:
 
 - number of sampled pixels and detected edges;
 - maximum gradient strength, used to set the edge cutoff;
 - mean brightness and the number of almost-white pixels;
-- up to ten supported edge directions;
-- the proportion of edges assigned to three broad position bands for each direction family, including an “other directions” bucket.
+- all nine fixed 20° direction buckets; and
+- the proportion of edges assigned to three broad position bands for each direction.
 
-A sensor is treated as having useful texture once at least eight qualifying edges are found. If a clear reference contains strong repeated geometry—rails are a good example—the orientation histogram normally contains obvious peaks. The firmware first selects a dominant direction. It then performs a railway-specific search within 15° of the perpendicular, accepting a sleeper family with at least four samples and 3% support. Only after that does it select generic secondary families, which need at least 5% of all strong gradients and one fifth of the dominant family's support. Up to ten families are retained. Candidate bin centres must be at least 25° apart and refined families at least 20° apart, preventing the angular spread of one pixelated diagonal edge from appearing as several independent directions.
-
-![Dominant rail selection followed by an explicit perpendicular sleeper search](Documentation/assets/06_rail_sleeper_directions.svg)
-
-Once direction families have been found, every matching edge is projected onto the normal of its physical line and placed in one of three broad bands: side A, centre, or side B. One catch-all bucket holds angles that do not fit any family. This gives the detector both direction and coarse position without retaining exact edge coordinates.
+A sensor is treated as textured once at least eight qualifying edges are found. Every retained edge contributes even when its direction is weak relative to a dominant rail or scenery boundary; there is no dominant-family support test and no “other directions” bucket. Each edge is projected onto the normal of its bucket's physical line and placed in side A, centre, or side B. The resulting 27 normalized direction/position proportions retain coarse geometry without exact edge coordinates.
 
 > The baseline is a fingerprint of the clear scene. It records the important structure of the image, not a photographic copy that must match exactly.
 
 ### 4. Auto-size every sensor from one empty-scene run
 
-The setup applications can calibrate every saved sensor on a camera in one shared ten-second operation. Sensor centres remain exactly where the user placed them. For each centre, the current radius is treated as the maximum permitted size and the camera evaluates five nested candidate radii from the same frames.
+The setup applications calibrate sensors on a camera in one shared ten-second operation. Sensor centres remain exactly where the user placed them. For each selected sensor, the current radius is treated as the maximum permitted size and the camera evaluates five nested candidate radii from the same frames.
 
 The smallest radius qualifies only when it contains at least 100 strong gradients, obtains at least three live samples, and its worst observed empty-scene score remains at or below 150/1000. If no smaller candidate qualifies, the user's maximum radius is retained. Slow cameras contribute as many samples as they can process; faster cameras are capped at 50 temporally spaced samples.
 
-The resulting per-sensor threshold is approximately twice the worst observed empty score plus a safety allowance of 100. It is rounded upward, capped at 800, and never allowed below 400 or below the sensor's existing threshold. The camera saves the selected baseline, the bridge stores the new radii and thresholds as a new revision, and the application redraws the actual chosen circles.
+The resulting per-sensor threshold is approximately twice the worst observed empty score plus a safety allowance of 100. It is rounded upward, capped at 800, and never allowed below 400 or below the sensor's existing threshold. **New sensors only** tunes sensors whose immutable creation revision is later than the last successful auto-size; other sensors retain manual radius and threshold adjustments. **All sensors** deliberately recalculates every sensor. Both choices refresh the complete empty baseline, and the application redraws the chosen circles.
 
 ![Five fixed-centre radii evaluated during a shared ten-second empty-track calibration](Documentation/assets/05_auto_size_calibration.svg)
 
@@ -213,14 +207,9 @@ Empty-only calibration estimates false-trigger behaviour; it cannot prove that e
 
 ### 5. Build the same features for each live frame
 
-Once a baseline exists, each new frame is analysed using the same sensor geometry and gradient cutoff rules. The comparison method depends on what was found in the reference:
+Once a baseline exists, each new frame is analysed using the same sensor geometry, saved gradient cutoff, nine direction buckets and three position bands. The detector calculates total variation between the 27 normalized baseline and live bucket proportions. It also calculates the proportional change in the total number of strong gradients and uses the larger of the two values. This second component catches an obstruction that preserves a dominant line direction while removing much of the empty-track texture.
 
-- **Reference with direction families:** live edges are assigned to the saved direction and coarse-position buckets and the proportions are compared.
-- **Textured reference without reliable dominant peaks:** the smoothed 36-bin orientation histograms are compared instead.
-- **Very weak reference and very weak live image:** the area is treated as unchanged rather than manufacturing a large score from sparse data.
-- **One image textured and the other not:** this is treated as a strong change unless both frames have fewer than 16 edges and the baseline has no stable peak.
-
-Both the bucket comparison and histogram comparison are normalized by the number of edges. That matters because the detector is comparing the *distribution* of edge structure, rather than simply assuming that a frame with more edge pixels must be occupied.
+If both images are untextured, the score is zero; if only one is textured, the score is 1000. The direction/position comparison is normalized by edge count, while the separate edge-count component deliberately preserves a large loss or gain of texture.
 
 ### 6. Allow a one-pixel image shift
 
