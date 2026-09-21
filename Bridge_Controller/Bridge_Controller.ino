@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.8-created-revisions"
+#define BRIDGE_VERSION "0.1.9-created-revisions"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -137,8 +137,8 @@ bool parseMac(const char *s,uint8_t *mac) {
   if(strlen(s)!=17 || s[2]!=':' || s[5]!=':' || s[8]!=':' || s[11]!=':' || s[14]!=':') return false;
   unsigned v[6];int used=0;
   if(sscanf(s,"%2x:%2x:%2x:%2x:%2x:%2x%n",v,v+1,v+2,v+3,v+4,v+5,&used)!=6 || s[used]) return false;
-  for(int i=0;i<6;++i) mac[i]=v[i];
-  return true;
+  bool any=false;for(int i=0;i<6;++i) { mac[i]=v[i];if(mac[i]) any=true; }
+  return any;
 }
 Camera *findCamera(const uint8_t *mac) { for(auto &c:cameras) if(c.used && !memcmp(c.mac,mac,6)) return &c;return nullptr; }
 Camera *cameraFor(const char *text) { uint8_t mac[6];return parseMac(text,mac)?findCamera(mac):nullptr; }
@@ -803,10 +803,13 @@ void setup() {
       String name=f.path();if(!name.startsWith("/")) name="/"+name;
       if(name.length()==14 && name.startsWith("/c")) {
         uint8_t mac[6];String hex=name.substring(2);char printable[18];
-        snprintf(printable,sizeof(printable),"%c%c:%c%c:%c%c:%c%c:%c%c:%c%c:%c%c",hex[0],hex[1],hex[2],hex[3],hex[4],hex[5],hex[6],hex[7],hex[8],hex[9],hex[10],hex[11]);
+        snprintf(printable,sizeof(printable),"%c%c:%c%c:%c%c:%c%c:%c%c:%c%c",hex[0],hex[1],hex[2],hex[3],hex[4],hex[5],hex[6],hex[7],hex[8],hex[9],hex[10],hex[11]);
         if(parseMac(printable,mac)) for(auto &c:cameras) if(!c.used) {
-          if(load(c,name)) { c.used=true;memcpy(c.mac,mac,6);Serial.printf("EVENT STORAGE camera_loaded %s revision=%lu cells=%u\n",printable,(unsigned long)c.revision,c.count); }
-          else Serial.printf("ERR storage camera_load %s\n",name.c_str());
+          // load() may migrate and rewrite an old file, so its destination
+          // path must be based on the real MAC rather than the zeroed slot.
+          memcpy(c.mac,mac,6);
+          if(load(c,name)) { c.used=true;Serial.printf("EVENT STORAGE camera_loaded %s revision=%lu cells=%u\n",printable,(unsigned long)c.revision,c.count); }
+          else { memset(c.mac,0,sizeof(c.mac));Serial.printf("ERR storage camera_load %s\n",name.c_str()); }
           break;
         }
       }
