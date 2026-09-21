@@ -136,8 +136,8 @@ async function refresh() {
   for (const mac of healthSamples.keys()) if (!cameras.has(mac)) healthSamples.delete(mac);
   for (const mac of cameras.keys()) {
     const getRows = await run(`GET ${mac}`);
-    const config = { revision: 0, cells: [], topics: {}, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 } };
-    for (const line of getRows) { const row = parseRow(line); if (row?.type === 'config') { config.revision = row.revision; config.settings = row.settings; } else if (row?.type === 'cell') config.cells.push(row.cell); else if (row?.type === 'topic') config.topics[row.id] = row.name; }
+    const config = { revision: 0, lastAutoSizeRevision: 0, cells: [], topics: {}, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 } };
+    for (const line of getRows) { const row = parseRow(line); if (row?.type === 'config') { config.revision = row.revision; config.lastAutoSizeRevision = row.lastAutoSizeRevision; config.settings = row.settings; } else if (row?.type === 'cell') config.cells.push(row.cell); else if (row?.type === 'topic') config.topics[row.id] = row.name; }
     configs.set(mac, config);
   }
   for (const mac of configs.keys()) if (!cameras.has(mac)) configs.delete(mac);
@@ -193,7 +193,7 @@ app.whenReady().then(() => {
   ipcMain.handle('frame', async (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); expectFrame(mac);try { return await run(`FRAME ${mac}`); } catch (error) { clearFrameRequest();throw error; } });
   ipcMain.handle('cached-frame', (_, mac) => loadFrame(frameDirectory(), mac).catch(() => null));
   ipcMain.handle('baseline', (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); return run(`BASELINE ${mac}`); });
-  ipcMain.handle('calibrate', (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); return run(`CALIBRATE ${mac}`); });
+  ipcMain.handle('calibrate', (_, mac, mode = 'new') => { if (!MAC.test(mac) || !['new','all'].includes(mode)) throw Error('Invalid calibration request'); return run(`CALIBRATE ${mac} ${mode}`); });
   ipcMain.handle('analysis', (_, mac, id) => { if (!MAC.test(mac) || !Number.isInteger(id) || id < 1) throw Error('Invalid sensor'); return run(`ANALYSIS ${mac} ${id}`); });
   ipcMain.handle('save', async (_, mac, config) => {
     if (!MAC.test(mac) || !configs.has(mac)) throw Error('Unknown camera');

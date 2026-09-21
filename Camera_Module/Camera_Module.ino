@@ -79,6 +79,7 @@ struct __attribute__((packed)) CellConfig {
   uint8_t radius, shape; // shape: 0 circle, 1 square
   uint16_t contrastFloor, thresholdPermille;
   uint8_t angleTolerance, enterFrames, clearFrames;
+  uint32_t createdRevision;
 };
 struct __attribute__((packed)) ConfigCellPayload {
   uint16_t index;
@@ -97,7 +98,7 @@ struct __attribute__((packed)) AnalysisPayload {
   uint16_t lineAngleTenths[MAX_PEAKS];
   uint16_t referenceBuckets[SPATIAL_BUCKETS],liveBuckets[SPATIAL_BUCKETS];
 };
-struct __attribute__((packed)) CalibrationRequestPayload { uint32_t revision,durationMs;uint8_t maxSamples; };
+struct __attribute__((packed)) CalibrationRequestPayload { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples; };
 struct __attribute__((packed)) CalibrationResultPayload {
   uint32_t revision,id;uint16_t index,count,thresholdPermille,clearMaximum,referenceEdges,samples;
   uint8_t radius,confidence;
@@ -439,8 +440,9 @@ bool autoCalibrate(const CalibrationRequestPayload &request) {
     // Prefer the smallest candidate only when the short calibration window
     // shows a genuinely quiet empty scene. If none qualifies, retain the
     // user's maximum radius rather than selecting a noisy smaller crop.
+    const bool tune=request.sinceRevision==0 || staging[i].config.createdRevision>request.sinceRevision;
     uint8_t chosen=CANDIDATES-1;
-    for(uint8_t candidate=0;candidate<CANDIDATES;++candidate) {
+    if(tune) for(uint8_t candidate=0;candidate<CANDIDATES;++candidate) {
       const size_t n=(size_t)i*CANDIDATES+candidate;
       if(trials[n].reference.edges>=100 && stats[n].samples>=3 && stats[n].maximum<=150) { chosen=candidate;break; }
     }
@@ -449,9 +451,13 @@ bool autoCalibrate(const CalibrationRequestPayload &request) {
     // Ten seconds cannot represent every later daylight condition. Preserve
     // the user's existing threshold and add a deliberately conservative
     // margin above the worst empty score observed during calibration.
-    uint16_t threshold=(uint16_t)constrain((int)stats[n].maximum*2+100,400,800);
-    threshold=max(threshold,staging[i].config.thresholdPermille);
-    threshold=(uint16_t)(((threshold+9)/10)*10);cells[i].config.thresholdPermille=threshold;
+    uint16_t threshold=staging[i].config.thresholdPermille;
+    if(tune) {
+      threshold=(uint16_t)constrain((int)stats[n].maximum*2+100,400,800);
+      threshold=max(threshold,staging[i].config.thresholdPermille);
+      threshold=(uint16_t)(((threshold+9)/10)*10);
+    }
+    cells[i].config.thresholdPermille=threshold;
     cells[i].state=CLEAR;cells[i].scorePermille=0;
   }
   configRevision=request.revision;baselineReady=saveBaseline();
@@ -566,7 +572,7 @@ bool saveBaseline() {
   const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
   // Runtime features contain the calibration. The full grayscale frame is not
   // needed after reboot and made SVGA baselines require two 480 KB flash files.
-  BaselineHeader h={0x52424C38,configRevision,0,
+  BaselineHeader h={0x52424C39,configRevision,0,
     crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
   if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
   File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
@@ -587,7 +593,7 @@ void loadBaseline() {
     LittleFS.rename("/baseline.bak","/baseline.bin");
   File f=LittleFS.open("/baseline.bin","r");if(!f) return;
   BaselineHeader h={};
-  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C38 ||
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C39 ||
      h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
   const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
   if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||

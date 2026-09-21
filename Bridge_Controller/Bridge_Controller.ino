@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.7"
+#define BRIDGE_VERSION "0.1.8-created-revisions"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -25,7 +25,7 @@ enum CellState:uint8_t { UNKNOWN=0,CLEAR=1,OCCUPIED=2 };
 struct __attribute__((packed)) Packet { uint16_t magic; uint8_t version,type; uint32_t seq; uint16_t length; uint8_t payload[PAYLOAD]; };
 struct __attribute__((packed)) CameraSettings { uint8_t resolution; int8_t brightness,contrast,saturation; uint8_t vflip,hmirror; };
 struct __attribute__((packed)) Begin { uint32_t revision; uint16_t count; CameraSettings settings; };
-struct __attribute__((packed)) Cell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t tolerance,enter,clear; };
+struct __attribute__((packed)) Cell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t tolerance,enter,clear; uint32_t createdRevision; };
 struct __attribute__((packed)) CellMessage { uint16_t index; Cell cell; };
 struct __attribute__((packed)) HelloMessage { uint8_t mac[6]; uint32_t revision; uint16_t width,height,count; uint8_t channel,baseline; };
 struct __attribute__((packed)) AckMessage { uint8_t type,status; uint16_t detail; };
@@ -34,7 +34,7 @@ struct __attribute__((packed)) AnalysisMessage {
   uint32_t id,revision,frame;uint16_t score,threshold,referenceEdges,liveEdges;uint8_t peakCount;
   uint16_t angles[10],referenceBuckets[31],liveBuckets[31];
 };
-struct __attribute__((packed)) CalibrationRequest { uint32_t revision,durationMs;uint8_t maxSamples; };
+struct __attribute__((packed)) CalibrationRequest { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples; };
 struct __attribute__((packed)) CalibrationResult {
   uint32_t revision,id;uint16_t index,count,threshold,clearMaximum,referenceEdges,samples;
   uint8_t radius,confidence;
@@ -49,8 +49,10 @@ struct __attribute__((packed)) DiagnosticPayload {
   uint16_t captureFailures,dropped;
   uint8_t event,resetReason,channel,operation,outcome;
 };
-struct __attribute__((packed)) FileHeader { uint32_t magic,revision; uint16_t count; CameraSettings settings; uint32_t crc; };
-static_assert(sizeof(Packet)==210 && sizeof(Cell)==21 && sizeof(HealthMessage)==26,"wire layout mismatch");
+struct __attribute__((packed)) FileHeader { uint32_t magic,revision,lastAutoSizeRevision; uint16_t count; CameraSettings settings; uint32_t crc; };
+struct __attribute__((packed)) LegacyFileHeader { uint32_t magic,revision; uint16_t count; CameraSettings settings; uint32_t crc; };
+struct __attribute__((packed)) LegacyCell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t tolerance,enter,clear; };
+static_assert(sizeof(Packet)==210 && sizeof(Cell)==25 && sizeof(HealthMessage)==26,"wire layout mismatch");
 static_assert(sizeof(AnalysisMessage)<=PAYLOAD,"analysis wire layout");
 
 struct Camera {
@@ -77,6 +79,7 @@ struct Camera {
   uint32_t lastSnapEndSeq=0;
   uint32_t diagBootId=0,diagEventSeq=0;
   uint32_t calibrationRevision=0;
+  uint32_t lastAutoSizeRevision=0;
   uint16_t calibrationReceived=0;
   uint8_t calibrationSeen[(MAX_CELLS+7)/8]={};
   uint16_t snapWidth=0,snapHeight=0;
@@ -244,7 +247,7 @@ bool blankStorage(const esp_partition_t *partition) {
 bool save(Camera &c) {
   String tmp=pathFor(c.mac)+".tmp",path=pathFor(c.mac);
   File f=LittleFS.open(tmp,"w");if(!f) return false;
-  FileHeader h={0x52434631,c.revision,c.count,c.settings,0};
+  FileHeader h={0x52434632,c.revision,c.lastAutoSizeRevision,c.count,c.settings,0};
   h.crc=~crcStep(0xFFFFFFFF,(const uint8_t *)c.cells,c.count*sizeof(Cell));
   bool ok=f.write((const uint8_t *)&h,sizeof(h))==sizeof(h) &&
     f.write((const uint8_t *)c.cells,c.count*sizeof(Cell))==c.count*sizeof(Cell);
@@ -275,14 +278,34 @@ bool saveStaged(Camera &c) {
 }
 bool load(Camera &c,const String &path) {
   File f=LittleFS.open(path,"r");if(!f) return false;
-  FileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.magic==0x52434631 &&
+  uint32_t magic=0;if(f.read((uint8_t *)&magic,sizeof(magic))!=sizeof(magic)) { f.close();return false; }f.seek(0);
+  if(magic==0x52434631) {
+    LegacyFileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.count<=MAX_CELLS &&
+      validSettings(h.settings) && f.size()==sizeof(h)+h.count*sizeof(LegacyCell);
+    LegacyCell *old=ok?(LegacyCell *)malloc((h.count?h.count:1)*sizeof(LegacyCell)):nullptr;
+    if(ok) ok=old && f.read((uint8_t *)old,h.count*sizeof(LegacyCell))==h.count*sizeof(LegacyCell) &&
+      ~crcStep(0xFFFFFFFF,(uint8_t *)old,h.count*sizeof(LegacyCell))==h.crc;
+    Cell *items=ok?(Cell *)malloc((h.count?h.count:1)*sizeof(Cell)):nullptr;
+    if(ok) ok=items;
+    if(ok) for(uint16_t i=0;i<h.count;++i) {
+      const LegacyCell &x=old[i];items[i]={x.id,x.group,x.x,x.y,x.radius,x.shape,x.floor,x.threshold,x.tolerance,x.enter,x.clear,h.revision};
+      if(!validCell(items[i],h.settings)) ok=false;
+    }
+    free(old);f.close();
+    if(!ok) { free(items);return false; }
+    c.cells=items;c.count=h.count;c.revision=h.revision;c.lastAutoSizeRevision=h.revision;c.settings=h.settings;
+    c.states=(uint8_t *)malloc(h.count?h.count:1);if(c.states) memset(c.states,UNKNOWN,h.count);
+    c.cellStates=(uint8_t *)malloc(h.count?h.count:1);if(c.cellStates) memset(c.cellStates,UNKNOWN,h.count);
+    save(c);return true;
+  }
+  FileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.magic==0x52434632 &&
     h.count<=MAX_CELLS && validSettings(h.settings) && f.size()==sizeof(h)+h.count*sizeof(Cell);
   if(ok) {
     Cell *items=(Cell *)malloc((h.count?h.count:1)*sizeof(Cell));
     ok=items && f.read((uint8_t *)items,h.count*sizeof(Cell))==h.count*sizeof(Cell) &&
       ~crcStep(0xFFFFFFFF,(uint8_t *)items,h.count*sizeof(Cell))==h.crc;
     if(ok) { for(uint16_t i=0;i<h.count;++i) if(!validCell(items[i],h.settings)) ok=false; }
-    if(ok) { c.cells=items;c.count=h.count;c.revision=h.revision;c.settings=h.settings;
+    if(ok) { c.cells=items;c.count=h.count;c.revision=h.revision;c.lastAutoSizeRevision=h.lastAutoSizeRevision;c.settings=h.settings;
       c.states=(uint8_t *)malloc(h.count?h.count:1);if(c.states) memset(c.states,UNKNOWN,h.count);
       c.cellStates=(uint8_t *)malloc(h.count?h.count:1);if(c.cellStates) memset(c.cellStates,UNKNOWN,h.count); }
     else free(items);
@@ -471,11 +494,13 @@ void handleRadio(const Received &r) {
       value.referenceEdges,value.samples,value.confidence);
     if(c->calibrationReceived==c->count) {
       c->received=c->stagedCount;
+      const uint32_t previousAutoSizeRevision=c->lastAutoSizeRevision;
+      c->lastAutoSizeRevision=c->stagedRevision;
       if(saveStaged(*c)) {
         c->remoteRevision=c->revision;c->baseline=true;c->calibrationRevision=0;c->calibrationReceived=0;
         Serial.printf("EVENT CALIBRATION_APPLIED %s %lu %u\n",mac,(unsigned long)c->revision,c->count);
         Packet ack=makePacket(CALIBRATION_ACK,p.seq,&c->revision,sizeof(c->revision));sendPacket(c->mac,ack);
-      } else Serial.printf("EVENT CALIBRATION_ERROR %s storage\n",mac);
+      } else { c->lastAutoSizeRevision=previousAutoSizeRevision;Serial.printf("EVENT CALIBRATION_ERROR %s storage\n",mac); }
     }
   } else if(p.type>=SNAPSHOT_BEGIN && p.type<=SNAPSHOT_END) handleSnapshot(*c,p);
 }
@@ -586,8 +611,8 @@ void command(char *input) {
   char *macArg=strtok_r(nullptr," \r\n",&saveptr);Camera *c=macArg?cameraFor(macArg):nullptr;
   if(!c) { Serial.println("ERR CAMERA unknown");return; }
   if(!strcmp(cmd,"GET")) {
-    char mac[18];macText(c->mac,mac);Serial.printf("CONFIG %s %lu %u %u %d %d %d %u %u\n",mac,(unsigned long)c->revision,c->count,c->settings.resolution,c->settings.brightness,c->settings.contrast,c->settings.saturation,c->settings.vflip,c->settings.hmirror);
-    for(uint16_t i=0;i<c->count;++i) { Cell &x=c->cells[i];Serial.printf("CELL %u %lu %lu %u %u %u %u %u %u %u %u %u\n",i,(unsigned long)x.id,(unsigned long)x.group,x.x,x.y,x.radius,x.shape,x.floor,x.tolerance,x.threshold,x.enter,x.clear); }
+    char mac[18];macText(c->mac,mac);Serial.printf("CONFIG %s %lu %u %lu %u %d %d %d %u %u\n",mac,(unsigned long)c->revision,c->count,(unsigned long)c->lastAutoSizeRevision,c->settings.resolution,c->settings.brightness,c->settings.contrast,c->settings.saturation,c->settings.vflip,c->settings.hmirror);
+    for(uint16_t i=0;i<c->count;++i) { Cell &x=c->cells[i];Serial.printf("CELL %u %lu %lu %u %u %u %u %u %u %u %u %u %lu\n",i,(unsigned long)x.id,(unsigned long)x.group,x.x,x.y,x.radius,x.shape,x.floor,x.tolerance,x.threshold,x.enter,x.clear,(unsigned long)x.createdRevision); }
     for(uint16_t i=0;i<c->count;++i) {
       uint32_t id=c->cells[i].group?c->cells[i].group:c->cells[i].id;
       bool first=true;for(uint16_t j=0;j<i;++j) if((c->cells[j].group?c->cells[j].group:c->cells[j].id)==id) first=false;
@@ -624,8 +649,11 @@ void command(char *input) {
     Serial.println("OK BEGIN");return;
   }
   if(!strcmp(cmd,"CELL")) {
-    long v[12];for(int i=0;i<12;++i) { char *a=strtok_r(nullptr," \r\n",&saveptr);if(!number(a,v[i],0,2147483647)) { Serial.println("ERR CELL args");return; } }
-    Cell x={(uint32_t)v[1],(uint32_t)v[2],(uint16_t)v[3],(uint16_t)v[4],(uint8_t)v[5],(uint8_t)v[6],(uint16_t)v[7],(uint16_t)v[9],(uint8_t)v[8],(uint8_t)v[10],(uint8_t)v[11]};
+    long v[13];for(int i=0;i<13;++i) { char *a=strtok_r(nullptr," \r\n",&saveptr);if(!number(a,v[i],0,2147483647)) { Serial.println("ERR CELL args");return; } }
+    Cell x={(uint32_t)v[1],(uint32_t)v[2],(uint16_t)v[3],(uint16_t)v[4],(uint8_t)v[5],(uint8_t)v[6],(uint16_t)v[7],(uint16_t)v[9],(uint8_t)v[8],(uint8_t)v[10],(uint8_t)v[11],c->stagedRevision};
+    // Creation is bridge-owned metadata. Preserve it for an existing sensor
+    // even when a setup app holds a stale draft after its first save.
+    for(uint16_t i=0;i<c->count;++i) if(c->cells[i].id==x.id) { x.createdRevision=c->cells[i].createdRevision;break; }
     if(!c->staged || v[0]!=c->received || c->received>=c->stagedCount || !validCell(x,c->stagedSettings)) { Serial.println("ERR CELL invalid");return; }
     for(uint16_t i=0;i<c->received;++i) if(c->staged[i].id==x.id) { Serial.println("ERR CELL duplicate");return; }
     c->staged[c->received++]=x;Serial.println("OK CELL");return;
@@ -669,7 +697,10 @@ void command(char *input) {
   }
   if(!strcmp(cmd,"CALIBRATE")) {
     if(!c->seen || c->phase || c->pendingType || c->snapshot || !c->count) { Serial.println("ERR CALIBRATE unavailable");return; }
-    CalibrationRequest value={c->revision+1,10000,50};
+    char *mode=strtok_r(nullptr," \r\n",&saveptr);const bool all=mode && !strcmp(mode,"all");
+    if(mode && !all && strcmp(mode,"new")) { Serial.println("ERR CALIBRATE mode");return; }
+    const uint32_t since=all?0:c->lastAutoSizeRevision;
+    CalibrationRequest value={c->revision+1,10000,since,50};
     Packet p=makePacket(CALIBRATE_REQUEST,sequence++,&value,sizeof(value));
     c->pending=p;c->pendingType=p.type;c->pendingSeq=p.seq;c->pendingAt=millis();c->retries=0;
     if(!sendPacket(c->mac,p)) { c->pendingType=0;Serial.println("ERR CALIBRATE radio");return; }

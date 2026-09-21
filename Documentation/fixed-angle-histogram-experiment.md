@@ -18,8 +18,8 @@ The fetched-frame preview displays all nine bucket centres and percentages. Line
 ## Compatibility
 
 - Camera firmware identifies itself as `0.2.0-fixed-histogram`.
-- The bridge protocol and analysis packet sizes are unchanged.
-- The baseline magic changes, so the camera safely rejects baselines made by `main` and requires a new baseline.
+- The analysis packet size is unchanged. Configuration packets now carry an immutable sensor creation revision, and calibration requests carry the bridge's last successful auto-size revision; flash the matching bridge and camera firmware together.
+- The baseline magic changes, so the camera safely rejects baselines made by `main` or an earlier experiment build and requires a new baseline.
 - The saved `angleTolerance` setting is ignored by this experiment.
 
 ## Suggested comparison procedure
@@ -31,5 +31,7 @@ The fetched-frame preview displays all nine bucket centres and percentages. Line
 5. Add representative rolling stock and collect scores at several positions.
 6. Set each sensor threshold above its highest credible clear score and below its lowest obstruction score. For the earlier 208-to-145-edge example, begin testing near 250 rather than assuming the production default of 400.
 7. Increase **Frames to occupy** to 2 if isolated frames still cross the threshold.
+
+After the first run, the setup applications offer `new` or `all`. `new` auto-sizes only sensors whose immutable creation revision is newer than the last successful auto-size, so later manual radius or threshold tuning is preserved. `all` intentionally recalculates every sensor. Both choices rebuild the empty baseline for the complete configuration.
 
 Hard 20-degree boundaries are deliberately retained in this first experiment. If otherwise stable lines wander between neighbouring buckets, the next refinement should use overlapping or softly weighted adjacent buckets.

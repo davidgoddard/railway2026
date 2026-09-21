@@ -9,14 +9,18 @@ test('new production sensors default to one occupancy frame and a 400 score', ()
   assert.equal(DEFAULT_CELL.enter, 1);
   assert.equal(DEFAULT_CELL.threshold, 400);
   assert.equal(DEFAULT_CELL.clear, 5);
+  assert.equal(DEFAULT_CELL.createdRevision, 0);
 });
-const config = () => ({ revision: 4, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 }, cells: [
-  { id: 1, group: 20, x: 40, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5 },
-  { id: 2, group: 20, x: 45, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5 }
+const config = () => ({ revision: 4, lastAutoSizeRevision: 3, settings: { resolution: 0, brightness: 0, contrast: 0, saturation: 0, vflip: 0, hmirror: 0 }, cells: [
+  { id: 1, group: 20, x: 40, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5, createdRevision: 2 },
+  { id: 2, group: 20, x: 45, y: 50, radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 200, enter: 3, clear: 5, createdRevision: 4 }
 ], topics: { 20: 'platform-1' } });
 test('parses bridge configuration and topic rows', () => {
   assert.deepEqual(parseRow('TOPIC 20 platform-1'), { type: 'topic', id: 20, name: 'platform-1' });
-  assert.equal(parseRow('CELL 0 1 20 40 50 5 0 80 10 200 3 5').cell.threshold, 200);
+  assert.equal(parseRow(`CONFIG ${mac} 4 2 3 0 0 0 0 0 0`).lastAutoSizeRevision, 3);
+  const cell = parseRow('CELL 0 1 20 40 50 5 0 80 10 200 3 5 2').cell;
+  assert.equal(cell.threshold, 200);
+  assert.equal(cell.createdRevision, 2);
 });
 test('builds a complete ordered upload including the MQTT alias', () => {
   const commands = commandsForConfig(mac, config());
@@ -30,7 +34,7 @@ test('uploads a camera-wide one-frame occupancy choice for every sensor', () => 
   assert.equal(sameCameraConfiguration(draft, saved), false);
   const commands = commandsForConfig(mac, draft).filter(line => line.startsWith('CELL '));
   assert.equal(commands.length, 2);
-  assert.ok(commands.every(line => line.endsWith(' 200 1 5')));
+  assert.ok(commands.every(line => / 200 1 5 [24]$/.test(line)));
 });
 test('uploads a camera-wide mismatch threshold for every sensor', () => {
   const saved = config(), draft = structuredClone(saved);
@@ -38,7 +42,7 @@ test('uploads a camera-wide mismatch threshold for every sensor', () => {
   assert.equal(sameCameraConfiguration(draft, saved), false);
   const commands = commandsForConfig(mac, draft).filter(line => line.startsWith('CELL '));
   assert.equal(commands.length, 2);
-  assert.ok(commands.every(line => line.endsWith(' 450 3 5')));
+  assert.ok(commands.every(line => / 450 3 5 [24]$/.test(line)));
   draft.cells[0].threshold = 1001;
   assert.throws(() => validateConfig(draft), /Invalid sensor thresholds/);
 });
@@ -97,7 +101,7 @@ test('Live view accepts the same saved config with default topics and parsed fie
   const saved = { revision: 5, settings: { ...draft.settings }, cells: draft.cells.map(cell => ({
     id: cell.id, group: cell.group, x: cell.x, y: cell.y, radius: cell.radius,
     shape: cell.shape, floor: cell.floor, tolerance: cell.tolerance,
-    threshold: cell.threshold, enter: cell.enter, clear: cell.clear
+    threshold: cell.threshold, enter: cell.enter, clear: cell.clear, createdRevision: cell.createdRevision
   })), topics: { 20: '20' } };
   assert.equal(sameCameraConfiguration(draft, saved), true);
   saved.cells[0].x++;

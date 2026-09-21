@@ -70,7 +70,7 @@ All fields are packed and little-endian, as sent by ESP32. The packet starts wit
 | --- | ---: | --- | --- |
 | `HELLO` | 1 | broadcast from camera | MAC `[6]`, revision `u32`, width/height/count `u16`, channel and baseline-ready `u8` |
 | `CONFIG_BEGIN` | 2 | bridge → camera | revision `u32`, count `u16`, camera settings: resolution `u8`, brightness/contrast/saturation `i8`, vertical flip/horizontal mirror `u8` |
-| `CONFIG_CELL` | 3 | bridge → camera | index `u16`, then `CellConfig`: id/group ID `u32`, centre x/y `u16`, radius/shape `u8`, contrast floor/threshold in thousandths `u16`, tolerance/enter/clear `u8` |
+| `CONFIG_CELL` | 3 | bridge → camera | index `u16`, then `CellConfig`: id/group ID `u32`, centre x/y `u16`, radius/shape `u8`, contrast floor/threshold in thousandths `u16`, tolerance/enter/clear `u8`, immutable creation revision `u32` |
 | `CONFIG_COMMIT` | 4 | bridge → camera | revision `u32` |
 | `CAPTURE_BASELINE` | 5 | bridge → camera | empty payload; captures three **fresh** frames, averages them, and recalibrates every active cell |
 | `SNAPSHOT_REQUEST` | 6 | bridge → camera | empty payload; starts transfer of the latest retained grayscale frame |
@@ -79,7 +79,7 @@ All fields are packed and little-endian, as sent by ESP32. The packet starts wit
 | `HEALTH` | 9 | camera → bridge | revision/frame/capture failures/free heap `u32`, cell count/width/height/capture age ms `u16`, baseline-ready/snapshot-active `u8` |
 | `ANALYSIS_REQUEST` | 17 | bridge → camera | individual sensor ID `u32` |
 | `CELL_ANALYSIS` | 18 | camera → bridge | sensor/revision/frame, score/threshold, baseline/live edge totals, up to ten line angles, baseline buckets, and live buckets |
-| `CALIBRATE_REQUEST` | 19 | bridge → camera | target revision and ten-second duration `u32`, maximum sample count `u8` |
+| `CALIBRATE_REQUEST` | 19 | bridge → camera | target revision, duration and last-auto-size revision `u32`, maximum sample count `u8`; creation revisions select new sensors when requested |
 | `CALIBRATION_RESULT` | 20 | camera → bridge | revision, sensor/index/count, chosen threshold/radius, worst clear score, reference edges, sample count, and confidence |
 | `CALIBRATION_ACK` | 21 | bridge → camera | stored revision `u32` after every result has been persisted |
 | `SNAPSHOT_BEGIN` | 10 | camera → bridge | frame/byte count/CRC32 `u32`, width/height `u16` |
