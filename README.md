@@ -13,15 +13,7 @@ The system has three components:
 - **Bridge controller:** a Wi-Fi-capable ESP32 that connects the cameras to your Wi-Fi network and MQTT broker, and provides a USB serial connection for setup.
 - **Setup application:** the [web app](https://davidgoddard.github.io/railway2026/) or the [desktop app](Bridge_Controller/README.md), used to configure cameras, define sensors and blocks, and view their states.
 
-```text
-Camera modules                  Bridge controller             Railway control software
-Local image processing   →      Wi-Fi-capable ESP32    →      MQTT broker and clients
-                         ESP-NOW                       Wi-Fi
-                                      ↑
-                                     USB
-                                      ↑
-                               Setup application
-```
+![Camera modules send occupancy states through the bridge to railway control software, while the setup application connects over USB](Documentation/assets/00_system_overview.svg)
 
 Camera modules need power and communicate with the bridge without data cables. After configuration, the bridge also needs only power; the setup computer can be disconnected.
 
