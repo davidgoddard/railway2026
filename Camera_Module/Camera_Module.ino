@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.1.15"
+#define CAMERA_MODULE_VERSION "0.2.0-fixed-histogram"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -38,7 +38,7 @@ constexpr uint8_t PROTOCOL_VERSION=1;
 constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
-constexpr uint8_t MAX_PEAKS=10, BINS=36, MAX_ANCHORS=2;
+constexpr uint8_t MAX_PEAKS=10, FIXED_DIRECTIONS=9, BINS=36, MAX_ANCHORS=2;
 constexpr uint8_t POSITION_BANDS=3, SPATIAL_BUCKETS=MAX_PEAKS*POSITION_BANDS+1;
 constexpr uint32_t HELLO_MS=2000, HEALTH_MS=5000, SNAP_TIMEOUT_MS=250;
 constexpr uint8_t BROADCAST_MAC[6]={255,255,255,255,255,255};
@@ -566,7 +566,7 @@ bool saveBaseline() {
   const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
   // Runtime features contain the calibration. The full grayscale frame is not
   // needed after reboot and made SVGA baselines require two 480 KB flash files.
-  BaselineHeader h={0x52424C37,configRevision,0,
+  BaselineHeader h={0x52424C38,configRevision,0,
     crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
   if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
   File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
@@ -587,7 +587,7 @@ void loadBaseline() {
     LittleFS.rename("/baseline.bak","/baseline.bin");
   File f=LittleFS.open("/baseline.bin","r");if(!f) return;
   BaselineHeader h={};
-  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C37 ||
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C38 ||
      h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
   const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
   if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||

@@ -150,15 +150,8 @@ function analyseCellPixels(cell){
   }
   const minimum=Math.max(cell.floor,maxGradient/5);let edges=0;
   if(maxGradient>=cell.floor)for(const [gx,gy,magnitude] of gradients){if(magnitude<minimum)continue;let angle=Math.atan2(gy,gx)*180/Math.PI;if(angle<0)angle+=180;if(angle>=180)angle-=180;const bin=Math.min(Math.floor(angle/5),bins-1);hist[bin]++;angleSum[bin]+=angle;edges++;}
-  const support=Array.from(hist,(_,i)=>hist[(i+bins-1)%bins]+hist[i]+hist[(i+1)%bins]);
-  const selected=new Set(),peaks=[];
-  const append=(best,count)=>{const centre=best*5+2.5;let total=0;for(let d=-1;d<=1;d++){const bin=(best+d+bins)%bins;if(!hist[bin])continue;let mean=angleSum[bin]/hist[bin];while(mean-centre>90)mean-=180;while(mean-centre< -90)mean+=180;total+=mean*hist[bin];}let gradientAngle=total/count;if(gradientAngle<0)gradientAngle+=180;if(gradientAngle>=180)gradientAngle-=180;const sameFamily=peaks.some(item=>{const separation=Math.abs(item.gradientAngle-gradientAngle);return Math.min(separation,180-separation)<20;});if(sameFamily||peaks.length>=10)return false;selected.add(best);peaks.push({gradientAngle,lineAngle:(gradientAngle+90)%180,share:count/edges});return true;};
-  let primary=0,primaryBin=-1;for(let bin=0;bin<bins;bin++)if(support[bin]>primary){primary=support[bin];primaryBin=bin;}
-  if(primaryBin>=0&&primary>=3&&primary*20>=3*edges&&append(primaryBin,primary)){
-    const opposite=(primaryBin+bins/2)%bins;let perpendicular=-1,perpendicularCount=0;for(let d=-3;d<=3;d++){const bin=(opposite+d+bins)%bins;if(support[bin]>perpendicularCount){perpendicular=bin;perpendicularCount=support[bin];}}
-    if(perpendicular>=0&&perpendicularCount>=4&&perpendicularCount*100>=3*edges)append(perpendicular,perpendicularCount);
-    while(peaks.length<10){let best=-1,count=0;for(let bin=0;bin<bins;bin++){let close=false;for(let d=-4;d<=4;d++)if(selected.has((bin+d+bins)%bins))close=true;if(!close&&support[bin]>count){best=bin;count=support[bin];}}if(best<0||count<3||count*20<edges||count*5<primary)break;if(!append(best,count))selected.add(best);}
-  }
+  const fixedCounts=new Uint16Array(9);for(let bin=0;bin<bins;bin++){const physical=(bin*5+2.5+90)%180;fixedCounts[Math.min(Math.floor(((physical+10)%180)/20),8)]+=hist[bin];}
+  const peaks=Array.from(fixedCounts,(count,direction)=>({lineAngle:direction*20,share:edges?count/edges:0}));
   return{samples,edges,maxGradient,minimum,peaks};
 }
 function renderCellAnalysis(cell){
@@ -166,8 +159,8 @@ function renderCellAnalysis(cell){
   if(!frame){canvas.width=canvas.height=1;canvas.getContext('2d').clearRect(0,0,1,1);summary.textContent='Fetch a clear-track frame to inspect this sensor.';return;}
   const pixels=new Uint8Array(frame.pixels),diameter=cell.radius*2+1,scale=Math.max(2,Math.min(10,Math.floor(300/diameter)));canvas.width=canvas.height=diameter*scale;const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
   for(let py=0;py<diameter;py++)for(let px=0;px<diameter;px++){const x=cell.x-cell.radius+px,y=cell.y-cell.radius+py,value=x>=0&&x<frame.width&&y>=0&&y<frame.height?pixels[y*frame.width+x]:0;ctx.fillStyle=`rgb(${value},${value},${value})`;ctx.fillRect(px*scale,py*scale,scale,scale);}
-  const result=analyseCellPixels(cell);summary.textContent=`${result.edges} strong gradients from ${result.samples} pixels · cutoff ${Math.ceil(result.minimum)}${result.peaks.length?` · ${result.peaks.length} direction${result.peaks.length===1?'':'s'}`:' · no supported direction'}`;
-  const centre=canvas.width/2,length=canvas.width*.42;result.peaks.forEach((peak,index)=>{const radians=peak.lineAngle*Math.PI/180;ctx.beginPath();ctx.moveTo(centre-Math.cos(radians)*length,centre-Math.sin(radians)*length);ctx.lineTo(centre+Math.cos(radians)*length,centre+Math.sin(radians)*length);ctx.strokeStyle=analysisColours[index];ctx.lineWidth=Math.max(2,scale/3);ctx.stroke();const tag=document.createElement('i'),dot=document.createElement('b');dot.style.background=analysisColours[index];tag.append(dot,document.createTextNode(`${peak.lineAngle.toFixed(1)}° · ${(peak.share*100).toFixed(0)}%`));list.append(tag);});
+  const result=analyseCellPixels(cell);summary.textContent=`${result.edges} strong gradients from ${result.samples} pixels · cutoff ${Math.ceil(result.minimum)} · 9 fixed direction buckets`;
+  const centre=canvas.width/2,length=canvas.width*.42;result.peaks.forEach((peak,index)=>{if(peak.share>=.03){const radians=peak.lineAngle*Math.PI/180;ctx.beginPath();ctx.moveTo(centre-Math.cos(radians)*length,centre-Math.sin(radians)*length);ctx.lineTo(centre+Math.cos(radians)*length,centre+Math.sin(radians)*length);ctx.strokeStyle=analysisColours[index];ctx.lineWidth=Math.max(2,scale/3);ctx.stroke();}const tag=document.createElement('i'),dot=document.createElement('b');dot.style.background=analysisColours[index];tag.append(dot,document.createTextNode(`${peak.lineAngle.toFixed(0)}° · ${(peak.share*100).toFixed(0)}%`));list.append(tag);});
 }
 function renderBaselineComparison(cell){
   const root=$('comparison-content'),result=cellAnalyses.get(`${selectedMac}:${cell.id}`);root.replaceChildren();

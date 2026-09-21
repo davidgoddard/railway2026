@@ -27,6 +27,8 @@ An occupancy change is queued for radio transmission. The queue coalesces newer 
 
 ## Detection algorithm
 
+> On the `experiment/fixed-angle-histogram` branch, firmware `0.2.0-fixed-histogram` replaces selected direction families with nine fixed 20-degree direction buckets, each split into three position bands, and adds proportional edge-count change to the score. See the [experiment procedure](../Documentation/fixed-angle-histogram-experiment.md). The description below documents the production algorithm on `main`.
+
 The detector retains **up to ten supported gradient angles** from 36 five-degree bins. These are gradient-normal angles: the visible rail or carriage edge runs 90° from the angle reported over serial. The setup app converts them to physical line directions in its cell preview. A cell with no stable angle is still usable; a blank reference can detect new texture. Saved edge locations are no longer used to decide occupancy.
 
 Firmware 0.1.6 expands the persisted angle signature, so an older baseline file is rejected safely. Save the camera configuration again if needed, then capture a fresh empty-track baseline after installing this version. Legacy edge-point fields remain unused.

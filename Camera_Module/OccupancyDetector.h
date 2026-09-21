@@ -33,10 +33,8 @@ class OccupancyDetector {
   void gradientAt(const uint8_t *pixels,int p,int &gx,int &gy);
   bool insideCell(const CellConfig &c,int x,int y);
   void bounds(const CellConfig &c,int &x0,int &x1,int &y0,int &y1);
-  bool nearDirection(const CellRuntime &cell,int peak,int gx,int gy,int tolerance);
   uint8_t directionBucket(const CellRuntime &cell,int gx,int gy);
   uint8_t spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y);
-  void selectPeaks(Feature &f);
   Feature analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
                   int offsetX=0,int offsetY=0);
   float histogramDistance(const Feature &a,const Feature &b);
@@ -67,22 +65,15 @@ void OccupancyDetector::bounds(const CellConfig &c,int &x0,int &x1,int &y0,int &
   x0=max(1,(int)c.x-c.radius);x1=min((int)width_-2,(int)c.x+c.radius);
   y0=max(1,(int)c.y-c.radius);y1=min((int)height_-2,(int)c.y+c.radius);
 }
-bool OccupancyDetector::nearDirection(const CellRuntime &cell,int peak,int gx,int gy,int tolerance) {
-  const int32_t dot=abs(gx*cell.directionX[peak]+gy*cell.directionY[peak]);
-  const int32_t cross=abs(gy*cell.directionX[peak]-gx*cell.directionY[peak]);
-  return cross*256<=dot*tanQ8[constrain(tolerance,0,20)];
-}
 uint8_t OccupancyDetector::directionBucket(const CellRuntime &cell,int gx,int gy) {
-  int32_t bestDot=-1;uint8_t best=MAX_PEAKS;
-  for(uint8_t peak=0;peak<cell.reference.peakCount;++peak) {
-    if(!nearDirection(cell,peak,gx,gy,cell.config.angleTolerance)) continue;
-    const int32_t dot=abs(gx*cell.directionX[peak]+gy*cell.directionY[peak]);
-    if(dot>bestDot) { bestDot=dot;best=peak; }
-  }
-  return best;
+  (void)cell;
+  float angle=atan2f((float)gy,(float)gx)*57.2957795f+90.0f;
+  if(angle<0) angle+=180;
+  if(angle>=180) angle-=180;
+  angle+=10.0f;if(angle>=180) angle-=180;
+  return min((int)(angle/20.0f),(int)FIXED_DIRECTIONS-1);
 }
 uint8_t OccupancyDetector::spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y) {
-  if(peak==MAX_PEAKS) return SPATIAL_BUCKETS-1;
   // directionX/Y is the edge normal. Project the sample position onto it,
   // then retain only three broad bands to avoid exact pixel matching.
   const int32_t rhoQ8=(x-(int)cell.config.x)*cell.directionX[peak]
@@ -90,65 +81,6 @@ uint8_t OccupancyDetector::spatialBucket(const CellRuntime &cell,uint8_t peak,in
   const int32_t limitQ8=(int32_t)cell.config.radius*256/3;
   const uint8_t band=rhoQ8 < -limitQ8 ? 0 : rhoQ8 > limitQ8 ? 2 : 1;
   return peak*POSITION_BANDS+band;
-}
-void OccupancyDetector::selectPeaks(Feature &f) {
-  uint32_t support[BINS]={};
-  for(int i=0;i<BINS;++i) support[i]=f.hist[(i+BINS-1)%BINS]+f.hist[i]+f.hist[(i+1)%BINS];
-  uint64_t selected=0;uint32_t primary=0;int primaryBin=-1;
-  auto append=[&](int best,uint32_t count) {
-    const float centre=best*5.0f+2.5f;
-    float total=0;
-    for(int delta=-1;delta<=1;++delta) {
-      const int bin=(best+delta+BINS)%BINS;
-      if(!f.hist[bin]) continue;
-      float mean=f.angleSum[bin]/f.hist[bin];
-      while(mean-centre>90) mean-=180;
-      while(mean-centre< -90) mean+=180;
-      total+=mean*f.hist[bin];
-    }
-    float refined=total/count;
-    if(refined<0) refined+=180;
-    if(refined>=180) refined-=180;
-    bool sameFamily=false;
-    for(uint8_t existing=0;existing<f.peakCount;++existing) {
-      float separation=fabsf(refined-f.peakAngle[existing]);
-      separation=min(separation,180.0f-separation);
-      if(separation<20.0f) { sameFamily=true;break; }
-    }
-    if(sameFamily || f.peakCount>=MAX_PEAKS) return false;
-    selected|=1ULL<<best;
-    f.peakAngle[f.peakCount]=refined;
-    f.peakShare[f.peakCount]=(float)count/f.edges;
-    ++f.peakCount;
-    return true;
-  };
-  for(int bin=0;bin<BINS;++bin) if(support[bin]>primary) { primary=support[bin];primaryBin=bin; }
-  if(primaryBin<0 || primary<3 || primary*20<3*f.edges || !append(primaryBin,primary)) return;
-
-  // Track sleepers are expected to be perpendicular to the dominant rail
-  // family. Search that neighbourhood explicitly before applying generic
-  // secondary-family thresholds. Four samples and 3% support suppress
-  // isolated noise while allowing a visually clear but weaker sleeper family.
-  int perpendicular=-1;uint32_t perpendicularCount=0;
-  const int opposite=(primaryBin+BINS/2)%BINS;
-  for(int delta=-3;delta<=3;++delta) {
-    const int bin=(opposite+delta+BINS)%BINS;
-    if(support[bin]>perpendicularCount) { perpendicular=bin;perpendicularCount=support[bin]; }
-  }
-  if(perpendicular>=0 && perpendicularCount>=4 && perpendicularCount*100>=3*f.edges)
-    append(perpendicular,perpendicularCount);
-
-  while(f.peakCount<MAX_PEAKS) {
-    int best=-1;uint32_t count=0;
-    for(int bin=0;bin<BINS;++bin) {
-      bool close=false;
-      for(int delta=-4;delta<=4;++delta)
-        if(selected&(1ULL<<((bin+delta+BINS)%BINS))) close=true;
-      if(!close && support[bin]>count) { best=bin;count=support[bin]; }
-    }
-    if(best<0 || count<3 || count*20<f.edges || count*5<primary) break;
-    if(!append(best,count)) selected|=1ULL<<best;
-  }
 }
 Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
                                    int offsetX,int offsetY) {
@@ -178,19 +110,26 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
     int gx,gy;gradientAt(pixels_,sy*width_+sx,gx,gy);
     if(abs(gx)+abs(gy)<minimum) continue;
     ++f.edges;
-    if(!referenceMode && cell.reference.peakCount) {
-      const uint8_t peak=directionBucket(cell,gx,gy);
-      ++buckets[spatialBucket(cell,peak,x,y)];
-    } else {
-      float angle=atan2f((float)gy,(float)gx)*57.2957795f;
-      if(angle<0) angle+=180;
-      if(angle>=180) angle-=180;
-      const int bin=min((int)(angle/5),BINS-1);
-      ++f.hist[bin];f.angleSum[bin]+=angle;
-    }
+    float angle=atan2f((float)gy,(float)gx)*57.2957795f;
+    if(angle<0) angle+=180;
+    if(angle>=180) angle-=180;
+    const int bin=min((int)(angle/5),BINS-1);
+    ++f.hist[bin];f.angleSum[bin]+=angle;
+    const uint8_t direction=directionBucket(cell,gx,gy);
+    ++buckets[spatialBucket(cell,direction,x,y)];
   }
   f.textured=f.edges>=8;
-  if(referenceMode && f.textured) selectPeaks(f);
+  if(referenceMode && f.textured) {
+    f.peakCount=FIXED_DIRECTIONS;
+    for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+      const float physicalAngle=direction*20.0f;
+      f.peakAngle[direction]=fmodf(physicalAngle+90.0f,180.0f);
+      uint32_t count=0;
+      for(uint8_t band=0;band<POSITION_BANDS;++band)
+        count+=buckets[direction*POSITION_BANDS+band];
+      f.peakShare[direction]=(float)count/f.edges;
+    }
+  }
   return f;
 }
 float OccupancyDetector::histogramDistance(const Feature &a,const Feature &b) {
@@ -212,27 +151,14 @@ float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Featur
   return min(1.0f,0.5f*sum);
 }
 void OccupancyDetector::calibrateCell(CellRuntime &cell) {
-  uint16_t unused[SPATIAL_BUCKETS]={};
-  cell.reference=analyse(cell,true,unused);
   memset(cell.referenceBuckets,0,sizeof(cell.referenceBuckets));
-  for(int peak=0;peak<cell.reference.peakCount;++peak) {
-    const float radians=cell.reference.peakAngle[peak]*0.01745329252f;
-    cell.directionX[peak]=(int16_t)lroundf(cosf(radians)*256);
-    cell.directionY[peak]=(int16_t)lroundf(sinf(radians)*256);
+  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+    const float physicalAngle=direction*20.0f;
+    const float gradientRadians=fmodf(physicalAngle+90.0f,180.0f)*0.01745329252f;
+    cell.directionX[direction]=(int16_t)lroundf(cosf(gradientRadians)*256);
+    cell.directionY[direction]=(int16_t)lroundf(sinf(gradientRadians)*256);
   }
-  // Calculate baseline buckets with the same projected assignment as live frames.
-  if(cell.reference.peakCount) {
-    int x0,x1,y0,y1;bounds(cell.config,x0,x1,y0,y1);
-    const int minimum=max((int)cell.config.contrastFloor,(int)cell.reference.maxGradient/5);
-    for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
-      if(!insideCell(cell.config,x,y)) continue;
-      int gx,gy;gradientAt(pixels_,y*width_+x,gx,gy);
-      if(abs(gx)+abs(gy)>=minimum) {
-        const uint8_t peak=directionBucket(cell,gx,gy);
-        ++cell.referenceBuckets[spatialBucket(cell,peak,x,y)];
-      }
-    }
-  }
+  cell.reference=analyse(cell,true,cell.referenceBuckets);
   cell.state=CLEAR;cell.enterCount=cell.clearCount=0;cell.scorePermille=0;
   DEBUGF("base id=%lu group=%lu centre=(%u,%u) r=%u edges=%u angles=%u",
     (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
@@ -250,8 +176,12 @@ uint16_t OccupancyDetector::compareCell(CellRuntime &cell,const Feature &live,co
   float score=0;
   if(!cell.reference.textured && !live.textured) score=0;
   else if(cell.reference.textured!=live.textured) score=1;
-  else if(cell.reference.peakCount) score=projectionDistance(cell,live,buckets);
-  else score=histogramDistance(cell.reference,live);
+  else {
+    score=projectionDistance(cell,live,buckets);
+    const float edgeDensity=fabsf((float)cell.reference.edges-live.edges)
+      /max((float)cell.reference.edges,(float)live.edges);
+    score=max(score,edgeDensity);
+  }
   return (uint16_t)constrain((int)lroundf(score*1000),0,1000);
 }
 uint16_t OccupancyDetector::inspectCell(CellRuntime &cell,Feature &live,uint16_t buckets[SPATIAL_BUCKETS]) {
