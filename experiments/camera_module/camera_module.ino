@@ -277,12 +277,14 @@ void appendFrameLog(bool captureOk) {
 
 // The angle is the gradient normal, so a visible line appears at angle + 90°.
 void gradientAt(const uint8_t *pixels, int p, int &gx, int &gy) {
-  gx = -pixels[p - WIDTH - 1] + pixels[p - WIDTH + 1]
-     - 2 * pixels[p - 1] + 2 * pixels[p + 1]
-     - pixels[p + WIDTH - 1] + pixels[p + WIDTH + 1];
-  gy = -pixels[p - WIDTH - 1] - 2 * pixels[p - WIDTH]
-     - pixels[p - WIDTH + 1] + pixels[p + WIDTH - 1]
-     + 2 * pixels[p + WIDTH] + pixels[p + WIDTH + 1];
+  const int rawX = -3 * pixels[p - WIDTH - 1] + 3 * pixels[p - WIDTH + 1]
+                   - 10 * pixels[p - 1] + 10 * pixels[p + 1]
+                   - 3 * pixels[p + WIDTH - 1] + 3 * pixels[p + WIDTH + 1];
+  const int rawY = -3 * pixels[p - WIDTH - 1] - 10 * pixels[p - WIDTH]
+                   - 3 * pixels[p - WIDTH + 1] + 3 * pixels[p + WIDTH - 1]
+                   + 10 * pixels[p + WIDTH] + 3 * pixels[p + WIDTH + 1];
+  gx = rawX < 0 ? -((-rawX + 2) / 4) : (rawX + 2) / 4;
+  gy = rawY < 0 ? -((-rawY + 2) / 4) : (rawY + 2) / 4;
 }
 
 int projectionBucket(int gx, int gy, int tolerance) {

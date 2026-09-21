@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.1.6"
+#define CAMERA_MODULE_VERSION "0.1.15"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -39,6 +39,7 @@ constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
 constexpr uint8_t MAX_PEAKS=10, BINS=36, MAX_ANCHORS=2;
+constexpr uint8_t POSITION_BANDS=3, SPATIAL_BUCKETS=MAX_PEAKS*POSITION_BANDS+1;
 constexpr uint32_t HELLO_MS=2000, HEALTH_MS=5000, SNAP_TIMEOUT_MS=250;
 constexpr uint8_t BROADCAST_MAC[6]={255,255,255,255,255,255};
 
@@ -47,7 +48,8 @@ enum MessageType : uint8_t {
   CAPTURE_BASELINE=5, SNAPSHOT_REQUEST=6, ACK=7,
   STATE=8, HEALTH=9, SNAPSHOT_BEGIN=10, SNAPSHOT_CHUNK=11,
   SNAPSHOT_END=12, SNAPSHOT_ACK=13, DIAGNOSTIC=14, DIAGNOSTIC_ACK=15,
-  HEALTH_ACK=16
+  HEALTH_ACK=16, ANALYSIS_REQUEST=17, CELL_ANALYSIS=18,
+  CALIBRATE_REQUEST=19, CALIBRATION_RESULT=20, CALIBRATION_ACK=21
 };
 enum AckStatus : uint8_t { ACK_OK=0, ACK_BAD_PAYLOAD=1, ACK_BAD_ORDER=2, ACK_NO_MEMORY=3, ACK_CAMERA_ERROR=4, ACK_BUSY=5 };
 enum CellState : uint8_t { UNKNOWN=0, CLEAR=1, OCCUPIED=2 };
@@ -88,6 +90,18 @@ struct __attribute__((packed)) StatePayload {
   uint16_t scorePermille;
   uint8_t state, grouped;
 };
+struct __attribute__((packed)) AnalysisPayload {
+  uint32_t id,revision,frame;
+  uint16_t scorePermille,thresholdPermille,referenceEdges,liveEdges;
+  uint8_t peakCount;
+  uint16_t lineAngleTenths[MAX_PEAKS];
+  uint16_t referenceBuckets[SPATIAL_BUCKETS],liveBuckets[SPATIAL_BUCKETS];
+};
+struct __attribute__((packed)) CalibrationRequestPayload { uint32_t revision,durationMs;uint8_t maxSamples; };
+struct __attribute__((packed)) CalibrationResultPayload {
+  uint32_t revision,id;uint16_t index,count,thresholdPermille,clearMaximum,referenceEdges,samples;
+  uint8_t radius,confidence;
+};
 struct __attribute__((packed)) HelloPayload {
   uint8_t mac[6];
   uint32_t revision;
@@ -120,6 +134,8 @@ struct __attribute__((packed)) DiagnosticPayload {
   uint8_t event,resetReason,channel,operation,outcome;
 };
 static_assert(sizeof(ConfigCellPayload)<=RADIO_PAYLOAD, "Cell message too large");
+static_assert(sizeof(AnalysisPayload)<=RADIO_PAYLOAD, "Analysis message too large");
+static_assert(sizeof(CalibrationResultPayload)<=RADIO_PAYLOAD, "Calibration result too large");
 
 #include "ImageSource.h"
 ImageSource imageSource;
@@ -159,7 +175,7 @@ struct CellRuntime {
   uint8_t state=UNKNOWN,enterCount=0,clearCount=0;
   uint16_t scorePermille=0;
   int16_t directionX[MAX_PEAKS]={},directionY[MAX_PEAKS]={};
-  uint16_t referenceBuckets[MAX_PEAKS+1]={};
+  uint16_t referenceBuckets[SPATIAL_BUCKETS]={};
 };
 struct GroupRuntime {
   uint32_t id=0;
@@ -328,12 +344,26 @@ void baselineHeartbeat() {
   if(millis()-lastHealth>=5000) { sendHealth();lastHealth=millis();delay(2); }
 }
 bool captureBaseline() {
+  constexpr uint8_t BASELINE_FRAMES=3;
   const uint32_t started=millis();
   rtcDiagnostic={RTC_DIAG_MAGIC,2,0,0};
   queueDiagnostic(DIAG_BASELINE_START,configRevision);
-  DEBUGF("baseline capture start revision=%lu frame=%lu\n",(unsigned long)configRevision,(unsigned long)frameNumber);
+  DEBUGF("baseline capture start revision=%lu frames=%u from_frame=%lu\n",(unsigned long)configRevision,BASELINE_FRAMES,(unsigned long)frameNumber);
   sendHello();lastHello=millis();
-  if(snapshot.active || !captureFrame()) { rtcDiagnostic.outcome=1;queueDiagnostic(DIAG_BASELINE_FAILED,1);rtcDiagnostic.operation=0;return false; }
+  const size_t frameBytes=(size_t)frameWidth*frameHeight;
+  uint8_t *meanPixels=snapshot.active?nullptr:(uint8_t *)ps_malloc(frameBytes);
+  if(!meanPixels) { rtcDiagnostic.outcome=1;queueDiagnostic(DIAG_BASELINE_FAILED,1);rtcDiagnostic.operation=0;return false; }
+  bool captured=true;
+  for(uint8_t frame=0;frame<BASELINE_FRAMES;++frame) {
+    if(!captureFrame()) { captured=false;break; }
+    if(frame==0) memcpy(meanPixels,framePixels,frameBytes);
+    else for(size_t p=0;p<frameBytes;++p)
+      meanPixels[p]=(uint8_t)(((uint16_t)meanPixels[p]*frame+framePixels[p]+frame/2)/(frame+1));
+    DEBUGF("baseline frame %u/%u captured frame=%lu\n",frame+1,BASELINE_FRAMES,(unsigned long)frameNumber);
+    baselineHeartbeat();
+  }
+  if(!captured) { free(meanPixels);rtcDiagnostic.outcome=1;queueDiagnostic(DIAG_BASELINE_FAILED,1);rtcDiagnostic.operation=0;return false; }
+  memcpy(framePixels,meanPixels,frameBytes);free(meanPixels);
   detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
   for(uint16_t i=0;i<cellCount;++i) {
     // Retain the flash record layout, but do not save old edge locations.
@@ -350,9 +380,102 @@ bool captureBaseline() {
   queueAllStates();
   flashReady();
   sendHello();lastHello=millis();
-  DEBUGF("baseline ready: %u cells frame=%lu duration_ms=%lu\n",cellCount,(unsigned long)frameNumber,(unsigned long)(millis()-started));
+  DEBUGF("baseline ready: %u cells frames=%u last_frame=%lu duration_ms=%lu\n",cellCount,BASELINE_FRAMES,(unsigned long)frameNumber,(unsigned long)(millis()-started));
   rtcDiagnostic.outcome=3;queueDiagnostic(DIAG_BASELINE_DONE,millis()-started);rtcDiagnostic.operation=0;
   return true;
+}
+
+// Test five nested radii at every configured centre during one shared,
+// wall-clock-limited empty-scene run. The configured radius is the user's
+// maximum search radius; the smallest stable candidate with enough texture wins.
+bool autoCalibrate(const CalibrationRequestPayload &request) {
+  constexpr uint8_t CANDIDATES=5;
+  if(!configured || snapshot.active || !cellCount || request.revision!=configRevision+1 ||
+     request.durationMs<2000 || request.durationMs>30000 || !request.maxSamples) return false;
+  const uint32_t previousRevision=configRevision;const bool previousBaselineReady=baselineReady;
+  memcpy(staging,cells,(size_t)cellCount*sizeof(CellRuntime));
+  const size_t total=(size_t)cellCount*CANDIDATES;
+  CellRuntime *trials=(CellRuntime *)ps_malloc(total*sizeof(CellRuntime));
+  struct Stats { uint32_t sum=0;uint16_t maximum=0,samples=0; };
+  Stats *stats=(Stats *)ps_malloc(total*sizeof(Stats));
+  const size_t frameBytes=(size_t)frameWidth*frameHeight;
+  uint8_t *meanPixels=(uint8_t *)ps_malloc(frameBytes);
+  if(!trials || !stats || !meanPixels) { free(trials);free(stats);free(meanPixels);return false; }
+  memset(stats,0,total*sizeof(Stats));
+  for(uint16_t i=0;i<cellCount;++i) for(uint8_t candidate=0;candidate<CANDIDATES;++candidate) {
+    CellRuntime &trial=trials[(size_t)i*CANDIDATES+candidate];trial=CellRuntime();trial.config=cells[i].config;
+    const uint8_t maximum=cells[i].config.radius;
+    trial.config.radius=(uint8_t)(3+((uint16_t)(maximum-3)*candidate+(CANDIDATES-1)/2)/(CANDIDATES-1));
+  }
+  const uint32_t started=millis();uint8_t baselineFrames=0;
+  while(baselineFrames<3 && millis()-started<request.durationMs) {
+    if(!captureFrame()) continue;
+    if(!baselineFrames) memcpy(meanPixels,framePixels,frameBytes);
+    else for(size_t p=0;p<frameBytes;++p)
+      meanPixels[p]=(uint8_t)(((uint16_t)meanPixels[p]*baselineFrames+framePixels[p]+baselineFrames/2)/(baselineFrames+1));
+    ++baselineFrames;baselineHeartbeat();
+  }
+  if(baselineFrames<3) { free(trials);free(stats);free(meanPixels);return false; }
+  uint8_t *livePixels=framePixels;framePixels=meanPixels;
+  detector.bind(framePixels,frameWidth,frameHeight,trials,(uint16_t)min(total,(size_t)65535),groups,0,nullptr);
+  for(size_t n=0;n<total;++n) { detector.calibrateCell(trials[n]);if((n&15)==15) baselineHeartbeat(); }
+  framePixels=livePixels;detector.bind(framePixels,frameWidth,frameHeight,trials,(uint16_t)min(total,(size_t)65535),groups,0,nullptr);
+  uint32_t nextSample=millis();uint8_t sampleCount=0;
+  const uint32_t interval=max((uint32_t)1,request.durationMs/request.maxSamples);
+  while(millis()-started<request.durationMs) {
+    baselineHeartbeat();
+    if((int32_t)(millis()-nextSample)<0) { delay(1);continue; }
+    nextSample+=interval;
+    if(!captureFrame()) continue;
+    for(size_t n=0;n<total;++n) {
+      Feature live={};uint16_t buckets[SPATIAL_BUCKETS]={};
+      const uint16_t score=detector.inspectCell(trials[n],live,buckets);
+      stats[n].sum+=score;stats[n].maximum=max(stats[n].maximum,score);++stats[n].samples;
+      if((n&15)==15) baselineHeartbeat();
+    }
+    ++sampleCount;
+  }
+  for(uint16_t i=0;i<cellCount;++i) {
+    // Prefer the smallest candidate only when the short calibration window
+    // shows a genuinely quiet empty scene. If none qualifies, retain the
+    // user's maximum radius rather than selecting a noisy smaller crop.
+    uint8_t chosen=CANDIDATES-1;
+    for(uint8_t candidate=0;candidate<CANDIDATES;++candidate) {
+      const size_t n=(size_t)i*CANDIDATES+candidate;
+      if(trials[n].reference.edges>=100 && stats[n].samples>=3 && stats[n].maximum<=150) { chosen=candidate;break; }
+    }
+    const size_t n=(size_t)i*CANDIDATES+chosen;
+    cells[i]=trials[n];
+    // Ten seconds cannot represent every later daylight condition. Preserve
+    // the user's existing threshold and add a deliberately conservative
+    // margin above the worst empty score observed during calibration.
+    uint16_t threshold=(uint16_t)constrain((int)stats[n].maximum*2+100,400,800);
+    threshold=max(threshold,staging[i].config.thresholdPermille);
+    threshold=(uint16_t)(((threshold+9)/10)*10);cells[i].config.thresholdPermille=threshold;
+    cells[i].state=CLEAR;cells[i].scorePermille=0;
+  }
+  configRevision=request.revision;baselineReady=saveBaseline();
+  if(baselineReady) {
+    for(uint16_t g=0;g<groupCount;++g) groups[g].state=CLEAR;
+    for(uint16_t i=0;i<cellCount;++i) {
+      const size_t base=(size_t)i*CANDIDATES;uint8_t chosen=0;
+      for(;chosen<CANDIDATES;++chosen) if(trials[base+chosen].config.radius==cells[i].config.radius) break;
+      const Stats &s=stats[base+min(chosen,(uint8_t)(CANDIDATES-1))];
+      CalibrationResultPayload result={configRevision,cells[i].config.id,i,cellCount,
+        cells[i].config.thresholdPermille,s.maximum,cells[i].reference.edges,s.samples,
+        cells[i].config.radius,(uint8_t)(s.samples>=40?2:s.samples>=15?1:0)};
+      for(uint8_t attempt=0;attempt<3;++attempt) { transmit(bridgeMac,CALIBRATION_RESULT,nextSeq++,&result,sizeof(result));delay(5); }
+    }
+    queueAllStates();sendHello();lastHello=millis();
+  } else {
+    memcpy(cells,staging,(size_t)cellCount*sizeof(CellRuntime));
+    configRevision=previousRevision;baselineReady=previousBaselineReady;
+  }
+  free(trials);free(stats);free(meanPixels);
+  detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+  DEBUGF("auto calibration revision=%lu cells=%u samples=%u duration_ms=%lu result=%u\n",
+    (unsigned long)configRevision,cellCount,sampleCount,(unsigned long)(millis()-started),baselineReady);
+  return baselineReady;
 }
 
 bool validSettings(const CameraSettings &s) {
@@ -443,7 +566,7 @@ bool saveBaseline() {
   const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
   // Runtime features contain the calibration. The full grayscale frame is not
   // needed after reboot and made SVGA baselines require two 480 KB flash files.
-  BaselineHeader h={0x52424C31,configRevision,0,
+  BaselineHeader h={0x52424C37,configRevision,0,
     crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
   if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
   File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
@@ -464,7 +587,7 @@ void loadBaseline() {
     LittleFS.rename("/baseline.bak","/baseline.bin");
   File f=LittleFS.open("/baseline.bin","r");if(!f) return;
   BaselineHeader h={};
-  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C31 ||
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C37 ||
      h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
   const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
   if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||
@@ -690,6 +813,30 @@ void handleRadio(const Received &message) {
       sendAck(message.mac,p.seq,p.type,ready?ACK_OK:ACK_BUSY);
       if(ready) startSnapshot(p.seq);
     }
+  } else if(p.type==ANALYSIS_REQUEST) {
+    uint32_t id=0;if(p.length==sizeof(id)) memcpy(&id,p.payload,sizeof(id));
+    int index=-1;for(uint16_t i=0;i<cellCount;++i) if(cells[i].config.id==id) { index=i;break; }
+    if(p.length!=sizeof(id) || index<0 || !baselineReady || !framePixels) return;
+    Feature live={};uint16_t liveBuckets[SPATIAL_BUCKETS]={};
+    detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+    const uint16_t score=detector.inspectCell(cells[index],live,liveBuckets);
+    AnalysisPayload value={};
+    value.id=id;value.revision=configRevision;value.frame=frameNumber;
+    value.scorePermille=score;value.thresholdPermille=cells[index].config.thresholdPermille;
+    value.referenceEdges=cells[index].reference.edges;value.liveEdges=live.edges;
+    value.peakCount=cells[index].reference.peakCount;
+    for(uint8_t peak=0;peak<value.peakCount;++peak)
+      value.lineAngleTenths[peak]=(uint16_t)lroundf(fmodf(cells[index].reference.peakAngle[peak]+90.0f,180.0f)*10.0f);
+    memcpy(value.referenceBuckets,cells[index].referenceBuckets,sizeof(value.referenceBuckets));
+    memcpy(value.liveBuckets,liveBuckets,sizeof(value.liveBuckets));
+    transmit(bridgeMac,CELL_ANALYSIS,p.seq,&value,sizeof(value));
+  } else if(p.type==CALIBRATE_REQUEST) {
+    CalibrationRequestPayload value={};
+    if(p.length!=sizeof(value)) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
+    memcpy(&value,p.payload,sizeof(value));
+    if(!configured || snapshot.active || value.revision!=configRevision+1) { sendAck(message.mac,p.seq,p.type,ACK_BAD_ORDER);return; }
+    sendAck(message.mac,p.seq,p.type,ACK_OK);
+    autoCalibrate(value);
   }
 }
 

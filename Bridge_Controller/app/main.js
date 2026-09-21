@@ -67,6 +67,12 @@ function handleLine(line) {
       else if (kind === 'SNAP_END' && snapshot) { clearFrameRequest();if (parts[3] === 'timeout') { snapshot = null; send('bridge:error', 'Frame transfer stalled or the camera went offline. Wait for it to reconnect, then try again.'); } else { const frame = snapshot.finish(parts); snapshot = null; try { saveFrame(frameDirectory(), frame); } catch (error) { send('bridge:error', `Could not keep this frame for next time: ${error.message}`); } send('bridge:frame', frame); send('bridge:notice', `Frame received from ${mac}`); } }
       else if (kind === 'STATE') { const entry = { mac, id: +parts[3], value: parts[4], score: +parts[5], frame: +parts[6], at: Date.now() }; states.set(`${mac}:${parts[3]}`, entry); send('bridge:state-event', entry); }
       else if (kind === 'CELL_STATE') { const entry = { mac, id: +parts[3], value: parts[4], score: +parts[5], frame: +parts[6], at: Date.now() }; cellStates.set(`${mac}:${parts[3]}`, entry); send('bridge:cell-state-event', entry); }
+      else if (kind === 'CELL_ANALYSIS') {
+        const numbers=value=>value.split(',').map(Number);
+        const entry={mac,id:+parts[3],frame:+parts[4],score:+parts[5],threshold:+parts[6],referenceEdges:+parts[7],liveEdges:+parts[8],peakCount:+parts[9],angles:numbers(parts[10]),reference:numbers(parts[11]),live:numbers(parts[12]),at:Date.now()};
+        if(entry.angles.length!==10||entry.reference.length!==31||entry.live.length!==31||entry.peakCount<0||entry.peakCount>10||[entry.id,entry.frame,entry.score,entry.threshold,entry.referenceEdges,entry.liveEdges,...entry.angles,...entry.reference,...entry.live].some(value=>!Number.isFinite(value)))throw Error('Invalid cell analysis from bridge');
+        send('bridge:cell-analysis',entry);
+      }
       else if (kind === 'DISCOVER') { send('bridge:notice', `Camera ${mac} discovered`); refresh().catch(report); }
       else if (kind === 'CONFIG_APPLIED') { send('bridge:notice', `Camera ${mac} applied revision ${parts[3]}`); refresh().catch(report); }
       else if (kind === 'CONFIG_ERROR' && parts[3] === '5') {
@@ -187,6 +193,8 @@ app.whenReady().then(() => {
   ipcMain.handle('frame', async (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); expectFrame(mac);try { return await run(`FRAME ${mac}`); } catch (error) { clearFrameRequest();throw error; } });
   ipcMain.handle('cached-frame', (_, mac) => loadFrame(frameDirectory(), mac).catch(() => null));
   ipcMain.handle('baseline', (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); return run(`BASELINE ${mac}`); });
+  ipcMain.handle('calibrate', (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); return run(`CALIBRATE ${mac}`); });
+  ipcMain.handle('analysis', (_, mac, id) => { if (!MAC.test(mac) || !Number.isInteger(id) || id < 1) throw Error('Invalid sensor'); return run(`ANALYSIS ${mac} ${id}`); });
   ipcMain.handle('save', async (_, mac, config) => {
     if (!MAC.test(mac) || !configs.has(mac)) throw Error('Unknown camera');
     const otherIds = [...configs].filter(([id]) => id !== mac).flatMap(([, c]) => c.cells.map(cell => cell.group || cell.id));

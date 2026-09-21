@@ -1,32 +1,45 @@
-# Railway Bridge Controller — static web comparison build
+# Railway Bridge Controller — web application
 
-This is a browser-hosted comparison version of the Electron UI in `Bridge_Controller/app`.
+This is the browser-hosted counterpart of the Electron application in `Bridge_Controller/app`. It deliberately shares the same HTML structure, styling, setup workflow and renderer logic so changes can be evaluated without maintaining two different user experiences.
+
+> [!WARNING]
+> This project is under active development and is not ready for download or operational use.
 
 ## Run
 
-Serve this directory over HTTPS (GitHub Pages is suitable), then open it in desktop Chrome or Edge.
+Serve this directory over HTTPS and open it in desktop Chrome or Edge. GitHub Pages is suitable. For local development, `localhost` is treated as a secure context by supported browsers.
 
-1. Click **Choose USB device** and approve the ESP32 serial device.
-2. Click **Connect bridge**.
-3. Web Serial opens it at 115200 baud and uses the same line protocol as the Electron app.
+1. Click **Scan USB ports** or **Choose USB device** and approve the ESP32 bridge.
+2. Select the approved device and click **Connect bridge**.
+3. The browser opens Web Serial at 115200 baud and uses the same bridge line protocol as Electron.
 
-Opening `index.html` directly with `file://` is not recommended; Web Serial requires a secure context (HTTPS, or localhost during development).
+Opening `index.html` directly with `file://` is not supported because Web Serial requires a secure context.
 
-## Implemented for comparison
+## Electron-parity features
 
-- Same dark UI structure and three workspaces: Camera setup, Live monitor, Network.
-- Web Serial permission chooser and 115200-baud bridge connection.
-- `LIST`, `GET`, `STATES`, `STATUS`, `LOG`, `FRAME`, `BASELINE`, `BEGIN/CELL/COMMIT/TOPIC`, Wi-Fi and MQTT bridge commands.
-- Camera discovery/state events and basic sensor editing on the image.
-- Snapshot CRC checking and browser decompression for compressed frames when `DecompressionStream('deflate-raw')` is supported.
-- Cached frames and local display names stored in browser localStorage.
+- Camera discovery, configuration revision handling and health display.
+- Lossless frame transfer with CRC validation and compressed-frame decompression.
+- Cached camera frames and local output display names.
+- Sensor creation, movement, deletion, block painting and block extension.
+- Live per-sensor overlays and combined block output monitoring.
+- Camera settings, per-sensor persistence settings and mismatch thresholds.
+- Fetched-frame texture preview using the same Scharr and direction-family rules as the camera.
+- On-demand camera baseline comparison with direction/position buckets.
+- Ten-second fixed-centre automatic radius and threshold calibration.
+- Bridge Wi-Fi and MQTT configuration.
+- Diagnostics, USB MQTT events and local state history.
+- Direct MQTT state monitoring when the broker exposes MQTT over WebSockets.
 
-## Intentional difference / unfinished item
+## Browser-specific differences
 
-The direct MQTT viewer is left as a UI-compatible placeholder in this comparison build. A browser cannot use MQTT TCP on port 1883; the broker needs an MQTT-over-WebSocket listener (`ws://` or preferably `wss://`). The bridge itself continues using its existing MQTT TCP connection unchanged.
+Web Serial is available only in browsers that implement it, currently desktop Chromium-family browsers. Device permission is controlled by the browser and may need to be granted again.
 
-For production, viewer passwords should normally be session-only rather than persisted in localStorage. This comparison build stores the entered viewer settings only to demonstrate the flow; do not use sensitive credentials there.
+Browsers cannot connect to ordinary MQTT TCP port 1883. The direct monitor therefore requires an MQTT-over-WebSocket listener, commonly on port 9001, using `ws://` locally or `wss://` from an HTTPS page. The bridge itself continues using ordinary MQTT TCP and is unaffected.
+
+The web application loads the pinned MQTT.js browser bundle from jsDelivr. Without internet access, USB setup and monitoring still work, but the direct MQTT viewer cannot start unless that dependency is hosted locally.
+
+Viewer settings are stored in browser `localStorage`, including any entered password. Use non-sensitive development credentials until secure credential handling is implemented.
 
 ## GitHub Pages
 
-The directory has no build step and can be copied to a `docs/` directory or a Pages branch. All application code is static HTML/CSS/JavaScript.
+The directory has no build step. Publish `Web_App` as the Pages source or copy its static contents to the configured Pages directory. The application must remain on HTTPS for Web Serial and secure MQTT WebSockets.

@@ -126,4 +126,27 @@ canvas{max-height:100%}
 #viewer-history{max-height:260px}
 #monitor-cameras{padding:16px}
 .cell-analysis{display:grid;grid-template-columns:132px 1fr;gap:13px;align-items:start;margin-bottom:9px}.cell-analysis canvas{display:block;width:132px;height:132px;max-width:none;max-height:none;background:#08131d;border:1px solid #365066;border-radius:7px;image-rendering:pixelated}.cell-analysis strong,.cell-analysis span{display:block}.cell-analysis strong{font-size:12px}.cell-analysis span{margin-top:4px;color:#8da2b6;font-size:10px;line-height:1.4}.cell-angle-list{display:flex;flex-wrap:wrap;gap:5px;margin-top:8px}.cell-angle-list i{display:inline-flex;align-items:center;gap:4px;padding:3px 5px;border-radius:5px;background:#1c3040;color:#cfe2ec;font-size:9px;font-style:normal}.cell-angle-list b{width:7px;height:7px;border-radius:50%;display:inline-block}
+.baseline-comparison{margin:9px 0;padding:9px;border:1px solid #29485a;border-radius:8px;background:#10202e}.comparison-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.comparison-head strong{font-size:10px}.comparison-head button{padding:5px 8px}.comparison-summary{margin:7px 0;color:#a9c0ce;font-size:10px}.comparison-row{display:grid;grid-template-columns:minmax(62px,1fr) 42px 42px 42px;gap:5px;align-items:center;padding:3px 0;border-top:1px solid #243b4b;font-size:9px}.comparison-row span:not(:first-child){text-align:right}.comparison-row.header{color:#718b9e;font-weight:700}
 @media(max-width:1200px){.monitor-settings form{grid-template-columns:repeat(3,minmax(0,1fr))}}
+
+/* Four-track setup workspace: the camera spans two tracks and each inspector
+   column occupies one. Lists and long details scroll inside their own cards. */
+@media(min-width:1300px){
+  .setup-grid{grid-template-columns:minmax(0,3fr) minmax(500px,2fr)}
+  .inspector{display:grid;grid-template-columns:minmax(205px,.82fr) minmax(275px,1.18fr);grid-template-rows:auto minmax(0,1fr) auto;gap:8px}
+  .tools-card{grid-column:1;grid-row:1}
+  .sensor-panel{grid-column:1;grid-row:2}
+  .camera-settings{grid-column:1;grid-row:3;max-height:240px}
+  .selection-card{grid-column:2;grid-row:1 / 4;max-height:none;min-height:0}
+}
+.selection-card{display:flex;flex-direction:column;overflow:hidden}
+.selection-card #selection-fields{flex:1;min-height:0;overflow-y:auto;padding-right:3px;overscroll-behavior:contain}
+.selection-card .cell-analysis{grid-template-columns:96px minmax(0,1fr);gap:9px;margin-bottom:6px}
+.selection-card .cell-analysis canvas{width:96px;height:96px}
+.selection-card .cell-angle-list{gap:3px;margin-top:5px}
+.selection-card .cell-angle-list i{padding:2px 4px}
+.selection-actions{flex:none;margin:6px -3px -1px;padding:7px 3px 1px;border-top:1px solid #294052;background:#132231}
+.selection-actions[hidden]{display:none}
+@media(max-width:1299px){
+  .selection-card{max-height:48%}
+}
