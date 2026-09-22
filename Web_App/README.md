@@ -35,7 +35,7 @@ Opening `index.html` directly with `file://` is not supported because Web Serial
 
 Web Serial is available only in browsers that implement it, currently desktop Chromium-family browsers. Device permission is controlled by the browser and may need to be granted again.
 
-Browsers cannot connect to ordinary MQTT TCP port 1883. The direct monitor therefore requires an MQTT-over-WebSocket listener, commonly on port 9001, using `ws://` locally or `wss://` from an HTTPS page. The bridge itself continues using ordinary MQTT TCP and is unaffected.
+Browsers cannot connect to ordinary MQTT TCP port 1883. The direct monitor therefore requires an MQTT-over-WebSocket listener, commonly on port 9001, using `ws://` locally or `wss://` from an HTTPS page. The GitHub Pages app cannot connect to an insecure `ws://` listener and the certificate on `wss://` must be trusted by the browser. Enter a full URL such as `wss://broker.example/mqtt` when the endpoint needs a particular path. A local broker exposing only `ws://` can instead be used from a copy of the app served at `http://localhost`. The bridge itself continues using ordinary MQTT TCP and is unaffected.
 
 The web application loads the pinned MQTT.js browser bundle from jsDelivr. Without internet access, USB setup and monitoring still work, but the direct MQTT viewer cannot start unless that dependency is hosted locally.
 

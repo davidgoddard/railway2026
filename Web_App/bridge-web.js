@@ -61,13 +61,13 @@
     if(!window.mqtt?.connect)throw Error('The browser MQTT library could not be loaded. Check the internet connection and reload.');
     const clean={host:String(settings.host||'').trim(),port:+settings.port,root:String(settings.root||'').replace(/^\/+|\/+$/g,''),user:String(settings.user||''),password:String(settings.password||'')};
     if(!clean.host||!clean.root||!Number.isInteger(clean.port)||clean.port<1||clean.port>65535)throw Error('Enter a valid WebSocket broker host, port and topic root');
-    localStorage.setItem('mqttViewer',JSON.stringify(clean));stopMonitor();emit('monitor:status',{status:'connecting',detail:'Connecting with MQTT over WebSockets…',settings:clean});
-    const scheme=location.protocol==='https:'?'wss':'ws',url=/^wss?:\/\//i.test(clean.host)?clean.host:`${scheme}://${clean.host}:${clean.port}`;
+    if(location.protocol==='https:'&&/^ws:\/\//i.test(clean.host))throw Error('This HTTPS page cannot open an insecure ws:// connection. Configure a trusted wss:// broker endpoint, or run the web app locally over http://localhost.');
+    localStorage.setItem('mqttViewer',JSON.stringify(clean));stopMonitor();const scheme=location.protocol==='https:'?'wss':'ws',url=/^wss?:\/\//i.test(clean.host)?clean.host:`${scheme}://${clean.host}:${clean.port}`;let lastError='';emit('monitor:status',{status:'connecting',detail:`Connecting to ${url}…`,settings:clean});
     monitorClient=window.mqtt.connect(url,{username:clean.user||undefined,password:clean.password||undefined,reconnectPeriod:3000,connectTimeout:10000,clientId:`railway_web_${Math.random().toString(16).slice(2)}`});
-    monitorClient.on('connect',()=>{monitorClient.subscribe(`${clean.root}/areas/+/state`,{qos:0});monitorClient.subscribe(`${clean.root}/controller/health`,{qos:0});emit('monitor:status',{status:'connected',detail:`Subscribed through ${url}`,settings:clean,bridgeOnline:null});});
-    monitorClient.on('reconnect',()=>emit('monitor:status',{status:'connecting',detail:'Reconnecting to MQTT WebSocket…',settings:clean}));
-    monitorClient.on('error',error=>emit('monitor:status',{status:'error',detail:error.message,settings:clean}));
-    monitorClient.on('close',()=>emit('monitor:status',{status:'disconnected',detail:'MQTT WebSocket disconnected.',settings:clean}));
+    monitorClient.on('connect',()=>{lastError='';monitorClient.subscribe(`${clean.root}/areas/+/state`,{qos:0});monitorClient.subscribe(`${clean.root}/controller/health`,{qos:0});emit('monitor:status',{status:'connected',detail:`Subscribed through ${url}`,settings:clean,bridgeOnline:null});});
+    monitorClient.on('reconnect',()=>emit('monitor:status',{status:'connecting',detail:`Retrying ${url}${lastError?` · last error: ${lastError}`:''}`,settings:clean}));
+    monitorClient.on('error',error=>{lastError=error.message||String(error);emit('monitor:status',{status:'error',detail:`${url} · ${lastError}`,settings:clean});});
+    monitorClient.on('close',()=>emit('monitor:status',{status:lastError?'error':'disconnected',detail:lastError?`Could not connect to ${url}: ${lastError}. Check that this is an MQTT WebSocket listener with a browser-trusted TLS certificate.`:`MQTT WebSocket ${url} disconnected.`,settings:clean}));
     monitorClient.on('message',(topic,payload,packet)=>{const value=payload.toString();if(topic===`${clean.root}/controller/health`){emit('monitor:status',{status:'connected',detail:`Subscribed through ${url}`,settings:clean,bridgeOnline:value!=='offline'});return;}const prefix=`${clean.root}/areas/`;if(!topic.startsWith(prefix)||!topic.endsWith('/state'))return;const name=topic.slice(prefix.length,-6);if(!value){emit('monitor:removed',{topic,name});return;}if(!['clear','occupied','unknown'].includes(value))return;emit('monitor:message',{topic,name,value,retained:!!packet.retain,at:Date.now()});});
     return true;
   }
