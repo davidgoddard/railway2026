@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.9"
+#define BRIDGE_VERSION "0.1.13"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -20,7 +20,7 @@ const uint8_t BROADCAST[6]={255,255,255,255,255,255};
 enum Type:uint8_t { HELLO=1,CONFIG_BEGIN=2,CONFIG_CELL=3,CONFIG_COMMIT=4,
   CAPTURE_BASELINE=5,SNAPSHOT_REQUEST=6,ACK=7,STATE=8,HEALTH=9,
   SNAPSHOT_BEGIN=10,SNAPSHOT_CHUNK=11,SNAPSHOT_END=12,SNAPSHOT_ACK=13,DIAGNOSTIC=14,DIAGNOSTIC_ACK=15,HEALTH_ACK=16,
-  ANALYSIS_REQUEST=17,CELL_ANALYSIS=18,CALIBRATE_REQUEST=19,CALIBRATION_RESULT=20,CALIBRATION_ACK=21 };
+  ANALYSIS_REQUEST=17,CELL_ANALYSIS=18,CALIBRATE_REQUEST=19,CALIBRATION_RESULT=20,CALIBRATION_ACK=21,STATE_BITMAP=22,SCORE_BATCH=23 };
 enum CellState:uint8_t { UNKNOWN=0,CLEAR=1,OCCUPIED=2 };
 struct __attribute__((packed)) Packet { uint16_t magic; uint8_t version,type; uint32_t seq; uint16_t length; uint8_t payload[PAYLOAD]; };
 struct __attribute__((packed)) CameraSettings { uint8_t resolution; int8_t brightness,contrast,saturation; uint8_t vflip,hmirror; };
@@ -30,10 +30,22 @@ struct __attribute__((packed)) CellMessage { uint16_t index; Cell cell; };
 struct __attribute__((packed)) HelloMessage { uint8_t mac[6]; uint32_t revision; uint16_t width,height,count; uint8_t channel,baseline; };
 struct __attribute__((packed)) AckMessage { uint8_t type,status; uint16_t detail; };
 struct __attribute__((packed)) StateMessage { uint32_t id,revision,frame; uint16_t score; uint8_t state,grouped; };
+struct __attribute__((packed)) StateRecord { uint32_t id;uint16_t score;uint8_t state,grouped; };
+constexpr uint16_t STATE_BITMAP_BYTES=(MAX_CELLS*2+7)/8;
+struct __attribute__((packed)) StateBitmapMessage {
+  uint32_t revision,frame;uint16_t count;uint8_t encoding;uint8_t states[STATE_BITMAP_BYTES];
+};
+struct __attribute__((packed)) ScoreRecord { uint16_t index,score; };
+constexpr uint8_t MAX_BATCHED_SCORES=(PAYLOAD-9)/sizeof(ScoreRecord);
+struct __attribute__((packed)) ScoreBatchMessage {
+  uint32_t revision,frame;uint8_t count;ScoreRecord records[MAX_BATCHED_SCORES];
+};
+static_assert(sizeof(StateBitmapMessage)<=PAYLOAD && sizeof(ScoreBatchMessage)<=PAYLOAD,"State payload exceeds ESP-NOW payload");
 struct __attribute__((packed)) AnalysisMessage {
   uint32_t id,revision,frame;uint16_t score,threshold,referenceEdges,liveEdges;uint8_t peakCount;
-  uint16_t angles[10],referenceBuckets[31],liveBuckets[31];
+  uint16_t angles[12],referenceBuckets[37],liveBuckets[37];
 };
+static_assert(sizeof(AnalysisMessage)<=PAYLOAD,"Analysis payload exceeds ESP-NOW payload");
 struct __attribute__((packed)) CalibrationRequest { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples; };
 struct __attribute__((packed)) CalibrationResult {
   uint32_t revision,id;uint16_t index,count,threshold,clearMaximum,referenceEdges,samples;
@@ -93,6 +105,7 @@ bool wifiPending=false,mqttPending=false,lastWifiConnected=false,lastMqttConnect
 uint32_t wifiPendingAt=0,mqttPendingAt=0;
 uint16_t brokerPort=1883;
 uint32_t sequence=1,lastMqttAttempt=0,lastWifiAttempt=0;
+uint32_t lastUsbCommandAt=0;
 constexpr uint32_t MQTT_RETRY_MS=30000;
 constexpr uint32_t MQTT_EARLY_RETRY_MS=10000;
 uint8_t mqttStartupFailures=0;
@@ -165,6 +178,7 @@ Packet makePacket(uint8_t type,uint32_t seq,const void *data,size_t length) {
 void broadcastBeacon() {
   uint8_t mac[6]={};esp_wifi_get_mac(WIFI_IF_STA,mac);
   HelloMessage beacon={};memcpy(beacon.mac,mac,6);beacon.channel=radioChannel;
+  beacon.baseline=lastUsbCommandAt && millis()-lastUsbCommandAt<15000;
   Packet p=makePacket(HELLO,sequence++,&beacon,sizeof(beacon));
   if(!sendPacket(BROADCAST,p) && millis()-lastBeaconFailureLog>=5000) {
     lastBeaconFailureLog=millis();
@@ -372,6 +386,23 @@ void handleSnapshot(Camera &c,const Packet &p) {
     recordDiagnostic("FRAME_END",mac,detail);
   }
 }
+void applyState(Camera &c,const StateRecord &s,uint32_t revision,uint32_t frame) {
+  const int index=c.cells && !s.grouped?cellIndex(c,s.id):-1;
+  if(!c.cells || !c.baseline || revision!=c.revision || s.state>OCCUPIED ||
+     (s.grouped?!isReported(c,s.id):index<0)) return;
+  char mac[18];macText(c.mac,mac);
+  if(!s.grouped) {
+    if(c.cellStates) c.cellStates[index]=s.state;
+    Serial.printf("EVENT CELL_STATE %s %lu %s %u %lu\n",mac,(unsigned long)s.id,
+      stateName(s.state),s.score,(unsigned long)frame);
+    if(c.cells[index].group) return;
+  }
+  if(c.states) for(uint16_t i=0;i<c.count;++i)
+    if((c.cells[i].group?c.cells[i].group:c.cells[i].id)==s.id) c.states[i]=s.state;
+  Serial.printf("EVENT STATE %s %lu %s %u %lu\n",mac,(unsigned long)s.id,
+    stateName(s.state),s.score,(unsigned long)frame);
+  publish(areaSuffix(s.id),stateName(s.state));
+}
 void handleRadio(const Received &r) {
   const Packet &p=r.packet;Camera *c=findCamera(r.mac);
   if(p.type==HELLO && p.length==sizeof(HelloMessage)) {
@@ -391,9 +422,10 @@ void handleRadio(const Received &r) {
     if(c->baseline && !h.baseline && c->cells) allUnknown(*c);
     c->seen=true;c->lastSeen=millis();c->remoteRevision=h.revision;c->baseline=h.baseline;
     addPeer(c->mac);
-    // A scanning camera may only stay on this channel briefly. Answer its
-    // first HELLO while it is still listening here.
-    if(!wasSeen) broadcastBeacon();
+    // A scanning camera may only stay on this channel briefly. Always answer
+    // its HELLO while it is still listening: the bridge can still consider a
+    // restarted or de-associated camera online until the 15-second timeout.
+    broadcastBeacon();
     if(c->cells && !c->phase && h.revision!=c->revision) startUpload(*c);
     return;
   }
@@ -435,22 +467,56 @@ void handleRadio(const Received &r) {
     nextUpload(*c);
   } else if(p.type==STATE && p.length==sizeof(StateMessage)) {
     StateMessage s;memcpy(&s,p.payload,sizeof(s));
-    const int index=c->cells && !s.grouped?cellIndex(*c,s.id):-1;
-    if(!c->cells || !c->baseline || s.revision!=c->revision || s.state>OCCUPIED ||
-      (s.grouped?!isReported(*c,s.id):index<0) ||
-      (c->lastStateSeq && (int32_t)(p.seq-c->lastStateSeq)<=0)) return;
+    if(c->lastStateSeq && (int32_t)(p.seq-c->lastStateSeq)<=0) return;
+    c->lastStateSeq=p.seq;
+    const StateRecord record={s.id,s.score,s.state,s.grouped};
+    applyState(*c,record,s.revision,s.frame);
+  } else if(p.type==STATE_BITMAP && p.length>=offsetof(StateBitmapMessage,states) && p.length<=sizeof(StateBitmapMessage)) {
+    StateBitmapMessage bitmap={};memcpy(&bitmap,p.payload,p.length);
+    const size_t expected=offsetof(StateBitmapMessage,states)+(bitmap.count*2+7)/8;
+    if(bitmap.encoding!=1 || bitmap.count!=c->count || bitmap.revision!=c->revision ||
+       p.length!=expected || !c->cells || !c->baseline ||
+       (c->lastStateSeq && (int32_t)(p.seq-c->lastStateSeq)<=0)) return;
+    for(uint16_t i=0;i<bitmap.count;++i) if(((bitmap.states[i/4]>>((i%4)*2))&3)>OCCUPIED) return;
     c->lastStateSeq=p.seq;
     char mac[18];macText(c->mac,mac);
-    if(!s.grouped) {
-      if(c->cellStates) c->cellStates[index]=s.state;
-      Serial.printf("EVENT CELL_STATE %s %lu %s %u %lu\n",mac,(unsigned long)s.id,
-        stateName(s.state),s.score,(unsigned long)s.frame);
-      if(c->cells[index].group) return; // Grouped members are visual diagnostics, not MQTT outputs.
+    for(uint16_t i=0;i<c->count;++i) {
+      const uint8_t next=(bitmap.states[i/4]>>((i%4)*2))&3;
+      if(c->cellStates[i]!=next) {
+        c->cellStates[i]=next;
+        Serial.printf("EVENT CELL_STATE %s %lu %s 0 %lu\n",mac,(unsigned long)c->cells[i].id,
+          stateName(next),(unsigned long)bitmap.frame);
+      }
     }
-    if(c->states) for(uint16_t i=0;i<c->count;++i)
-      if((c->cells[i].group?c->cells[i].group:c->cells[i].id)==s.id) c->states[i]=s.state;
-    Serial.printf("EVENT STATE %s %lu %s %u %lu\n",mac,(unsigned long)s.id,stateName(s.state),s.score,(unsigned long)s.frame);
-    publish(areaSuffix(s.id),stateName(s.state));
+    for(uint16_t i=0;i<c->count;++i) {
+      const uint32_t id=c->cells[i].group?c->cells[i].group:c->cells[i].id;
+      bool first=true;for(uint16_t j=0;j<i;++j) if((c->cells[j].group?c->cells[j].group:c->cells[j].id)==id) first=false;
+      if(!first) continue;
+      uint8_t next=CLEAR;
+      for(uint16_t j=0;j<c->count;++j) if((c->cells[j].group?c->cells[j].group:c->cells[j].id)==id) {
+        if(c->cellStates[j]==OCCUPIED) { next=OCCUPIED;break; }
+        if(c->cellStates[j]==UNKNOWN) next=UNKNOWN;
+      }
+      const uint8_t old=c->states[i];
+      for(uint16_t j=0;j<c->count;++j) if((c->cells[j].group?c->cells[j].group:c->cells[j].id)==id) c->states[j]=next;
+      if(old!=next) {
+        Serial.printf("EVENT STATE %s %lu %s 0 %lu\n",mac,(unsigned long)id,stateName(next),(unsigned long)bitmap.frame);
+        publish(areaSuffix(id),stateName(next));
+      }
+    }
+  } else if(p.type==SCORE_BATCH && p.length>=offsetof(ScoreBatchMessage,records) && p.length<=sizeof(ScoreBatchMessage)) {
+    ScoreBatchMessage batch={};memcpy(&batch,p.payload,p.length);
+    const size_t expected=offsetof(ScoreBatchMessage,records)+(size_t)batch.count*sizeof(ScoreRecord);
+    if(!batch.count || batch.count>MAX_BATCHED_SCORES || p.length!=expected ||
+       batch.revision!=c->revision || !c->cells || !c->baseline) return;
+    char mac[18];macText(c->mac,mac);
+    for(uint8_t i=0;i<batch.count;++i) if(batch.records[i].index<c->count) {
+      const uint16_t index=batch.records[i].index;const Cell &cell=c->cells[index];
+      Serial.printf("EVENT CELL_STATE %s %lu %s %u %lu\n",mac,(unsigned long)cell.id,
+        stateName(c->cellStates[index]),batch.records[i].score,(unsigned long)batch.frame);
+      if(!cell.group) Serial.printf("EVENT STATE %s %lu %s %u %lu\n",mac,(unsigned long)cell.id,
+        stateName(c->cellStates[index]),batch.records[i].score,(unsigned long)batch.frame);
+    }
   } else if(p.type==HEALTH && p.length==sizeof(HealthMessage)) {
     HealthMessage h;memcpy(&h,p.payload,sizeof(h));
     Packet reply=makePacket(HEALTH_ACK,p.seq,nullptr,0);sendPacket(c->mac,reply);
@@ -462,15 +528,15 @@ void handleRadio(const Received &r) {
     if(c->cells && h.revision!=c->revision && !c->phase) startUpload(*c);
   } else if(p.type==CELL_ANALYSIS && p.length==sizeof(AnalysisMessage)) {
     AnalysisMessage a;memcpy(&a,p.payload,sizeof(a));
-    if(!c->baseline || a.revision!=c->revision || a.peakCount>10 || cellIndex(*c,a.id)<0) return;
+    if(!c->baseline || a.revision!=c->revision || a.peakCount>12 || cellIndex(*c,a.id)<0) return;
     char mac[18];macText(c->mac,mac);
     Serial.printf("EVENT CELL_ANALYSIS %s %lu %lu %u %u %u %u %u ",mac,(unsigned long)a.id,
       (unsigned long)a.frame,a.score,a.threshold,a.referenceEdges,a.liveEdges,a.peakCount);
-    for(int i=0;i<10;++i) Serial.printf("%s%u",i?",":"",a.angles[i]);
+    for(int i=0;i<12;++i) Serial.printf("%s%u",i?",":"",a.angles[i]);
     Serial.print(' ');
-    for(int i=0;i<31;++i) Serial.printf("%s%u",i?",":"",a.referenceBuckets[i]);
+    for(int i=0;i<37;++i) Serial.printf("%s%u",i?",":"",a.referenceBuckets[i]);
     Serial.print(' ');
-    for(int i=0;i<31;++i) Serial.printf("%s%u",i?",":"",a.liveBuckets[i]);Serial.println();
+    for(int i=0;i<37;++i) Serial.printf("%s%u",i?",":"",a.liveBuckets[i]);Serial.println();
   } else if(p.type==CALIBRATION_RESULT && p.length==sizeof(CalibrationResult)) {
     CalibrationResult value;memcpy(&value,p.payload,sizeof(value));
     if(value.count!=c->count || value.index>=c->count || value.revision!=c->revision+1 ||
@@ -527,6 +593,7 @@ const char *mqttError(int status) {
 }
 void command(char *input) {
   char *saveptr=nullptr;char *cmd=strtok_r(input," \r\n",&saveptr);if(!cmd) return;
+  lastUsbCommandAt=millis();
   if(!strcmp(cmd,"LOG")) {
     Serial.printf("LOG_NOW %08lX %lu\n",(unsigned long)bridgeBootId,(unsigned long)millis());
     for(uint8_t i=0;i<diagnosticCount;++i) Serial.println(diagnosticLog[(diagnosticHead+i)%64]);

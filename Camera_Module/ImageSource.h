@@ -29,6 +29,34 @@ const Resolution RESOLUTIONS[]={
 
 class ImageSource {
  public:
+  bool applyControls(const CameraSettings &settings) {
+    if(!ready_) return false;
+    sensor_t *sensor=esp_camera_sensor_get();
+    if(!sensor) return false;
+    // Sensor drivers do not consistently report success for every cosmetic
+    // control in grayscale mode (notably saturation). The camera can still
+    // capture valid frames, so only absence of the sensor is fatal here.
+    sensor->set_brightness(sensor,settings.brightness);
+    sensor->set_contrast(sensor,settings.contrast);
+    sensor->set_saturation(sensor,settings.saturation);
+    sensor->set_vflip(sensor,settings.vflip);
+    sensor->set_hmirror(sensor,settings.hmirror);
+    return true;
+  }
+  bool reconfigure(const CameraSettings &settings,uint8_t *&framePixels,
+                   uint16_t &frameWidth,uint16_t &frameHeight) {
+    if(!ready_ || settings.resolution>XGA) return false;
+    const Resolution &next=RESOLUTIONS[settings.resolution];
+    if(frameWidth!=next.width || frameHeight!=next.height) {
+      uint8_t *nextPixels=(uint8_t *)ps_malloc((size_t)next.width*next.height);
+      sensor_t *sensor=esp_camera_sensor_get();
+      if(!nextPixels || !sensor) { free(nextPixels);return false; }
+      if(sensor->set_framesize(sensor,next.frameSize)!=0) { free(nextPixels);return false; }
+      free(framePixels);framePixels=nextPixels;frameWidth=next.width;frameHeight=next.height;
+      DEBUGF("camera changed to %ux%u grayscale\n",frameWidth,frameHeight);
+    }
+    return applyControls(settings);
+  }
   bool begin(const CameraSettings &settings,uint8_t *&framePixels,uint16_t &frameWidth,uint16_t &frameHeight) {
   if(settings.resolution>XGA) return false;
   if(ready_) { esp_camera_deinit();ready_=false; }
@@ -48,17 +76,13 @@ class ImageSource {
   if(error!=ESP_OK) {
     DEBUGF("camera init failed board=%s sensor_sda=%d sensor_scl=%d error=0x%X\n",
       CAMERA_BOARD_NAME,SIOD,SIOC,(unsigned)error);
+    // esp_camera_init can leave partially installed GPIO/LEDC state behind.
+    // Tear it down so a later cold-start recovery attempt can succeed.
+    esp_camera_deinit();
     free(framePixels);framePixels=nullptr;return false;
   }
-  sensor_t *sensor=esp_camera_sensor_get();
-  if(sensor) {
-    sensor->set_brightness(sensor,settings.brightness);
-    sensor->set_contrast(sensor,settings.contrast);
-    sensor->set_saturation(sensor,settings.saturation);
-    sensor->set_vflip(sensor,settings.vflip);
-    sensor->set_hmirror(sensor,settings.hmirror);
-  }
   ready_=true;
+  if(!applyControls(settings)) { esp_camera_deinit();ready_=false;free(framePixels);framePixels=nullptr;return false; }
   DEBUGF("camera %ux%u grayscale ready\n",frameWidth,frameHeight);
   return true;
 }

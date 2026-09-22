@@ -70,7 +70,7 @@ function handleLine(line) {
       else if (kind === 'CELL_ANALYSIS') {
         const numbers=value=>value.split(',').map(Number);
         const entry={mac,id:+parts[3],frame:+parts[4],score:+parts[5],threshold:+parts[6],referenceEdges:+parts[7],liveEdges:+parts[8],peakCount:+parts[9],angles:numbers(parts[10]),reference:numbers(parts[11]),live:numbers(parts[12]),at:Date.now()};
-        if(entry.angles.length!==10||entry.reference.length!==31||entry.live.length!==31||entry.peakCount<0||entry.peakCount>10||[entry.id,entry.frame,entry.score,entry.threshold,entry.referenceEdges,entry.liveEdges,...entry.angles,...entry.reference,...entry.live].some(value=>!Number.isFinite(value)))throw Error('Invalid cell analysis from bridge');
+        if(entry.angles.length!==12||entry.reference.length!==37||entry.live.length!==37||entry.peakCount<0||entry.peakCount>12||[entry.id,entry.frame,entry.score,entry.threshold,entry.referenceEdges,entry.liveEdges,...entry.angles,...entry.reference,...entry.live].some(value=>!Number.isFinite(value)))throw Error('Invalid cell analysis from bridge');
         send('bridge:cell-analysis',entry);
       }
       else if (kind === 'DISCOVER') { send('bridge:notice', `Camera ${mac} discovered`); refresh().catch(report); }

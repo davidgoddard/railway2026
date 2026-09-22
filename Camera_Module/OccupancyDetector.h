@@ -70,8 +70,8 @@ uint8_t OccupancyDetector::directionBucket(const CellRuntime &cell,int gx,int gy
   float angle=atan2f((float)gy,(float)gx)*57.2957795f+90.0f;
   if(angle<0) angle+=180;
   if(angle>=180) angle-=180;
-  angle+=10.0f;if(angle>=180) angle-=180;
-  return min((int)(angle/20.0f),(int)FIXED_DIRECTIONS-1);
+  angle+=7.5f;if(angle>=180) angle-=180;
+  return min((int)(angle/15.0f),(int)FIXED_DIRECTIONS-1);
 }
 uint8_t OccupancyDetector::spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y) {
   // directionX/Y is the edge normal. Project the sample position onto it,
@@ -122,7 +122,7 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
   if(referenceMode && f.textured) {
     f.peakCount=FIXED_DIRECTIONS;
     for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
-      const float physicalAngle=direction*20.0f;
+      const float physicalAngle=direction*15.0f;
       f.peakAngle[direction]=fmodf(physicalAngle+90.0f,180.0f);
       uint32_t count=0;
       for(uint8_t band=0;band<POSITION_BANDS;++band)
@@ -153,7 +153,7 @@ float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Featur
 void OccupancyDetector::calibrateCell(CellRuntime &cell) {
   memset(cell.referenceBuckets,0,sizeof(cell.referenceBuckets));
   for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
-    const float physicalAngle=direction*20.0f;
+    const float physicalAngle=direction*15.0f;
     const float gradientRadians=fmodf(physicalAngle+90.0f,180.0f)*0.01745329252f;
     cell.directionX[direction]=(int16_t)lroundf(cosf(gradientRadians)*256);
     cell.directionY[direction]=(int16_t)lroundf(sinf(gradientRadians)*256);

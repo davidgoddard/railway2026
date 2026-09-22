@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.1"
+#define CAMERA_MODULE_VERSION "0.2.7"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -38,7 +38,7 @@ constexpr uint8_t PROTOCOL_VERSION=1;
 constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
-constexpr uint8_t MAX_PEAKS=10, FIXED_DIRECTIONS=9, BINS=36, MAX_ANCHORS=2;
+constexpr uint8_t MAX_PEAKS=12, FIXED_DIRECTIONS=12, BINS=36, MAX_ANCHORS=2;
 constexpr uint8_t POSITION_BANDS=3, SPATIAL_BUCKETS=MAX_PEAKS*POSITION_BANDS+1;
 constexpr uint32_t HELLO_MS=2000, HEALTH_MS=5000, SNAP_TIMEOUT_MS=250;
 constexpr uint8_t BROADCAST_MAC[6]={255,255,255,255,255,255};
@@ -49,7 +49,8 @@ enum MessageType : uint8_t {
   STATE=8, HEALTH=9, SNAPSHOT_BEGIN=10, SNAPSHOT_CHUNK=11,
   SNAPSHOT_END=12, SNAPSHOT_ACK=13, DIAGNOSTIC=14, DIAGNOSTIC_ACK=15,
   HEALTH_ACK=16, ANALYSIS_REQUEST=17, CELL_ANALYSIS=18,
-  CALIBRATE_REQUEST=19, CALIBRATION_RESULT=20, CALIBRATION_ACK=21
+  CALIBRATE_REQUEST=19, CALIBRATION_RESULT=20, CALIBRATION_ACK=21,
+  STATE_BITMAP=22, SCORE_BATCH=23
 };
 enum AckStatus : uint8_t { ACK_OK=0, ACK_BAD_PAYLOAD=1, ACK_BAD_ORDER=2, ACK_NO_MEMORY=3, ACK_CAMERA_ERROR=4, ACK_BUSY=5 };
 enum CellState : uint8_t { UNKNOWN=0, CLEAR=1, OCCUPIED=2 };
@@ -91,6 +92,17 @@ struct __attribute__((packed)) StatePayload {
   uint16_t scorePermille;
   uint8_t state, grouped;
 };
+constexpr uint16_t STATE_BITMAP_BYTES=(MAX_CELLS*2+7)/8;
+struct __attribute__((packed)) StateBitmapPayload {
+  uint32_t revision,frame;uint16_t count;uint8_t encoding;
+  uint8_t states[STATE_BITMAP_BYTES];
+};
+struct __attribute__((packed)) ScoreRecord { uint16_t index,scorePermille; };
+constexpr uint8_t MAX_BATCHED_SCORES=(RADIO_PAYLOAD-9)/sizeof(ScoreRecord);
+struct __attribute__((packed)) ScoreBatchPayload {
+  uint32_t revision,frame;uint8_t count;ScoreRecord records[MAX_BATCHED_SCORES];
+};
+static_assert(sizeof(StateBitmapPayload)<=RADIO_PAYLOAD && sizeof(ScoreBatchPayload)<=RADIO_PAYLOAD,"State payload exceeds ESP-NOW payload");
 struct __attribute__((packed)) AnalysisPayload {
   uint32_t id,revision,frame;
   uint16_t scorePermille,thresholdPermille,referenceEdges,liveEdges;
@@ -98,6 +110,7 @@ struct __attribute__((packed)) AnalysisPayload {
   uint16_t lineAngleTenths[MAX_PEAKS];
   uint16_t referenceBuckets[SPATIAL_BUCKETS],liveBuckets[SPATIAL_BUCKETS];
 };
+static_assert(sizeof(AnalysisPayload)<=RADIO_PAYLOAD,"Analysis payload exceeds ESP-NOW payload");
 struct __attribute__((packed)) CalibrationRequestPayload { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples; };
 struct __attribute__((packed)) CalibrationResultPayload {
   uint32_t revision,id;uint16_t index,count,thresholdPermille,clearMaximum,referenceEdges,samples;
@@ -285,10 +298,21 @@ void flashReady() {
 }
 // The board adapter owns the camera driver; the rest of the sketch sees grayscale frames.
 bool initCamera(const CameraSettings &settings) {
-  const bool ok=imageSource.begin(settings,framePixels,frameWidth,frameHeight);
-  cameraReady=ok;
-  if(ok) cameraSettings=settings;
-  return ok;
+  for(uint8_t attempt=0;attempt<3;++attempt) {
+    if(imageSource.begin(settings,framePixels,frameWidth,frameHeight)) {
+      cameraReady=true;cameraSettings=settings;return true;
+    }
+    cameraReady=false;
+    if(attempt<2) delay(150);
+  }
+  return false;
+}
+bool applyCameraSettings(const CameraSettings &settings) {
+  if(cameraReady) {
+    if(!imageSource.reconfigure(settings,framePixels,frameWidth,frameHeight)) return false;
+    cameraSettings=settings;return true;
+  }
+  return initCamera(settings);
 }
 bool captureFrame() {
   if(!cameraReady || !framePixels) return false;
@@ -300,9 +324,10 @@ bool captureFrame() {
 constexpr uint16_t STATE_QUEUE_CAPACITY=400;
 StatePayload *stateQueue=nullptr;
 uint16_t stateHead=0,stateCount=0;
-uint32_t lastStateSend=0;
+bool stateBitmapDirty=false,scoreReportingEnabled=false;
 void queueState(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
-  if(!stateQueue) return;
+  stateBitmapDirty=true;
+  if(!stateQueue || !scoreReportingEnabled || grouped) return;
   StatePayload value={id,configRevision,frameNumber,score,state,(uint8_t)grouped};
   for(uint16_t i=0;i<stateCount;++i) {
     StatePayload &slot=stateQueue[(stateHead+i)%STATE_QUEUE_CAPACITY];
@@ -315,18 +340,34 @@ void queueState(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
   stateQueue[(stateHead+stateCount)%STATE_QUEUE_CAPACITY]=value;
   ++stateCount;
 }
-void flushState() {
-  if(!bridgeKnown || !stateCount || millis()-lastStateSend<20) return;
-  lastStateSend=millis();
-  StatePayload &value=stateQueue[stateHead];
-  if(transmit(bridgeMac,STATE,nextSeq++,&value,sizeof(value))) {
-    DEBUGF("state %s %lu=%s score=%u frame=%lu\n",value.grouped?"block":"sensor",
-      (unsigned long)value.id,value.state==OCCUPIED?"occupied":value.state==CLEAR?"clear":"unknown",
-      value.scorePermille,(unsigned long)value.frame);
-    stateHead=(stateHead+1)%STATE_QUEUE_CAPACITY;--stateCount;
+void sendStateBitmap() {
+  if(!bridgeKnown || !stateBitmapDirty) return;
+  StateBitmapPayload bitmap={};bitmap.revision=configRevision;bitmap.frame=frameNumber;
+  bitmap.count=cellCount;bitmap.encoding=1;
+  for(uint16_t i=0;i<cellCount;++i)
+    bitmap.states[i/4]|=(cells[i].state&3)<<((i%4)*2);
+  const uint32_t seq=nextSeq++;
+  const size_t bytes=offsetof(StateBitmapPayload,states)+(cellCount*2+7)/8;
+  const bool accepted=transmit(bridgeMac,STATE_BITMAP,seq,&bitmap,bytes);
+  if(accepted) stateBitmapDirty=false;
+}
+void sendScores() {
+  if(!bridgeKnown || !scoreReportingEnabled || !stateCount) return;
+  ScoreBatchPayload batch={};batch.revision=configRevision;batch.frame=frameNumber;
+  const uint16_t take=min(stateCount,(uint16_t)MAX_BATCHED_SCORES);
+  for(uint16_t offset=0;offset<take;++offset) {
+    const StatePayload &value=stateQueue[(stateHead+offset)%STATE_QUEUE_CAPACITY];
+    int index=-1;for(uint16_t i=0;i<cellCount;++i) if(cells[i].config.id==value.id) { index=i;break; }
+    if(index>=0) batch.records[batch.count++]={(uint16_t)index,value.scorePermille};
+  }
+  if(!batch.count) { stateHead=(stateHead+take)%STATE_QUEUE_CAPACITY;stateCount-=take;return; }
+  const size_t bytes=offsetof(ScoreBatchPayload,records)+(size_t)batch.count*sizeof(ScoreRecord);
+  if(transmit(bridgeMac,SCORE_BATCH,nextSeq++,&batch,bytes)) {
+    stateHead=(stateHead+take)%STATE_QUEUE_CAPACITY;stateCount-=take;
   }
 }
 void queueAllStates() {
+  stateBitmapDirty=true;
   for(uint16_t i=0;i<cellCount;++i)
     queueState(cells[i].config.id,false,cells[i].state,cells[i].scorePermille);
   for(uint16_t g=0;g<groupCount;++g) {
@@ -541,7 +582,7 @@ uint8_t commitConfig(uint32_t revision) {
   if(memcmp(&stagingSettings,&cameraSettings,sizeof(CameraSettings))!=0 || !cameraReady) {
     const CameraSettings previous=cameraSettings;
     const bool wasReady=cameraReady;
-    if(!initCamera(stagingSettings)) {
+    if(!applyCameraSettings(stagingSettings)) {
       if(wasReady) initCamera(previous);
       return ACK_CAMERA_ERROR;
     }
@@ -572,7 +613,7 @@ bool saveBaseline() {
   const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
   // Runtime features contain the calibration. The full grayscale frame is not
   // needed after reboot and made SVGA baselines require two 480 KB flash files.
-  BaselineHeader h={0x52424C39,configRevision,0,
+  BaselineHeader h={0x52424C3A,configRevision,0,
     crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
   if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
   File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
@@ -593,7 +634,7 @@ void loadBaseline() {
     LittleFS.rename("/baseline.bak","/baseline.bin");
   File f=LittleFS.open("/baseline.bin","r");if(!f) return;
   BaselineHeader h={};
-  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C39 ||
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C3A ||
      h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
   const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
   if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||
@@ -755,6 +796,9 @@ void handleRadio(const Received &message) {
     const bool bridgeRestarted=lastBridgeBeaconSeq && (int32_t)(p.seq-lastBridgeBeaconSeq)<0;
     if(!bridgeKnown) setBridge(message.mac);
     if(sameMac(message.mac,bridgeMac)) {
+      const bool scoresRequested=beacon.baselineReady!=0;
+      scoreReportingEnabled=scoresRequested;
+      if(!scoreReportingEnabled) stateHead=stateCount=0;
       if(lastBridgeBeacon && now-lastBridgeBeacon>12000) queueDiagnostic(DIAG_BRIDGE_REJOIN,now-lastBridgeBeacon);
       lastBridgeBeacon=now;lastBridgeBeaconSeq=p.seq;
       if(newBridge || missedBridge || bridgeRestarted) {
@@ -1017,13 +1061,16 @@ void loop() {
   for(int n=0;n<16 && xQueueReceive(inbox,&message,0)==pdTRUE;++n) handleRadio(message);
   serviceSnapshot();
   serviceDiagnostics();
+  // Submit state first. ESP-NOW continues radio work while the next frame is
+  // captured; optional score diagnostics never delay capture.
+  sendStateBitmap();sendScores();
   if(cameraReady && !snapshot.active) {
     if(captureFrame()) {
       detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
       if(baselineReady) detector.analyseAllCells();
     }
   }
-  flushState();
+  sendStateBitmap();sendScores();
   if(millis()-lastHello>=HELLO_MS) { lastHello=millis();sendHello(); }
   if(millis()-lastHealth>=HEALTH_MS) { lastHealth=millis();sendHealth(); }
   // A router channel change can move the bridge. Search until its beacon reappears.
