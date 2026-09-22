@@ -88,9 +88,9 @@ function cameraStatus(online){const badge=document.createElement('span');badge.c
 function toast(message,error=false){const el=$('toast');el.textContent=message;el.className=error?'error':'';el.style.display='block';clearTimeout(toast.timer);toast.timer=setTimeout(()=>el.style.display='none',5000);}
 function showOperation(title,detail,kind='info'){const el=$('operation-status');$('operation-title').textContent=title;$('operation-detail').textContent=detail;el.className=`operation-status ${kind}`;el.hidden=false;}
 async function act(fn){try{busy=true;setButtons();return await fn();}catch(e){const message=e.message||String(e);toast(message,true);if(selectedMac)showOperation('Operation failed',message,'error');}finally{busy=false;setButtons();}}
-function visibleCameras(){return bridgeState.connected?bridgeState.cameras:Object.values(knownCameras).map(item=>({...item.camera,online:false,cached:true}));}
+function visibleCameras(){return bridgeState.connected?bridgeState.cameras:Object.values(knownCameras).map(item=>({...item.camera,count:item.config?.cells?.length||0,online:false,cached:true}));}
 function savedConfigFor(mac){return bridgeState.configs[mac]||knownCameras[mac]?.config;}
-function rememberCameras(data){let changed=false;for(const item of data.cameras||[]){const config=data.configs?.[item.mac];if(!config)continue;knownCameras[item.mac]={camera:{...item,online:false},config:cloneConfig(config)};changed=true;}if(changed)localStorage.setItem('knownCameras',JSON.stringify(knownCameras));}
+function rememberCameras(data){let changed=false;for(const item of data.cameras||[]){const config=data.configs?.[item.mac];if(!config||!Array.isArray(config.cells)||config.cells.length!==item.count)continue;knownCameras[item.mac]={camera:{...item,count:config.cells.length,online:false},config:cloneConfig(config)};changed=true;}if(changed)localStorage.setItem('knownCameras',JSON.stringify(knownCameras));}
 function camera(){return visibleCameras().find(c=>c.mac===selectedMac);}
 function outputId(cell){return cell.group || cell.id;}
 function mqttStateForCell(cell){if(viewerStatus!=='connected'||viewerBridgeOnline===false)return null;const name=draft?.topics?.[outputId(cell)]||String(outputId(cell));return Object.values(viewerStates).find(item=>item.name===name)?.value||null;}
