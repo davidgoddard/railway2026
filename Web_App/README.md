@@ -21,7 +21,7 @@ Opening `index.html` directly with `file://` is not supported because Web Serial
 - Lossless frame transfer with CRC validation and compressed-frame decompression.
 - Cached camera frames and local output display names.
 - Sensor creation, movement, deletion, block painting and block extension.
-- Live per-sensor overlays and combined block output monitoring.
+- Live overlays selectable between individual USB sensor events and MQTT output states. In MQTT mode, all circles belonging to a block show its combined published state.
 - Camera settings, per-sensor persistence settings and mismatch thresholds.
 - Fetched-frame texture preview using the camera's Scharr gradients and nine fixed 20° direction buckets.
 - On-demand camera baseline comparison with 27 direction/position buckets and proportional edge-count change.

@@ -36,6 +36,7 @@ header h1{font-size:22px;margin:0}
 .preview-controls{display:flex;align-items:center;gap:10px}
 .preview-controls .zoom-note{white-space:nowrap}
 .preview-controls button{padding:5px 9px;font-size:10px}
+.preview-controls select{min-width:74px;padding:5px 8px;font-size:10px}
 .live-toggle{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border:1px solid #365066;border-radius:7px;color:#c8d9e4;font-size:11px;font-weight:800;cursor:pointer}
 .live-toggle:has(input:checked){border-color:#36cda4;background:#174439;color:#a6f5d7}
 .live-toggle input{width:14px;height:14px;margin:0;padding:0;accent-color:#29d8ae}

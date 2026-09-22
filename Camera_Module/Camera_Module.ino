@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.0"
+#define CAMERA_MODULE_VERSION "0.2.1"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
