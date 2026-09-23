@@ -116,7 +116,7 @@ One camera can reduce hardware and wiring **per monitored area** when its view c
 
 ## How the camera firmware detects changes
 
-The detector does **not** ask whether every live pixel is identical to the reference image. That would be too sensitive to normal camera noise, small exposure changes, and gradual lighting drift. Instead, each configured sensor area is reduced to 27 proportions: nine fixed physical-line directions at 20° intervals, each divided into three coarse position bands. The detector also records the total number of strong gradients so an obstruction cannot appear unchanged merely by preserving a dominant direction.
+The detector does **not** ask whether every live pixel is identical to the reference image. That would be too sensitive to normal camera noise, small exposure changes, and gradual lighting drift. Instead, each configured sensor area is reduced to 36 proportions: twelve fixed physical-line directions at 15° intervals, each divided into three coarse position bands. The detector also records the total number of strong gradients so an obstruction cannot appear unchanged merely by preserving a dominant direction.
 
 A useful way to think about the process is:
 
@@ -173,7 +173,7 @@ Not every gradient is retained. The firmware calculates an edge cutoff using the
 
 For live frames, that second term comes from the **saved baseline**, rather than being recalculated from the live frame. This is important: a newly introduced bright object should not be allowed to raise the threshold that is being used to detect that same object.
 
-For retained edges, the algorithm also measures physical line direction from 0° to 180°. Opposite gradient signs represent the same physical line, so an edge has an orientation rather than a one-way heading. Each edge is assigned to the nearest fixed direction bucket centred at 0°, 20°, …, 160°; the 0° bucket wraps across 180°.
+For retained edges, the algorithm also measures physical line direction from 0° to 180°. Opposite gradient signs represent the same physical line, so an edge has an orientation rather than a one-way heading. Each edge is assigned to the nearest fixed direction bucket centred at 0°, 15°, …, 165°; the 0° bucket wraps across 180°.
 
 > The detector is interested less in the exact shade of a rail or sleeper and more in the pattern of strong lines and boundaries visible in the area.
 
@@ -186,10 +186,10 @@ For each sensor, the baseline includes measurements such as:
 - number of sampled pixels and detected edges;
 - maximum gradient strength, used to set the edge cutoff;
 - mean brightness and the number of almost-white pixels;
-- all nine fixed 20° direction buckets; and
+- all twelve fixed 15° direction buckets; and
 - the proportion of edges assigned to three broad position bands for each direction.
 
-A sensor is treated as textured once at least eight qualifying edges are found. Every retained edge contributes even when its direction is weak relative to a dominant rail or scenery boundary; there is no dominant-family support test and no “other directions” bucket. Each edge is projected onto the normal of its bucket's physical line and placed in side A, centre, or side B. The resulting 27 normalized direction/position proportions retain coarse geometry without exact edge coordinates.
+A sensor is treated as textured once at least eight qualifying edges are found. Every retained edge contributes even when its direction is weak relative to a dominant rail or scenery boundary; there is no dominant-family support test and no “other directions” bucket. Each edge is projected onto the normal of its bucket's physical line and placed in side A, centre, or side B. The resulting 36 normalized direction/position proportions retain coarse geometry without exact edge coordinates.
 
 > The baseline is a fingerprint of the clear scene. It records the important structure of the image, not a photographic copy that must match exactly.
 
@@ -207,7 +207,7 @@ Empty-only calibration estimates false-trigger behaviour; it cannot prove that e
 
 ### 5. Build the same features for each live frame
 
-Once a baseline exists, each new frame is analysed using the same sensor geometry, saved gradient cutoff, nine direction buckets and three position bands. The detector calculates total variation between the 27 normalized baseline and live bucket proportions. It also calculates the proportional change in the total number of strong gradients and uses the larger of the two values. This second component catches an obstruction that preserves a dominant line direction while removing much of the empty-track texture.
+Once a baseline exists, each new frame is analysed using the same sensor geometry, saved gradient cutoff, twelve direction buckets and three position bands. The detector calculates total variation between the 36 normalized baseline and live bucket proportions. It also calculates the proportional change in the total number of strong gradients and uses the larger of the two values. This second component catches an obstruction that preserves a dominant line direction while removing much of the empty-track texture.
 
 If both images are untextured, the score is zero; if only one is textured, the score is 1000. The direction/position comparison is normalized by edge count, while the separate edge-count component deliberately preserves a large loss or gain of texture.
 

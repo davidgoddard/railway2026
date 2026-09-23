@@ -165,10 +165,11 @@ function analyseCellPixels(cell){
 }
 function renderCellAnalysis(cell){
   const canvas=$('cell-preview'),summary=$('cell-analysis-summary'),list=$('cell-angle-list');list.replaceChildren();
+  canvas.style.clipPath=cell.shape===0?'circle(50%)':'none';
   if(!frame){canvas.width=canvas.height=1;canvas.getContext('2d').clearRect(0,0,1,1);summary.textContent='Fetch a clear-track frame to inspect this sensor.';return;}
   const pixels=new Uint8Array(frame.pixels),diameter=cell.radius*2+1,scale=Math.max(2,Math.min(10,Math.floor(300/diameter)));canvas.width=canvas.height=diameter*scale;const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
   for(let py=0;py<diameter;py++)for(let px=0;px<diameter;px++){const x=cell.x-cell.radius+px,y=cell.y-cell.radius+py,value=x>=0&&x<frame.width&&y>=0&&y<frame.height?pixels[y*frame.width+x]:0;ctx.fillStyle=`rgb(${value},${value},${value})`;ctx.fillRect(px*scale,py*scale,scale,scale);}
-  const result=analyseCellPixels(cell);summary.textContent=`${result.edges} strong gradients from ${result.samples} pixels · cutoff ${Math.ceil(result.minimum)} · 9 fixed direction buckets`;
+  const result=analyseCellPixels(cell);summary.textContent=`${result.edges} strong gradients from ${result.samples} pixels · cutoff ${Math.ceil(result.minimum)} · 12 fixed direction buckets`;
   const centre=canvas.width/2,length=canvas.width*.42;result.peaks.forEach((peak,index)=>{if(peak.share>=.03){const radians=peak.lineAngle*Math.PI/180;ctx.beginPath();ctx.moveTo(centre-Math.cos(radians)*length,centre-Math.sin(radians)*length);ctx.lineTo(centre+Math.cos(radians)*length,centre+Math.sin(radians)*length);ctx.strokeStyle=analysisColours[index];ctx.lineWidth=Math.max(2,scale/3);ctx.stroke();}const tag=document.createElement('i'),dot=document.createElement('b');dot.style.background=analysisColours[index];tag.append(dot,document.createTextNode(`${peak.lineAngle.toFixed(0)}° · ${(peak.share*100).toFixed(0)}%`));list.append(tag);});
 }
 function renderBaselineComparison(cell){

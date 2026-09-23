@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.7"
+#define CAMERA_MODULE_VERSION "0.2.12"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -166,7 +166,10 @@ uint8_t localMac[6]={},bridgeMac[6]={};
 bool bridgeKnown=false;
 uint8_t radioChannel=1;
 uint32_t lastBridgeBeacon=0,lastChannelScan=0,lastBridgeBeaconSeq=0;
-constexpr uint32_t BRIDGE_SEARCH_AFTER_MS=5000,CHANNEL_DWELL_MS=600;
+// Stay long enough for several normal bridge beacons. A 600 ms dwell gave a
+// scanning camera only one marginal receive opportunity on each channel and
+// produced repeated one-way discoveries at noisy installations.
+constexpr uint32_t BRIDGE_SEARCH_AFTER_MS=5000,CHANNEL_DWELL_MS=2000;
 
 struct Anchor { uint16_t x,y; };
 struct Feature {
@@ -202,7 +205,7 @@ uint32_t stagingRevision=0;
 CameraSettings stagingSettings={QVGA,0,0,0,0,0};
 bool stagingOpen=false;
 
-struct Received { uint8_t mac[6]; Packet packet; };
+struct Received { uint8_t mac[6],channel; Packet packet; };
 QueueHandle_t inbox=nullptr;
 struct SnapshotTransfer {
   bool active=false,waiting=false;
@@ -285,6 +288,7 @@ void serviceDiagnostics() {
 void onReceive(const esp_now_recv_info_t *info,const uint8_t *data,int length) {
   if(!info || length<(int)offsetof(Packet,payload) || !inbox) return;
   Received item={}; memcpy(item.mac,info->src_addr,6);
+  if(info->rx_ctrl) item.channel=info->rx_ctrl->channel;
   const size_t bytes=min((size_t)length,sizeof(Packet));
   memcpy(&item.packet,data,bytes);
   if(item.packet.magic!=MAGIC || item.packet.version!=PROTOCOL_VERSION ||
@@ -325,6 +329,8 @@ constexpr uint16_t STATE_QUEUE_CAPACITY=400;
 StatePayload *stateQueue=nullptr;
 uint16_t stateHead=0,stateCount=0;
 bool stateBitmapDirty=false,scoreReportingEnabled=false;
+uint32_t lastStateBitmap=0;
+constexpr uint32_t STATE_BITMAP_REFRESH_MS=1000;
 void queueState(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
   stateBitmapDirty=true;
   if(!stateQueue || !scoreReportingEnabled || grouped) return;
@@ -341,7 +347,7 @@ void queueState(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
   ++stateCount;
 }
 void sendStateBitmap() {
-  if(!bridgeKnown || !stateBitmapDirty) return;
+  if(!bridgeKnown || (!stateBitmapDirty && millis()-lastStateBitmap<STATE_BITMAP_REFRESH_MS)) return;
   StateBitmapPayload bitmap={};bitmap.revision=configRevision;bitmap.frame=frameNumber;
   bitmap.count=cellCount;bitmap.encoding=1;
   for(uint16_t i=0;i<cellCount;++i)
@@ -349,7 +355,7 @@ void sendStateBitmap() {
   const uint32_t seq=nextSeq++;
   const size_t bytes=offsetof(StateBitmapPayload,states)+(cellCount*2+7)/8;
   const bool accepted=transmit(bridgeMac,STATE_BITMAP,seq,&bitmap,bytes);
-  if(accepted) stateBitmapDirty=false;
+  if(accepted) { stateBitmapDirty=false;lastStateBitmap=millis(); }
 }
 void sendScores() {
   if(!bridgeKnown || !scoreReportingEnabled || !stateCount) return;
@@ -785,6 +791,12 @@ uint8_t lastBaselineStatus=ACK_BAD_ORDER;
 void setChannel(uint8_t channel);
 void handleRadio(const Received &message) {
   const Packet &p=message.packet;
+  // A packet can arrive in the Wi-Fi callback just after this loop drained the
+  // inbox, followed by the channel scanner advancing before the packet is
+  // handled on the next iteration. Return to the channel on which a known
+  // bridge packet was actually received before replying or starting a transfer.
+  if(bridgeKnown && sameMac(message.mac,bridgeMac) && message.channel &&
+     message.channel!=radioChannel) setChannel(message.channel);
   if(p.type==HELLO && p.length==sizeof(HelloPayload)) {
     HelloPayload beacon;memcpy(&beacon,p.payload,sizeof(beacon));
     if(memcmp(beacon.mac,message.mac,6)!=0 || beacon.channel!=radioChannel ||
@@ -1047,8 +1059,11 @@ void setup() {
   if(!storage) DEBUGLN("LittleFS partition missing");
   if(!storageReady) DEBUGLN("LittleFS unavailable; persistent baseline disabled");
   else if(freshStorage) DEBUGLN("LittleFS initialized");
-  initCamera(cameraSettings);
+  // A saved baseline knows the required resolution and initializes the camera
+  // directly at that size. Initializing QVGA first and immediately tearing the
+  // driver down for the saved size made cold boot timing-dependent.
   loadBaseline();
+  if(!cameraReady) initCamera(cameraSettings);
   queueDiagnostic(cameraReady?DIAG_READY:DIAG_INIT_FAILED,configRevision);
   printInfo();
   DEBUGLN("Send H for USB commands. Configuration and baseline are volatile.");

@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.13"
+#define BRIDGE_VERSION "0.1.16"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -175,17 +175,32 @@ Packet makePacket(uint8_t type,uint32_t seq,const void *data,size_t length) {
   Packet p={};p.magic=MAGIC;p.version=VERSION;p.type=type;p.seq=seq;p.length=length;
   if(length) memcpy(p.payload,data,length);return p;
 }
-void broadcastBeacon() {
+Packet beaconPacket() {
   uint8_t mac[6]={};esp_wifi_get_mac(WIFI_IF_STA,mac);
   HelloMessage beacon={};memcpy(beacon.mac,mac,6);beacon.channel=radioChannel;
   beacon.baseline=lastUsbCommandAt && millis()-lastUsbCommandAt<15000;
-  Packet p=makePacket(HELLO,sequence++,&beacon,sizeof(beacon));
-  if(!sendPacket(BROADCAST,p) && millis()-lastBeaconFailureLog>=5000) {
+  return makePacket(HELLO,sequence++,&beacon,sizeof(beacon));
+}
+void broadcastBeacon() {
+  Packet p=beaconPacket();
+  const bool broadcastSent=sendPacket(BROADCAST,p);
+  // Broadcast discovery can be asymmetric: the bridge may hear camera health
+  // while a remote camera misses bridge broadcasts and starts channel scans.
+  // Give each known online camera a unicast copy with MAC-layer peer handling.
+  bool unicastSent=true;
+  for(auto &camera:cameras) if(camera.used && camera.seen)
+    unicastSent=sendPacket(camera.mac,p)&&unicastSent;
+  if((!broadcastSent || !unicastSent) && millis()-lastBeaconFailureLog>=5000) {
     lastBeaconFailureLog=millis();
-    char detail[48];snprintf(detail,sizeof(detail),"channel=%u",radioChannel);
+    char detail[64];snprintf(detail,sizeof(detail),"channel=%u broadcast=%u unicast=%u",
+      radioChannel,broadcastSent,unicastSent);
     recordDiagnostic("BEACON_SEND_FAILED","-",detail);
   }
   lastBeacon=millis();
+}
+bool promptCamera(const uint8_t *mac) {
+  Packet p=beaconPacket();
+  return sendPacket(mac,p);
 }
 void sendSnapshotAck(Camera &c,uint32_t seq) { Packet p=makePacket(SNAPSHOT_ACK,seq,nullptr,0);sendPacket(c.mac,p); }
 void publish(const String &suffix,const String &value,bool retained=true) {
@@ -422,10 +437,17 @@ void handleRadio(const Received &r) {
     if(c->baseline && !h.baseline && c->cells) allUnknown(*c);
     c->seen=true;c->lastSeen=millis();c->remoteRevision=h.revision;c->baseline=h.baseline;
     addPeer(c->mac);
-    // A scanning camera may only stay on this channel briefly. Always answer
-    // its HELLO while it is still listening: the bridge can still consider a
-    // restarted or de-associated camera online until the 15-second timeout.
-    broadcastBeacon();
+    // A scanning camera remains on this channel for a finite dwell. Send
+    // frequent broadcast and unicast beacons during that acquisition window
+    // so one missed prompt cannot leave communication one-way.
+    fastBeaconUntil=millis()+3000;
+    // A scanning camera may only stay on this channel briefly. Answer with a
+    // unicast beacon so ESP-NOW can use its peer delivery handling; broadcast
+    // discovery alone was unreliable at the installed camera location.
+    if(!promptCamera(c->mac)) recordDiagnostic("PROMPT_SEND_FAILED",mac);
+    // If a command is already waiting, put it directly behind the prompt while
+    // the scanning camera is still dwelling on this channel.
+    if(c->pendingType) sendPacket(c->mac,c->pending);
     if(c->cells && !c->phase && h.revision!=c->revision) startUpload(*c);
     return;
   }

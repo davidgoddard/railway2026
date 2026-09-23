@@ -17,7 +17,7 @@ The fetched-frame preview displays all twelve bucket centres and percentages. Li
 
 ## Compatibility
 
-- Camera firmware identifies itself as `0.2.7`.
+- Camera firmware identifies itself as `0.2.12`.
 - The analysis packet now carries twelve angles and 37 values per bucket array. Flash the matching bridge and camera firmware together.
 - The baseline magic changes, so the camera safely rejects baselines made by `main` or an earlier experiment build and requires a new baseline.
 - The saved `angleTolerance` setting is ignored by this experiment.

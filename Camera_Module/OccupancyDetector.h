@@ -272,7 +272,8 @@ void OccupancyDetector::analyseAllCells() {
       cell.enterCount=min((int)cell.enterCount+1,255);
       cell.clearCount=0;
       if(cell.enterCount>=cell.config.enterFrames) cell.state=OCCUPIED;
-    } else if(cell.scorePermille<(uint16_t)(cell.config.thresholdPermille*0.7f)) {
+    } else if(cell.state==UNKNOWN ||
+              cell.scorePermille<(uint16_t)(cell.config.thresholdPermille*0.7f)) {
       cell.clearCount=min((int)cell.clearCount+1,255);
       cell.enterCount=0;
       if(cell.clearCount>=cell.config.clearFrames) cell.state=CLEAR;

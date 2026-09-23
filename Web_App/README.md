@@ -24,7 +24,7 @@ Opening `index.html` directly with `file://` is not supported because Web Serial
 - Live overlays selectable between individual USB sensor events and MQTT output states. In MQTT mode, all circles belonging to a block show its combined published state.
 - Previously known cameras, configurations, and cached images remain selectable without USB, allowing the MQTT overlay to operate as a standalone layout view.
 - Camera settings, per-sensor persistence settings and mismatch thresholds.
-- Fetched-frame texture preview using the camera's Scharr gradients and nine fixed 20° direction buckets.
+- Fetched-frame texture preview using the camera's Scharr gradients and twelve fixed 15° direction buckets.
 - On-demand camera baseline comparison with 27 direction/position buckets and proportional edge-count change.
 - Ten-second fixed-centre automatic radius and threshold calibration for new sensors only or all sensors.
 - Bridge Wi-Fi and MQTT configuration.

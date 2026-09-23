@@ -165,6 +165,7 @@ function analyseCellPixels(cell){
 }
 function renderCellAnalysis(cell){
   const canvas=$('cell-preview'),summary=$('cell-analysis-summary'),list=$('cell-angle-list');list.replaceChildren();
+  canvas.style.clipPath=cell.shape===0?'circle(50%)':'none';
   if(!frame){canvas.width=canvas.height=1;canvas.getContext('2d').clearRect(0,0,1,1);summary.textContent='Fetch a clear-track frame to inspect this sensor.';return;}
   const pixels=new Uint8Array(frame.pixels),diameter=cell.radius*2+1,scale=Math.max(2,Math.min(10,Math.floor(300/diameter)));canvas.width=canvas.height=diameter*scale;const ctx=canvas.getContext('2d');ctx.imageSmoothingEnabled=false;
   for(let py=0;py<diameter;py++)for(let px=0;px<diameter;px++){const x=cell.x-cell.radius+px,y=cell.y-cell.radius+py,value=x>=0&&x<frame.width&&y>=0&&y<frame.height?pixels[y*frame.width+x]:0;ctx.fillStyle=`rgb(${value},${value},${value})`;ctx.fillRect(px*scale,py*scale,scale,scale);}
