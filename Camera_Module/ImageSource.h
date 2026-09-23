@@ -29,6 +29,10 @@ const Resolution RESOLUTIONS[]={
 
 class ImageSource {
  public:
+  struct Frame {
+    uint8_t *pixels=nullptr;
+    uint32_t sequence=0,capturedAtMs=0;
+  };
   bool applyControls(const CameraSettings &settings) {
     if(!ready_) return false;
     sensor_t *sensor=esp_camera_sensor_get();
@@ -47,24 +51,28 @@ class ImageSource {
                    uint16_t &frameWidth,uint16_t &frameHeight) {
     if(!ready_ || settings.resolution>XGA) return false;
     const Resolution &next=RESOLUTIONS[settings.resolution];
-    if(frameWidth!=next.width || frameHeight!=next.height) {
-      uint8_t *nextPixels=(uint8_t *)ps_malloc((size_t)next.width*next.height);
-      sensor_t *sensor=esp_camera_sensor_get();
-      if(!nextPixels || !sensor) { free(nextPixels);return false; }
-      if(sensor->set_framesize(sensor,next.frameSize)!=0) { free(nextPixels);return false; }
-      free(framePixels);framePixels=nextPixels;frameWidth=next.width;frameHeight=next.height;
-      DEBUGF("camera changed to %ux%u grayscale\n",frameWidth,frameHeight);
-    }
-    return applyControls(settings);
+    // A dimension change is a cold rebuild. This avoids needing both the old
+    // and new double buffers in PSRAM at the same time; the caller already
+    // restores the previous settings if this rebuild fails.
+    if(frameWidth!=next.width || frameHeight!=next.height)
+      return begin(settings,framePixels,frameWidth,frameHeight);
+    if(!pause()) return false;
+    const bool applied=applyControls(settings);
+    resume();
+    return applied;
   }
   bool begin(const CameraSettings &settings,uint8_t *&framePixels,uint16_t &frameWidth,uint16_t &frameHeight) {
   if(settings.resolution>XGA) return false;
-  if(ready_) { esp_camera_deinit();ready_=false; }
-  free(framePixels);framePixels=nullptr;
+  if(ready_) { stopCaptureTask();esp_camera_deinit();ready_=false; }
+  free(buffers_[0]);free(buffers_[1]);buffers_[0]=buffers_[1]=nullptr;framePixels=nullptr;
   const Resolution &r=RESOLUTIONS[settings.resolution];
   frameWidth=r.width;frameHeight=r.height;
-  framePixels=(uint8_t *)ps_malloc((size_t)r.width*r.height);
-  if(!framePixels) return false;
+  captureWidth_=r.width;captureHeight_=r.height;
+  buffers_[0]=(uint8_t *)ps_malloc((size_t)r.width*r.height);
+  buffers_[1]=(uint8_t *)ps_malloc((size_t)r.width*r.height);
+  if(!buffers_[0] || !buffers_[1]) {
+    free(buffers_[0]);free(buffers_[1]);buffers_[0]=buffers_[1]=nullptr;return false;
+  }
   camera_config_t c={};
   c.pin_pwdn=PWDN;c.pin_reset=RESET;c.pin_xclk=XCLK;c.pin_sccb_sda=SIOD;c.pin_sccb_scl=SIOC;
   c.pin_d0=D0;c.pin_d1=D1;c.pin_d2=D2;c.pin_d3=D3;c.pin_d4=D4;c.pin_d5=D5;c.pin_d6=D6;c.pin_d7=D7;
@@ -79,25 +87,122 @@ class ImageSource {
     // esp_camera_init can leave partially installed GPIO/LEDC state behind.
     // Tear it down so a later cold-start recovery attempt can succeed.
     esp_camera_deinit();
-    free(framePixels);framePixels=nullptr;return false;
+    free(buffers_[0]);free(buffers_[1]);buffers_[0]=buffers_[1]=nullptr;return false;
   }
   ready_=true;
-  if(!applyControls(settings)) { esp_camera_deinit();ready_=false;free(framePixels);framePixels=nullptr;return false; }
+  if(!applyControls(settings)) {
+    esp_camera_deinit();ready_=false;free(buffers_[0]);free(buffers_[1]);
+    buffers_[0]=buffers_[1]=nullptr;return false;
+  }
+  resetMailbox();
+  if(!startCaptureTask()) {
+    esp_camera_deinit();ready_=false;free(buffers_[0]);free(buffers_[1]);
+    buffers_[0]=buffers_[1]=nullptr;return false;
+  }
   DEBUGF("camera %ux%u grayscale ready\n",frameWidth,frameHeight);
   return true;
 }
-  bool capture(uint8_t *framePixels,uint16_t frameWidth,uint16_t frameHeight) {
-  if(!ready_ || !framePixels) return false;
-  camera_fb_t *fb=esp_camera_fb_get();
-  const size_t bytes=(size_t)frameWidth*frameHeight;
-  if(!fb) return false;
-  const bool valid=fb->format==PIXFORMAT_GRAYSCALE && fb->width==frameWidth &&
-    fb->height==frameHeight && fb->len>=bytes;
-  if(valid) memcpy(framePixels,fb->buf,bytes);
-  esp_camera_fb_return(fb);
-  return valid;
-}
+  // Lease the newest completed frame. The producer will not overwrite it
+  // until a later frame is leased, so analysis and snapshot reads are safe.
+  bool capture(uint8_t *&framePixels,uint16_t,uint16_t,Frame &frame) {
+    if(!ready_) return false;
+    const uint32_t started=millis();
+    do {
+      portENTER_CRITICAL(&mailboxMux_);
+      if(published_>=0 && published_!=writing_ && publishedSequence_!=leasedSequence_) {
+        const uint32_t advanced=publishedSequence_-leasedSequence_;
+        if(leasedSequence_ && advanced>1) replacedFrames_+=advanced-1;
+        leased_=published_;leasedSequence_=publishedSequence_;
+        framePixels=buffers_[leased_];frame={framePixels,leasedSequence_,publishedAtMs_};
+        portEXIT_CRITICAL(&mailboxMux_);
+        return true;
+      }
+      portEXIT_CRITICAL(&mailboxMux_);
+      const uint32_t elapsed=millis()-started;
+      if(elapsed>=1000) break;
+      xSemaphoreTake(frameReady_,pdMS_TO_TICKS(1000-elapsed));
+    } while(millis()-started<1000);
+    return false;
+  }
+
+  bool pause() {
+    if(!taskRunning_ || pauseRequested_) return taskRunning_;
+    pauseRequested_=true;
+    xSemaphoreTake(paused_,portMAX_DELAY);
+    return true;
+  }
+  void resume() { pauseRequested_=false; }
+  uint32_t acquisitionCount() const { return acquisitionCount_; }
+  uint32_t acquisitionFailures() const { return acquisitionFailures_; }
+  uint32_t replacedFrames() const { return replacedFrames_; }
 
  private:
   bool ready_=false;
+  uint8_t *buffers_[2]={nullptr,nullptr};
+  TaskHandle_t captureTask_=nullptr;
+  SemaphoreHandle_t frameReady_=nullptr,stopped_=nullptr,paused_=nullptr;
+  portMUX_TYPE mailboxMux_=portMUX_INITIALIZER_UNLOCKED;
+  volatile bool stopRequested_=false,pauseRequested_=false,taskRunning_=false;
+  volatile int8_t published_=-1,leased_=-1,writing_=-1;
+  volatile uint32_t publishedSequence_=0,leasedSequence_=0,publishedAtMs_=0;
+  volatile uint32_t acquisitionCount_=0,acquisitionFailures_=0,replacedFrames_=0;
+  uint16_t captureWidth_=0,captureHeight_=0;
+
+  void resetMailbox() {
+    portENTER_CRITICAL(&mailboxMux_);
+    published_=leased_=writing_=-1;publishedSequence_=leasedSequence_=publishedAtMs_=0;
+    portEXIT_CRITICAL(&mailboxMux_);
+  }
+  static void captureTaskEntry(void *context) {
+    static_cast<ImageSource *>(context)->captureLoop();
+  }
+  void captureLoop() {
+    while(!stopRequested_) {
+      if(pauseRequested_) {
+        xSemaphoreGive(paused_);
+        while(pauseRequested_ && !stopRequested_) delay(1);
+        continue;
+      }
+      camera_fb_t *fb=esp_camera_fb_get();
+      if(!fb) { ++acquisitionFailures_;delay(1);continue; }
+      int8_t target;
+      portENTER_CRITICAL(&mailboxMux_);
+      target=leased_==0?1:0;
+      writing_=target;
+      portEXIT_CRITICAL(&mailboxMux_);
+      const size_t bytes=(size_t)captureWidth_*captureHeight_;
+      const bool valid=fb->format==PIXFORMAT_GRAYSCALE && fb->width==captureWidth_ &&
+        fb->height==captureHeight_ && buffers_[target] && fb->len>=bytes;
+      if(valid) memcpy(buffers_[target],fb->buf,bytes);
+      esp_camera_fb_return(fb);
+      if(valid) {
+        portENTER_CRITICAL(&mailboxMux_);
+        published_=target;publishedAtMs_=millis();++publishedSequence_;++acquisitionCount_;
+        writing_=-1;
+        portEXIT_CRITICAL(&mailboxMux_);
+        xSemaphoreGive(frameReady_);
+      } else {
+        ++acquisitionFailures_;
+        portENTER_CRITICAL(&mailboxMux_);writing_=-1;portEXIT_CRITICAL(&mailboxMux_);
+      }
+    }
+    xSemaphoreGive(stopped_);
+    vTaskDelete(nullptr);
+  }
+  bool startCaptureTask() {
+    if(!frameReady_) frameReady_=xSemaphoreCreateBinary();
+    if(!stopped_) stopped_=xSemaphoreCreateBinary();
+    if(!paused_) paused_=xSemaphoreCreateBinary();
+    if(!frameReady_ || !stopped_ || !paused_) return false;
+    xSemaphoreTake(frameReady_,0);xSemaphoreTake(stopped_,0);xSemaphoreTake(paused_,0);
+    stopRequested_=pauseRequested_=false;taskRunning_=true;
+    if(xTaskCreate(captureTaskEntry,"camera-capture",4096,this,2,&captureTask_)==pdPASS) return true;
+    taskRunning_=false;captureTask_=nullptr;return false;
+  }
+  void stopCaptureTask() {
+    if(!taskRunning_) return;
+    stopRequested_=true;pauseRequested_=false;
+    xSemaphoreTake(stopped_,portMAX_DELAY);
+    taskRunning_=false;captureTask_=nullptr;
+  }
 };

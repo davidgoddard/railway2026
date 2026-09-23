@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.12"
+#define CAMERA_MODULE_VERSION "0.2.15"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -18,6 +18,7 @@
 #include <miniz.h>
 #include <LittleFS.h>
 #include <esp_partition.h>
+#include <esp_heap_caps.h>
 #include <math.h>
 #include <stddef.h>
 
@@ -38,7 +39,7 @@ constexpr uint8_t PROTOCOL_VERSION=1;
 constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
-constexpr uint8_t MAX_PEAKS=12, FIXED_DIRECTIONS=12, BINS=36, MAX_ANCHORS=2;
+constexpr uint8_t MAX_PEAKS=12, FIXED_DIRECTIONS=12;
 constexpr uint8_t POSITION_BANDS=3, SPATIAL_BUCKETS=MAX_PEAKS*POSITION_BANDS+1;
 constexpr uint32_t HELLO_MS=2000, HEALTH_MS=5000, SNAP_TIMEOUT_MS=250;
 constexpr uint8_t BROADCAST_MAC[6]={255,255,255,255,255,255};
@@ -161,6 +162,8 @@ bool storageReady=false;
 uint8_t baselineStorageError=0;
 uint32_t frameNumber=0, configRevision=0, captureFailures=0;
 uint32_t lastHello=0,lastHealth=0,lastCapture=0,nextSeq=1;
+uint32_t frameCapturedAt=0,analysisCount=0,analysisWindowStarted=0;
+uint32_t lastPerformanceCaptureCount=0,lastPerformanceAnalysisCount=0;
 uint32_t lastFullStateRefresh=0;
 uint8_t localMac[6]={},bridgeMac[6]={};
 bool bridgeKnown=false;
@@ -171,27 +174,15 @@ uint32_t lastBridgeBeacon=0,lastChannelScan=0,lastBridgeBeaconSeq=0;
 // produced repeated one-way discoveries at noisy installations.
 constexpr uint32_t BRIDGE_SEARCH_AFTER_MS=5000,CHANNEL_DWELL_MS=2000;
 
-struct Anchor { uint16_t x,y; };
 struct Feature {
-  uint16_t samples=0,edges=0,maxGradient=0,medianGradient=0,upperGradient=0;
-  uint16_t whitePixels=0;
-  uint32_t graySum=0;
-  uint16_t hist[BINS]={};
-  float angleSum[BINS]={};
-  float peakAngle[MAX_PEAKS]={}, peakShare[MAX_PEAKS]={};
-  uint8_t peakCount=0;
+  uint16_t edges=0,maxGradient=0;
   bool textured=false;
 };
 struct CellRuntime {
   CellConfig config={};
   Feature reference={};
-  // Retained only to read baselines written by earlier firmware revisions.
-  // OccupancyDetector never uses these saved edge locations.
-  Anchor anchors[MAX_ANCHORS]={};
-  uint8_t anchorCount=0;
   uint8_t state=UNKNOWN,enterCount=0,clearCount=0;
   uint16_t scorePermille=0;
-  int16_t directionX[MAX_PEAKS]={},directionY[MAX_PEAKS]={};
   uint16_t referenceBuckets[SPATIAL_BUCKETS]={};
 };
 struct GroupRuntime {
@@ -215,6 +206,13 @@ struct SnapshotTransfer {
   uint8_t codec=0;
   uint8_t *encoded=nullptr;
 } snapshot;
+struct CalibrationTransfer {
+  bool active=false;
+  CalibrationResultPayload *results=nullptr;
+  uint16_t count=0,index=0;
+  uint8_t retries=0;
+  uint32_t seq=0,sentAt=0,revision=0;
+} calibration;
 struct RtcDiagnostic { uint32_t magic;uint8_t operation,outcome;uint32_t offset; };
 RTC_DATA_ATTR RtcDiagnostic rtcDiagnostic;
 constexpr uint32_t RTC_DIAG_MAGIC=0x52444941;
@@ -269,6 +267,24 @@ void sendHealth() {
              frameWidth,frameHeight,(uint16_t)min((uint32_t)65535,millis()-lastCapture),
              (uint8_t)baselineReady,(uint8_t)snapshot.active};
   transmit(bridgeMac,HEALTH,nextSeq++,&payload,sizeof(payload));
+  const uint32_t now=millis();
+  if(!analysisWindowStarted) analysisWindowStarted=now;
+  const uint32_t elapsed=now-analysisWindowStarted;
+  if(elapsed) {
+    const uint32_t captures=imageSource.acquisitionCount();
+    DEBUGF("pipeline capture_fps=%lu.%lu analysis_fps=%lu.%lu frame_age_ms=%lu replaced=%lu acquisition_failures=%lu free_psram=%lu largest_psram=%lu\n",
+      (unsigned long)(((captures-lastPerformanceCaptureCount)*1000)/elapsed),
+      (unsigned long)((((captures-lastPerformanceCaptureCount)*10000)/elapsed)%10),
+      (unsigned long)(((analysisCount-lastPerformanceAnalysisCount)*1000)/elapsed),
+      (unsigned long)((((analysisCount-lastPerformanceAnalysisCount)*10000)/elapsed)%10),
+      (unsigned long)(frameCapturedAt?now-frameCapturedAt:0),
+      (unsigned long)imageSource.replacedFrames(),
+      (unsigned long)imageSource.acquisitionFailures(),
+      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    lastPerformanceCaptureCount=captures;lastPerformanceAnalysisCount=analysisCount;
+    analysisWindowStarted=now;
+  }
 }
 void queueDiagnostic(uint8_t event,uint32_t detail=0,uint32_t offset=0) {
   if(diagnosticCount==16) { diagnosticHead=(diagnosticHead+1)%16;--diagnosticCount;++diagnosticDropped; }
@@ -319,10 +335,10 @@ bool applyCameraSettings(const CameraSettings &settings) {
   return initCamera(settings);
 }
 bool captureFrame() {
-  if(!cameraReady || !framePixels) return false;
-  lastCapture=millis();
-  if(!imageSource.capture(framePixels,frameWidth,frameHeight)) { ++captureFailures;return false; }
-  ++frameNumber;return true;
+  if(!cameraReady) return false;
+  ImageSource::Frame frame;
+  if(!imageSource.capture(framePixels,frameWidth,frameHeight,frame)) { ++captureFailures;return false; }
+  frameNumber=frame.sequence;frameCapturedAt=frame.capturedAtMs;lastCapture=frameCapturedAt;return true;
 }
 
 constexpr uint16_t STATE_QUEUE_CAPACITY=400;
@@ -392,6 +408,7 @@ void baselineHeartbeat() {
   if(millis()-lastHealth>=5000) { sendHealth();lastHealth=millis();delay(2); }
 }
 bool captureBaseline() {
+  if(calibration.active) return false;
   constexpr uint8_t BASELINE_FRAMES=3;
   const uint32_t started=millis();
   rtcDiagnostic={RTC_DIAG_MAGIC,2,0,0};
@@ -414,8 +431,6 @@ bool captureBaseline() {
   memcpy(framePixels,meanPixels,frameBytes);free(meanPixels);
   detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
   for(uint16_t i=0;i<cellCount;++i) {
-    // Retain the flash record layout, but do not save old edge locations.
-    memset(cells[i].anchors,0,sizeof(cells[i].anchors));cells[i].anchorCount=0;
     detector.calibrateCell(cells[i]);baselineHeartbeat();
   }
   if(!saveBaseline()) {
@@ -483,6 +498,9 @@ bool autoCalibrate(const CalibrationRequestPayload &request) {
     }
     ++sampleCount;
   }
+  CalibrationResultPayload *results=(CalibrationResultPayload *)ps_malloc(
+    (size_t)cellCount*sizeof(CalibrationResultPayload));
+  if(!results) { free(trials);free(stats);free(meanPixels);return false; }
   for(uint16_t i=0;i<cellCount;++i) {
     // Prefer the smallest candidate only when the short calibration window
     // shows a genuinely quiet empty scene. If none qualifies, retain the
@@ -514,13 +532,16 @@ bool autoCalibrate(const CalibrationRequestPayload &request) {
       const size_t base=(size_t)i*CANDIDATES;uint8_t chosen=0;
       for(;chosen<CANDIDATES;++chosen) if(trials[base+chosen].config.radius==cells[i].config.radius) break;
       const Stats &s=stats[base+min(chosen,(uint8_t)(CANDIDATES-1))];
-      CalibrationResultPayload result={configRevision,cells[i].config.id,i,cellCount,
+      results[i]={configRevision,cells[i].config.id,i,cellCount,
         cells[i].config.thresholdPermille,s.maximum,cells[i].reference.edges,s.samples,
         cells[i].config.radius,(uint8_t)(s.samples>=40?2:s.samples>=15?1:0)};
-      for(uint8_t attempt=0;attempt<3;++attempt) { transmit(bridgeMac,CALIBRATION_RESULT,nextSeq++,&result,sizeof(result));delay(5); }
     }
+    free(calibration.results);calibration=CalibrationTransfer();
+    calibration.active=true;calibration.results=results;calibration.count=cellCount;
+    calibration.revision=configRevision;calibration.seq=nextSeq++;
     queueAllStates();sendHello();lastHello=millis();
   } else {
+    free(results);
     memcpy(cells,staging,(size_t)cellCount*sizeof(CellRuntime));
     configRevision=previousRevision;baselineReady=previousBaselineReady;
   }
@@ -529,6 +550,32 @@ bool autoCalibrate(const CalibrationRequestPayload &request) {
   DEBUGF("auto calibration revision=%lu cells=%u samples=%u duration_ms=%lu result=%u\n",
     (unsigned long)configRevision,cellCount,sampleCount,(unsigned long)(millis()-started),baselineReady);
   return baselineReady;
+}
+
+void sendCalibrationResult() {
+  if(!calibration.active || !bridgeKnown || calibration.index>=calibration.count) return;
+  transmit(bridgeMac,CALIBRATION_RESULT,calibration.seq,
+    &calibration.results[calibration.index],sizeof(CalibrationResultPayload));
+  calibration.sentAt=millis();
+}
+void serviceCalibration() {
+  if(!calibration.active) return;
+  if(!calibration.sentAt) { sendCalibrationResult();return; }
+  if(millis()-calibration.sentAt<500) return;
+  if(calibration.retries<255) ++calibration.retries;
+  sendCalibrationResult();
+}
+void acceptCalibrationAck(const Packet &p) {
+  uint32_t revision=0;
+  if(!calibration.active || p.length!=sizeof(revision) || p.seq!=calibration.seq) return;
+  memcpy(&revision,p.payload,sizeof(revision));
+  if(revision!=calibration.revision) return;
+  ++calibration.index;calibration.retries=0;calibration.sentAt=0;
+  if(calibration.index<calibration.count) calibration.seq=nextSeq++;
+  else {
+    free(calibration.results);calibration=CalibrationTransfer();
+    DEBUGLN("calibration results acknowledged");
+  }
 }
 
 bool validSettings(const CameraSettings &s) {
@@ -544,7 +591,7 @@ bool validCell(const CellConfig &c,const CameraSettings &settings) {
     c.angleTolerance<=20 && c.enterFrames>=1 && c.clearFrames>=1;
 }
 uint8_t beginConfig(const ConfigBeginPayload &value) {
-  if(snapshot.active) return ACK_BUSY;
+  if(snapshot.active || calibration.active) return ACK_BUSY;
   if(value.count>MAX_CELLS || !validSettings(value.camera)) return ACK_BAD_PAYLOAD;
   stagingOpen=true;stagingCount=0;expectedCount=value.count;
   stagingRevision=value.revision;stagingSettings=value.camera;
@@ -647,7 +694,12 @@ void loadBaseline() {
      (h.bytes && h.bytes!=(uint32_t)frameWidth*frameHeight)) { f.close();return; }
   bool ok=f.read((uint8_t *)cells,cellsBytes)==cellsBytes &&
     crc32((const uint8_t *)cells,cellsBytes)==h.cellsCrc;
-  if(ok && h.bytes) ok=f.read(framePixels,h.bytes)==h.bytes && crc32(framePixels,h.bytes)==h.imageCrc;
+  if(ok && h.bytes) {
+    uint8_t *legacyPixels=(uint8_t *)ps_malloc(h.bytes);
+    ok=legacyPixels && f.read(legacyPixels,h.bytes)==h.bytes &&
+      crc32(legacyPixels,h.bytes)==h.imageCrc;
+    free(legacyPixels);
+  }
   f.close();if(!ok) return;
   uint16_t found=0;
   for(uint16_t i=0;i<h.count;++i) {
@@ -692,6 +744,7 @@ void sendSnapshotPart() {
 }
 bool startSnapshot(uint32_t requestSeq) {
   if(snapshot.active || !framePixels || !frameNumber) return false;
+  if(!imageSource.pause()) return false;
   snapshot=SnapshotTransfer();
   snapshot.active=true;snapshot.type=SNAPSHOT_BEGIN;snapshot.seq=nextSeq++;snapshot.requestSeq=requestSeq;
   const size_t rawBytes=(size_t)frameWidth*frameHeight;
@@ -744,7 +797,7 @@ void acceptSnapshotAck(uint32_t seq) {
     DEBUGF("snapshot complete frame=%lu bytes=%lu\n",(unsigned long)frameNumber,
       (unsigned long)((size_t)frameWidth*frameHeight));
     rtcDiagnostic.outcome=3;queueDiagnostic(DIAG_SNAPSHOT_DONE,(uint32_t)frameWidth*frameHeight,snapshot.offset);rtcDiagnostic.operation=0;
-    free(snapshot.encoded);snapshot.encoded=nullptr;snapshot.active=false;return;
+    free(snapshot.encoded);snapshot.encoded=nullptr;snapshot.active=false;imageSource.resume();return;
   }
   snapshot.seq=nextSeq++;
   sendSnapshotPart();
@@ -755,7 +808,7 @@ void serviceSnapshot() {
   if(snapshot.retries++>=8) {
     DEBUGF("snapshot aborted at offset=%lu after %s retries\n",
       (unsigned long)snapshot.offset,snapshot.waiting?"ack":"send");
-    free(snapshot.encoded);snapshot.encoded=nullptr;snapshot.active=false;
+    free(snapshot.encoded);snapshot.encoded=nullptr;snapshot.active=false;imageSource.resume();
     rtcDiagnostic.outcome=snapshot.waiting?2:1;
     queueDiagnostic(DIAG_SNAPSHOT_ABORTED,snapshot.type,snapshot.offset);rtcDiagnostic.operation=0;
     return;
@@ -814,6 +867,10 @@ void handleRadio(const Received &message) {
       if(lastBridgeBeacon && now-lastBridgeBeacon>12000) queueDiagnostic(DIAG_BRIDGE_REJOIN,now-lastBridgeBeacon);
       lastBridgeBeacon=now;lastBridgeBeaconSeq=p.seq;
       if(newBridge || missedBridge || bridgeRestarted) {
+        if((bridgeRestarted || missedBridge) && calibration.active) {
+          calibration.index=0;calibration.retries=0;calibration.sentAt=0;
+          calibration.seq=nextSeq++;
+        }
         if(!newBridge) { queueAllStates();lastFullStateRefresh=now; }
         // Reply promptly, with a short random offset so several cameras do not answer together.
         lastHello=now-HELLO_MS+(esp_random()%200);
@@ -830,6 +887,7 @@ void handleRadio(const Received &message) {
   // Snapshot/config acknowledgements also prove the bridge is still on this channel.
   lastBridgeBeacon=millis();
   if(p.type==HEALTH_ACK) return;
+  if(p.type==CALIBRATION_ACK) { acceptCalibrationAck(p);return; }
   if(p.type==DIAGNOSTIC_ACK) {
     uint32_t bootId=0;if(p.length==sizeof(bootId)) memcpy(&bootId,p.payload,sizeof(bootId));
     if(diagnosticCount && bootId==diagnosticBootId && p.seq==diagnosticQueue[diagnosticHead].eventSeq) {
@@ -861,7 +919,7 @@ void handleRadio(const Received &message) {
   } else if(p.type==CAPTURE_BASELINE) {
     if(p.length!=0) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
     if(p.seq!=lastBaselineSeq) {
-      lastBaselineStatus=configured && !snapshot.active
+      lastBaselineStatus=configured && !snapshot.active && !calibration.active
         ? (captureBaseline()?ACK_OK:ACK_CAMERA_ERROR) : ACK_BAD_ORDER;
       lastBaselineSeq=p.seq;
     }
@@ -870,10 +928,11 @@ void handleRadio(const Received &message) {
     if(p.length!=0) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
     if(snapshot.active) {
       sendAck(message.mac,p.seq,p.type,p.seq==snapshot.requestSeq?ACK_OK:ACK_BUSY);
+    } else if(calibration.active) {
+      sendAck(message.mac,p.seq,p.type,ACK_BUSY);
     } else {
-      const bool ready=framePixels && frameNumber;
+      const bool ready=framePixels && frameNumber && startSnapshot(p.seq);
       sendAck(message.mac,p.seq,p.type,ready?ACK_OK:ACK_BUSY);
-      if(ready) startSnapshot(p.seq);
     }
   } else if(p.type==ANALYSIS_REQUEST) {
     uint32_t id=0;if(p.length==sizeof(id)) memcpy(&id,p.payload,sizeof(id));
@@ -886,9 +945,9 @@ void handleRadio(const Received &message) {
     value.id=id;value.revision=configRevision;value.frame=frameNumber;
     value.scorePermille=score;value.thresholdPermille=cells[index].config.thresholdPermille;
     value.referenceEdges=cells[index].reference.edges;value.liveEdges=live.edges;
-    value.peakCount=cells[index].reference.peakCount;
+    value.peakCount=cells[index].reference.textured?FIXED_DIRECTIONS:0;
     for(uint8_t peak=0;peak<value.peakCount;++peak)
-      value.lineAngleTenths[peak]=(uint16_t)lroundf(fmodf(cells[index].reference.peakAngle[peak]+90.0f,180.0f)*10.0f);
+      value.lineAngleTenths[peak]=peak*150;
     memcpy(value.referenceBuckets,cells[index].referenceBuckets,sizeof(value.referenceBuckets));
     memcpy(value.liveBuckets,liveBuckets,sizeof(value.liveBuckets));
     transmit(bridgeMac,CELL_ANALYSIS,p.seq,&value,sizeof(value));
@@ -896,7 +955,7 @@ void handleRadio(const Received &message) {
     CalibrationRequestPayload value={};
     if(p.length!=sizeof(value)) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
     memcpy(&value,p.payload,sizeof(value));
-    if(!configured || snapshot.active || value.revision!=configRevision+1) { sendAck(message.mac,p.seq,p.type,ACK_BAD_ORDER);return; }
+    if(!configured || snapshot.active || calibration.active || value.revision!=configRevision+1) { sendAck(message.mac,p.seq,p.type,ACK_BAD_ORDER);return; }
     sendAck(message.mac,p.seq,p.type,ACK_OK);
     autoCalibrate(value);
   }
@@ -924,10 +983,10 @@ void printInfo() {
     (unsigned long)captureFailures,stateCount);
   for(uint16_t i=0;i<cellCount;++i) {
     const CellRuntime &c=cells[i];
-    DEBUGF("[%u] id=%lu group=%lu (%u,%u) r=%u %s angle0=%.1f angles=%u score=%u state=%u\n",
+    DEBUGF("[%u] id=%lu group=%lu (%u,%u) r=%u %s directions=%u score=%u state=%u\n",
       i,(unsigned long)c.config.id,(unsigned long)c.config.groupId,c.config.x,c.config.y,
-      c.config.radius,c.config.shape?"square":"circle",c.reference.peakAngle[0],
-      c.reference.peakCount,c.scorePermille,c.state);
+      c.config.radius,c.config.shape?"square":"circle",
+      c.reference.textured?FIXED_DIRECTIONS:0,c.scorePermille,c.state);
   }
 #endif
 }
@@ -990,12 +1049,13 @@ void handleSerialLine(char *line) {
   } else if(strcmp(command,"A")==0) DEBUGF("commit status=%u\n",commitConfig(stagingRevision));
   else if(strcmp(command,"R")==0) DEBUGLN(configured && captureBaseline()?"baseline OK":"baseline failed");
   else if(strcmp(command,"F")==0) serialSnapshot();
-  else if(strcmp(command,"X")==0) {
+  else if(strcmp(command,"X")==0 && !calibration.active) {
     cellCount=groupCount=0;baselineReady=configured=stagingOpen=false;
     stateHead=stateCount=0;DEBUGLN("configuration cleared from RAM");
-  } else if(strcmp(command,"Z")==0) {
+  } else if(strcmp(command,"X")==0) DEBUGLN("configuration busy sending calibration results");
+  else if(strcmp(command,"Z")==0) {
     char *confirmation=strtok(nullptr," \t");
-    if(!confirmation || strcmp(confirmation,"FORMAT")!=0 || snapshot.active || stagingOpen) {
+    if(!confirmation || strcmp(confirmation,"FORMAT")!=0 || snapshot.active || calibration.active || stagingOpen) {
       DEBUGLN("Z FORMAT required; camera must be idle");
     } else {
       LittleFS.end();storageReady=false;
@@ -1075,6 +1135,7 @@ void loop() {
   Received message;
   for(int n=0;n<16 && xQueueReceive(inbox,&message,0)==pdTRUE;++n) handleRadio(message);
   serviceSnapshot();
+  serviceCalibration();
   serviceDiagnostics();
   // Submit state first. ESP-NOW continues radio work while the next frame is
   // captured; optional score diagnostics never delay capture.
@@ -1082,7 +1143,7 @@ void loop() {
   if(cameraReady && !snapshot.active) {
     if(captureFrame()) {
       detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
-      if(baselineReady) detector.analyseAllCells();
+      if(baselineReady) { detector.analyseAllCells();++analysisCount; }
     }
   }
   sendStateBitmap();sendScores();

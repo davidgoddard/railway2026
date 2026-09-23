@@ -11,10 +11,16 @@ class OccupancyDetector {
             uint16_t groupCount, StateCallback callback) {
     pixels_=pixels; width_=width; height_=height; cells_=cells;
     cellCount_=cellCount; groups_=groups; groupCount_=groupCount; callback_=callback;
+    if(workSignature_ && workSignature_!=configurationSignature()) releaseWorkMap();
   }
   void begin() {
-    for(int degree=0;degree<=20;++degree)
-      tanQ8[degree]=(uint16_t)lroundf(tanf(degree*0.01745329252f)*256);
+    for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+      const float radians=(direction*15.0f+90.0f)*0.01745329252f;
+      directionX_[direction]=(int16_t)lroundf(cosf(radians)*256);
+      directionY_[direction]=(int16_t)lroundf(sinf(radians)*256);
+      classifierX_[direction]=(int16_t)lroundf(cosf(radians)*16384);
+      classifierY_[direction]=(int16_t)lroundf(sinf(radians)*16384);
+    }
   }
   void calibrateCell(CellRuntime &cell);
   void analyseAllCells();
@@ -25,7 +31,15 @@ class OccupancyDetector {
   CellRuntime *cells_=nullptr;
   GroupRuntime *groups_=nullptr;
   StateCallback callback_=nullptr;
-  uint16_t tanQ8[21]={};
+  struct WorkPixel { uint16_t x,y;uint32_t firstMember; };
+  WorkPixel *workPixels_=nullptr;
+  uint16_t *workMembers_=nullptr;
+  Feature *liveFeatures_=nullptr;
+  uint16_t *liveBuckets_=nullptr;
+  uint16_t *liveCutoffs_=nullptr;
+  uint32_t workPixelCount_=0,workMemberCount_=0,workSignature_=0;
+  int16_t directionX_[FIXED_DIRECTIONS]={},directionY_[FIXED_DIRECTIONS]={};
+  int16_t classifierX_[FIXED_DIRECTIONS]={},classifierY_[FIXED_DIRECTIONS]={};
   uint32_t analysisNumber_=0;
   void emit(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
     if(callback_) callback_(id,grouped,state,score);
@@ -33,25 +47,27 @@ class OccupancyDetector {
   void gradientAt(const uint8_t *pixels,int p,int &gx,int &gy);
   bool insideCell(const CellConfig &c,int x,int y);
   void bounds(const CellConfig &c,int &x0,int &x1,int &y0,int &y1);
-  uint8_t directionBucket(const CellRuntime &cell,int gx,int gy);
+  uint8_t directionBucket(int gx,int gy);
   uint8_t spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y);
   Feature analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
                   int offsetX=0,int offsetY=0);
-  float histogramDistance(const Feature &a,const Feature &b);
   float projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets);
   uint16_t compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets);
   void updateGroups();
+  uint32_t configurationSignature() const;
+  bool prepareWorkMap();
+  void releaseWorkMap();
 };
 
 void OccupancyDetector::gradientAt(const uint8_t *pixels,int p,int &gx,int &gy) {
   // 3x3 Scharr is more rotationally consistent than Sobel for these small
   // cells. Its coefficients produce four times Sobel's response, so return
   // a rounded quarter-scale result to preserve configured contrast floors.
-  const int rawX=-3*pixels[p-width_-1]+3*pixels[p-width_+1]
-                 -10*pixels[p-1]+10*pixels[p+1]
-                 -3*pixels[p+width_-1]+3*pixels[p+width_+1];
-  const int rawY=-3*pixels[p-width_-1]-10*pixels[p-width_]-3*pixels[p-width_+1]
-                 +3*pixels[p+width_-1]+10*pixels[p+width_]+3*pixels[p+width_+1];
+  const int a=pixels[p-width_-1],b=pixels[p-width_],c=pixels[p-width_+1];
+  const int d=pixels[p-1],f=pixels[p+1];
+  const int g=pixels[p+width_-1],h=pixels[p+width_],i=pixels[p+width_+1];
+  const int rawX=3*((c-a)+(i-g))+10*(f-d);
+  const int rawY=3*((g-a)+(i-c))+10*(h-b);
   gx=rawX<0?-((-rawX+2)/4):(rawX+2)/4;
   gy=rawY<0?-((-rawY+2)/4):(rawY+2)/4;
 }
@@ -65,19 +81,21 @@ void OccupancyDetector::bounds(const CellConfig &c,int &x0,int &x1,int &y0,int &
   x0=max(1,(int)c.x-c.radius);x1=min((int)width_-2,(int)c.x+c.radius);
   y0=max(1,(int)c.y-c.radius);y1=min((int)height_-2,(int)c.y+c.radius);
 }
-uint8_t OccupancyDetector::directionBucket(const CellRuntime &cell,int gx,int gy) {
-  (void)cell;
-  float angle=atan2f((float)gy,(float)gx)*57.2957795f+90.0f;
-  if(angle<0) angle+=180;
-  if(angle>=180) angle-=180;
-  angle+=7.5f;if(angle>=180) angle-=180;
-  return min((int)(angle/15.0f),(int)FIXED_DIRECTIONS-1);
+uint8_t OccupancyDetector::directionBucket(int gx,int gy) {
+  uint8_t best=0;
+  int32_t bestProjection=-1;
+  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+    int32_t projection=(int32_t)gx*classifierX_[direction]+(int32_t)gy*classifierY_[direction];
+    if(projection<0) projection=-projection;
+    if(projection>bestProjection) { bestProjection=projection;best=direction; }
+  }
+  return best;
 }
 uint8_t OccupancyDetector::spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y) {
   // directionX/Y is the edge normal. Project the sample position onto it,
   // then retain only three broad bands to avoid exact pixel matching.
-  const int32_t rhoQ8=(x-(int)cell.config.x)*cell.directionX[peak]
-                    +(y-(int)cell.config.y)*cell.directionY[peak];
+  const int32_t rhoQ8=(x-(int)cell.config.x)*directionX_[peak]
+                    +(y-(int)cell.config.y)*directionY_[peak];
   const int32_t limitQ8=(int32_t)cell.config.radius*256/3;
   const uint8_t band=rhoQ8 < -limitQ8 ? 0 : rhoQ8 > limitQ8 ? 2 : 1;
   return peak*POSITION_BANDS+band;
@@ -94,8 +112,6 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
     const int p=sy*width_+sx;
     int gx,gy;gradientAt(pixels_,p,gx,gy);
     const int magnitude=abs(gx)+abs(gy);
-    ++f.samples;f.graySum+=pixels_[p];
-    if(pixels_[p]>=250) ++f.whitePixels;
     f.maxGradient=max(f.maxGradient,(uint16_t)magnitude);
   }
   if(f.maxGradient<cell.config.contrastFloor) return f;
@@ -110,37 +126,11 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
     int gx,gy;gradientAt(pixels_,sy*width_+sx,gx,gy);
     if(abs(gx)+abs(gy)<minimum) continue;
     ++f.edges;
-    float angle=atan2f((float)gy,(float)gx)*57.2957795f;
-    if(angle<0) angle+=180;
-    if(angle>=180) angle-=180;
-    const int bin=min((int)(angle/5),BINS-1);
-    ++f.hist[bin];f.angleSum[bin]+=angle;
-    const uint8_t direction=directionBucket(cell,gx,gy);
+    const uint8_t direction=directionBucket(gx,gy);
     ++buckets[spatialBucket(cell,direction,x,y)];
   }
   f.textured=f.edges>=8;
-  if(referenceMode && f.textured) {
-    f.peakCount=FIXED_DIRECTIONS;
-    for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
-      const float physicalAngle=direction*15.0f;
-      f.peakAngle[direction]=fmodf(physicalAngle+90.0f,180.0f);
-      uint32_t count=0;
-      for(uint8_t band=0;band<POSITION_BANDS;++band)
-        count+=buckets[direction*POSITION_BANDS+band];
-      f.peakShare[direction]=(float)count/f.edges;
-    }
-  }
   return f;
-}
-float OccupancyDetector::histogramDistance(const Feature &a,const Feature &b) {
-  if(!a.edges || !b.edges) return 1;
-  float sum=0;
-  for(int i=0;i<BINS;++i) {
-    const int am=a.hist[(i+BINS-1)%BINS]+2*a.hist[i]+a.hist[(i+1)%BINS];
-    const int bm=b.hist[(i+BINS-1)%BINS]+2*b.hist[i]+b.hist[(i+1)%BINS];
-    sum+=fabsf((float)am/(4*a.edges)-(float)bm/(4*b.edges));
-  }
-  return min(1.0f,0.5f*sum);
 }
 float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
   if(!cell.reference.edges || !live.edges) return 1;
@@ -152,27 +142,22 @@ float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Featur
 }
 void OccupancyDetector::calibrateCell(CellRuntime &cell) {
   memset(cell.referenceBuckets,0,sizeof(cell.referenceBuckets));
-  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
-    const float physicalAngle=direction*15.0f;
-    const float gradientRadians=fmodf(physicalAngle+90.0f,180.0f)*0.01745329252f;
-    cell.directionX[direction]=(int16_t)lroundf(cosf(gradientRadians)*256);
-    cell.directionY[direction]=(int16_t)lroundf(sinf(gradientRadians)*256);
-  }
   cell.reference=analyse(cell,true,cell.referenceBuckets);
   cell.state=CLEAR;cell.enterCount=cell.clearCount=0;cell.scorePermille=0;
   DEBUGF("base id=%lu group=%lu centre=(%u,%u) r=%u edges=%u angles=%u",
     (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
-    cell.config.x,cell.config.y,cell.config.radius,cell.reference.edges,cell.reference.peakCount);
+    cell.config.x,cell.config.y,cell.config.radius,cell.reference.edges,
+    cell.reference.textured?FIXED_DIRECTIONS:0);
 #if CAMERA_DEBUG_SERIAL
-  for(int i=0;i<cell.reference.peakCount;++i) DEBUGF(" %.1fdeg",cell.reference.peakAngle[i]);
+  for(int i=0;i<(cell.reference.textured?FIXED_DIRECTIONS:0);++i) DEBUGF(" %ddeg",i*15);
   DEBUGF("\n");
 #endif
 }
 
 uint16_t OccupancyDetector::compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
-  // Angle histograms from fewer than 16 edges are too sparse to compare reliably.
-  // Treat a weak, unoriented reference as clear until the live patch has real detail.
-  if(!cell.reference.peakCount && cell.reference.edges<16 && live.edges<16) return 0;
+  // Direction buckets from very few edges are too sparse to compare reliably.
+  // Treat a weak reference as clear until the live patch has real detail.
+  if(!cell.reference.textured && cell.reference.edges<16 && live.edges<16) return 0;
   float score=0;
   if(!cell.reference.textured && !live.textured) score=0;
   else if(cell.reference.textured!=live.textured) score=1;
@@ -204,6 +189,96 @@ uint16_t OccupancyDetector::inspectCell(CellRuntime &cell,Feature &live,uint16_t
   }
   return score;
 }
+
+uint32_t OccupancyDetector::configurationSignature() const {
+  uint32_t hash=2166136261UL;
+  const uint16_t dimensions[]={width_,height_,cellCount_};
+  const uint8_t *dimensionBytes=(const uint8_t *)dimensions;
+  for(size_t i=0;i<sizeof(dimensions);++i)
+    hash=(hash^dimensionBytes[i])*16777619UL;
+  for(uint16_t cell=0;cell<cellCount_;++cell) {
+    const uint8_t *bytes=(const uint8_t *)&cells_[cell].config;
+    for(size_t i=0;i<sizeof(CellConfig);++i) hash=(hash^bytes[i])*16777619UL;
+  }
+  return hash?hash:1;
+}
+
+void OccupancyDetector::releaseWorkMap() {
+  free(workPixels_);free(workMembers_);free(liveFeatures_);free(liveBuckets_);free(liveCutoffs_);
+  workPixels_=nullptr;workMembers_=nullptr;liveFeatures_=nullptr;liveBuckets_=nullptr;liveCutoffs_=nullptr;
+  workPixelCount_=workMemberCount_=workSignature_=0;
+}
+
+bool OccupancyDetector::prepareWorkMap() {
+  const uint32_t signature=configurationSignature();
+  if(workSignature_==signature) return true;
+  releaseWorkMap();
+  if(!cellCount_) { workSignature_=signature;return true; }
+
+  const size_t frameSize=(size_t)width_*height_;
+  uint8_t *mask=(uint8_t *)ps_malloc(frameSize);
+  if(!mask) return false;
+  memset(mask,0,frameSize);
+
+  uint32_t uniquePixels=0,totalMembers=0;
+  for(uint16_t cell=0;cell<cellCount_;++cell) {
+    int x0,x1,y0,y1;bounds(cells_[cell].config,x0,x1,y0,y1);
+    for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
+      if(!insideCell(cells_[cell].config,x,y)) continue;
+      const uint32_t pixel=(uint32_t)y*width_+x;
+      if(!mask[pixel]) { mask[pixel]=1;++uniquePixels; }
+      ++totalMembers;
+    }
+  }
+
+  workPixels_=(WorkPixel *)ps_malloc((size_t)uniquePixels*sizeof(WorkPixel));
+  workMembers_=(uint16_t *)ps_malloc((size_t)totalMembers*sizeof(uint16_t));
+  liveFeatures_=(Feature *)ps_malloc((size_t)cellCount_*sizeof(Feature));
+  liveBuckets_=(uint16_t *)ps_malloc((size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
+  liveCutoffs_=(uint16_t *)ps_malloc((size_t)cellCount_*sizeof(uint16_t));
+  if((uniquePixels && !workPixels_) ||
+     (totalMembers && !workMembers_) || !liveFeatures_ || !liveBuckets_ || !liveCutoffs_) {
+    free(mask);releaseWorkMap();return false;
+  }
+  uint32_t nextPixel=0;
+  for(uint32_t pixel=0;pixel<frameSize;++pixel) if(mask[pixel]) {
+    workPixels_[nextPixel].x=pixel%width_;workPixels_[nextPixel].y=pixel/width_;
+    workPixels_[nextPixel].firstMember=0;
+    ++nextPixel;
+  }
+  free(mask);
+  auto findPixel=[&](uint32_t pixel) {
+    uint32_t low=0,high=uniquePixels;
+    while(low<high) {
+      const uint32_t middle=low+(high-low)/2;
+      const uint32_t middlePixel=(uint32_t)workPixels_[middle].y*width_+workPixels_[middle].x;
+      if(middlePixel<pixel) low=middle+1;else high=middle;
+    }
+    return low;
+  };
+  for(uint16_t cell=0;cell<cellCount_;++cell) {
+    int x0,x1,y0,y1;bounds(cells_[cell].config,x0,x1,y0,y1);
+    for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x)
+      if(insideCell(cells_[cell].config,x,y))
+        ++workPixels_[findPixel((uint32_t)y*width_+x)].firstMember;
+  }
+  uint32_t nextMember=0;
+  for(uint32_t pixel=0;pixel<uniquePixels;++pixel) {
+    nextMember+=workPixels_[pixel].firstMember;
+    workPixels_[pixel].firstMember=nextMember;
+  }
+  for(uint16_t cell=0;cell<cellCount_;++cell) {
+    int x0,x1,y0,y1;bounds(cells_[cell].config,x0,x1,y0,y1);
+    for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
+      if(!insideCell(cells_[cell].config,x,y)) continue;
+      const uint32_t index=findPixel((uint32_t)y*width_+x);
+      workMembers_[--workPixels_[index].firstMember]=cell;
+    }
+  }
+  workPixelCount_=uniquePixels;workMemberCount_=totalMembers;workSignature_=signature;
+  return true;
+}
+
 void OccupancyDetector::updateGroups() {
   for(uint16_t g=0;g<groupCount_;++g) {
     bool occupied=false,unknown=false;
@@ -246,10 +321,44 @@ void OccupancyDetector::analyseAllCells() {
     updateGroups();
     return;
   }
+  const bool sharedPass=prepareWorkMap();
+  if(sharedPass && cellCount_) {
+    memset(liveFeatures_,0,(size_t)cellCount_*sizeof(Feature));
+    memset(liveBuckets_,0,(size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
+    uint16_t lowestCutoff=UINT16_MAX;
+    for(uint16_t cell=0;cell<cellCount_;++cell) {
+      liveCutoffs_[cell]=(uint16_t)max((int)cells_[cell].config.contrastFloor,
+        (int)cells_[cell].reference.maxGradient/5);
+      lowestCutoff=min(lowestCutoff,liveCutoffs_[cell]);
+    }
+    for(uint32_t work=0;work<workPixelCount_;++work) {
+      const WorkPixel &item=workPixels_[work];
+      int gx,gy;gradientAt(pixels_,(uint32_t)item.y*width_+item.x,gx,gy);
+      const uint16_t magnitude=(uint16_t)(abs(gx)+abs(gy));
+      const bool possiblyAnEdge=magnitude>=lowestCutoff;
+      const uint8_t direction=possiblyAnEdge?directionBucket(gx,gy):0;
+      const uint32_t memberEnd=work+1<workPixelCount_
+        ? workPixels_[work+1].firstMember : workMemberCount_;
+      for(uint32_t member=item.firstMember;member<memberEnd;++member) {
+        const uint16_t cellIndex=workMembers_[member];
+        CellRuntime &cell=cells_[cellIndex];Feature &live=liveFeatures_[cellIndex];
+        live.maxGradient=max(live.maxGradient,magnitude);
+        if(!possiblyAnEdge || magnitude<liveCutoffs_[cellIndex]) continue;
+        ++live.edges;
+        ++liveBuckets_[(size_t)cellIndex*SPATIAL_BUCKETS+
+          spatialBucket(cell,direction,item.x,item.y)];
+      }
+    }
+    for(uint16_t cell=0;cell<cellCount_;++cell)
+      liveFeatures_[cell].textured=liveFeatures_[cell].edges>=8;
+  }
+
   for(uint16_t i=0;i<cellCount_;++i) {
     CellRuntime &cell=cells_[i];
-    uint16_t buckets[SPATIAL_BUCKETS]={};
-    const Feature live=analyse(cell,false,buckets);
+    uint16_t fallbackBuckets[SPATIAL_BUCKETS]={};
+    const Feature live=sharedPass?liveFeatures_[i]:analyse(cell,false,fallbackBuckets);
+    const uint16_t *buckets=sharedPass
+      ? liveBuckets_+(size_t)i*SPATIAL_BUCKETS : fallbackBuckets;
     cell.scorePermille=compareCell(cell,live,buckets);
     // A one-pixel image shift can replace several edge samples in a small
     // cell. Search neighbouring image positions only when the current score
@@ -282,7 +391,7 @@ void OccupancyDetector::analyseAllCells() {
       DEBUGF("trigger id=%lu group=%lu %s score=%u angles=%u edges=%u/%u max=%u/%u\n",
         (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
         cell.state==OCCUPIED?"occupied":"clear",cell.scorePermille,
-        cell.reference.peakCount,live.edges,cell.reference.edges,
+        cell.reference.textured?FIXED_DIRECTIONS:0,live.edges,cell.reference.edges,
         live.maxGradient,cell.reference.maxGradient);
       emit(cell.config.id,false,cell.state,cell.scorePermille);
     }

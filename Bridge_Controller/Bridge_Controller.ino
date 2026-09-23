@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.16"
+#define BRIDGE_VERSION "0.1.17"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -71,6 +71,7 @@ struct Camera {
   bool used=false,seen=false,upload=false;
   uint8_t mac[6]={};
   uint32_t revision=0,remoteRevision=0,lastSeen=0,lastHelloSeq=0,lastStateSeq=0;
+  uint32_t revisionMismatchAt=0;
   uint16_t count=0,received=0;
   CameraSettings settings={};
   Cell *cells=nullptr;
@@ -287,13 +288,15 @@ bool save(Camera &c) {
   LittleFS.remove(backup);return true;
 }
 bool saveStaged(Camera &c) {
+  uint8_t *nextStates=(uint8_t *)malloc(c.stagedCount?c.stagedCount:1);
+  uint8_t *nextCellStates=(uint8_t *)malloc(c.stagedCount?c.stagedCount:1);
+  if(!nextStates || !nextCellStates) { free(nextStates);free(nextCellStates);return false; }
+  memset(nextStates,UNKNOWN,c.stagedCount);memset(nextCellStates,UNKNOWN,c.stagedCount);
   Cell *oldCells=c.cells;uint16_t oldCount=c.count;uint32_t oldRevision=c.revision;CameraSettings oldSettings=c.settings;
   c.cells=c.staged;c.count=c.stagedCount;c.revision=c.stagedRevision;c.settings=c.stagedSettings;
   if(save(c)) {
-    free(c.states);c.states=(uint8_t *)malloc(c.count?c.count:1);
-    if(c.states) memset(c.states,UNKNOWN,c.count);
-    free(c.cellStates);c.cellStates=(uint8_t *)malloc(c.count?c.count:1);
-    if(c.cellStates) memset(c.cellStates,UNKNOWN,c.count);
+    free(c.states);c.states=nextStates;
+    free(c.cellStates);c.cellStates=nextCellStates;
     for(uint16_t i=0;i<oldCount;++i) {
       uint32_t id=oldCells[i].group?oldCells[i].group:oldCells[i].id;
       bool earlier=false,still=false;
@@ -303,7 +306,8 @@ bool saveStaged(Camera &c) {
     }
     free(oldCells);c.staged=nullptr;return true;
   }
-  c.cells=oldCells;c.count=oldCount;c.revision=oldRevision;c.settings=oldSettings;return false;
+  c.cells=oldCells;c.count=oldCount;c.revision=oldRevision;c.settings=oldSettings;
+  free(nextStates);free(nextCellStates);return false;
 }
 bool load(Camera &c,const String &path) {
   File f=LittleFS.open(path,"r");if(!f) return false;
@@ -322,9 +326,12 @@ bool load(Camera &c,const String &path) {
     }
     free(old);f.close();
     if(!ok) { free(items);return false; }
+    uint8_t *states=(uint8_t *)malloc(h.count?h.count:1);
+    uint8_t *cellStates=(uint8_t *)malloc(h.count?h.count:1);
+    if(!states || !cellStates) { free(states);free(cellStates);free(items);return false; }
+    memset(states,UNKNOWN,h.count);memset(cellStates,UNKNOWN,h.count);
     c.cells=items;c.count=h.count;c.revision=h.revision;c.lastAutoSizeRevision=h.revision;c.settings=h.settings;
-    c.states=(uint8_t *)malloc(h.count?h.count:1);if(c.states) memset(c.states,UNKNOWN,h.count);
-    c.cellStates=(uint8_t *)malloc(h.count?h.count:1);if(c.cellStates) memset(c.cellStates,UNKNOWN,h.count);
+    c.states=states;c.cellStates=cellStates;
     save(c);return true;
   }
   FileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.magic==0x52434632 &&
@@ -334,10 +341,14 @@ bool load(Camera &c,const String &path) {
     ok=items && f.read((uint8_t *)items,h.count*sizeof(Cell))==h.count*sizeof(Cell) &&
       ~crcStep(0xFFFFFFFF,(uint8_t *)items,h.count*sizeof(Cell))==h.crc;
     if(ok) { for(uint16_t i=0;i<h.count;++i) if(!validCell(items[i],h.settings)) ok=false; }
-    if(ok) { c.cells=items;c.count=h.count;c.revision=h.revision;c.lastAutoSizeRevision=h.lastAutoSizeRevision;c.settings=h.settings;
-      c.states=(uint8_t *)malloc(h.count?h.count:1);if(c.states) memset(c.states,UNKNOWN,h.count);
-      c.cellStates=(uint8_t *)malloc(h.count?h.count:1);if(c.cellStates) memset(c.cellStates,UNKNOWN,h.count); }
-    else free(items);
+    uint8_t *states=ok?(uint8_t *)malloc(h.count?h.count:1):nullptr;
+    uint8_t *cellStates=ok?(uint8_t *)malloc(h.count?h.count:1):nullptr;
+    if(ok && (!states || !cellStates)) ok=false;
+    if(ok) {
+      memset(states,UNKNOWN,h.count);memset(cellStates,UNKNOWN,h.count);
+      c.cells=items;c.count=h.count;c.revision=h.revision;c.lastAutoSizeRevision=h.lastAutoSizeRevision;c.settings=h.settings;
+      c.states=states;c.cellStates=cellStates;
+    } else { free(items);free(states);free(cellStates); }
   }
   f.close();return ok;
 }
@@ -357,6 +368,18 @@ void nextUpload(Camera &c) {
   recordDiagnostic("UPLOAD_SEND",mac,detail);
 }
 void startUpload(Camera &c) { c.phase=1;c.uploadIndex=0;c.pendingType=0;c.baseline=false;allUnknown(c);nextUpload(c); }
+void reconcileRevision(Camera &c,uint32_t remoteRevision) {
+  if(remoteRevision==c.revision) { c.revisionMismatchAt=0;return; }
+  if(!c.cells || c.phase) return;
+  if(c.calibrationRevision==remoteRevision) return;
+  if(!c.revisionMismatchAt) c.revisionMismatchAt=millis();
+  // Auto-calibration advances the camera by exactly one revision and its
+  // reliable result stream follows the first status packet. Give that stream
+  // time to arrive before treating the mismatch as stale configuration.
+  const bool possibleCalibration=remoteRevision==c.revision+1 &&
+    millis()-c.revisionMismatchAt<5000;
+  if(!possibleCalibration) startUpload(c);
+}
 void onReceive(const esp_now_recv_info_t *info,const uint8_t *data,int length) {
   if(!info || !inbox || length<(int)offsetof(Packet,payload) || length>(int)sizeof(Packet)) return;
   Received r={};memcpy(r.mac,info->src_addr,6);memcpy(&r.packet,data,length);
@@ -448,7 +471,7 @@ void handleRadio(const Received &r) {
     // If a command is already waiting, put it directly behind the prompt while
     // the scanning camera is still dwelling on this channel.
     if(c->pendingType) sendPacket(c->mac,c->pending);
-    if(c->cells && !c->phase && h.revision!=c->revision) startUpload(*c);
+    reconcileRevision(*c,h.revision);
     return;
   }
   if(!c || !c->seen) return;
@@ -497,7 +520,7 @@ void handleRadio(const Received &r) {
     StateBitmapMessage bitmap={};memcpy(&bitmap,p.payload,p.length);
     const size_t expected=offsetof(StateBitmapMessage,states)+(bitmap.count*2+7)/8;
     if(bitmap.encoding!=1 || bitmap.count!=c->count || bitmap.revision!=c->revision ||
-       p.length!=expected || !c->cells || !c->baseline ||
+       p.length!=expected || !c->cells || !c->states || !c->cellStates || !c->baseline ||
        (c->lastStateSeq && (int32_t)(p.seq-c->lastStateSeq)<=0)) return;
     for(uint16_t i=0;i<bitmap.count;++i) if(((bitmap.states[i/4]>>((i%4)*2))&3)>OCCUPIED) return;
     c->lastStateSeq=p.seq;
@@ -547,7 +570,7 @@ void handleRadio(const Received &r) {
     publish("/cameras/"+String(mac)+"/health",String("{\"revision\":")+h.revision+",\"frame\":"+h.frame+",\"age_ms\":"+h.age+",\"baseline\":"+(h.baseline?"true":"false")+"}");
     if(c->baseline && !h.baseline && c->cells) allUnknown(*c);
     c->baseline=h.baseline;
-    if(c->cells && h.revision!=c->revision && !c->phase) startUpload(*c);
+    reconcileRevision(*c,h.revision);
   } else if(p.type==CELL_ANALYSIS && p.length==sizeof(AnalysisMessage)) {
     AnalysisMessage a;memcpy(&a,p.payload,sizeof(a));
     if(!c->baseline || a.revision!=c->revision || a.peakCount>12 || cellIndex(*c,a.id)<0) return;
@@ -561,6 +584,13 @@ void handleRadio(const Received &r) {
     for(int i=0;i<37;++i) Serial.printf("%s%u",i?",":"",a.liveBuckets[i]);Serial.println();
   } else if(p.type==CALIBRATION_RESULT && p.length==sizeof(CalibrationResult)) {
     CalibrationResult value;memcpy(&value,p.payload,sizeof(value));
+    // A repeated result after a lost final ACK is safe once this revision has
+    // already been persisted. Acknowledge it without rebuilding staging.
+    if(value.revision==c->revision && value.count==c->count && value.index<c->count &&
+       c->cells && c->cells[value.index].id==value.id) {
+      Packet ack=makePacket(CALIBRATION_ACK,p.seq,&value.revision,sizeof(value.revision));
+      sendPacket(c->mac,ack);return;
+    }
     if(value.count!=c->count || value.index>=c->count || value.revision!=c->revision+1 ||
        value.radius<3 || value.radius>50 || value.threshold<50 || value.threshold>1000 ||
        c->cells[value.index].id!=value.id) return;
@@ -572,23 +602,31 @@ void handleRadio(const Received &r) {
       c->calibrationRevision=value.revision;c->calibrationReceived=0;memset(c->calibrationSeen,0,sizeof(c->calibrationSeen));
     }
     const uint8_t mask=(uint8_t)(1u<<(value.index&7));
-    if(c->calibrationSeen[value.index>>3]&mask) return;
-    c->calibrationSeen[value.index>>3]|=mask;
-    c->staged[value.index].radius=value.radius;c->staged[value.index].threshold=value.threshold;
-    ++c->calibrationReceived;
+    const bool duplicate=c->calibrationSeen[value.index>>3]&mask;
+    if(!duplicate) {
+      c->calibrationSeen[value.index>>3]|=mask;
+      c->staged[value.index].radius=value.radius;c->staged[value.index].threshold=value.threshold;
+      ++c->calibrationReceived;
+    }
     char mac[18];macText(c->mac,mac);
-    Serial.printf("EVENT CALIBRATION_SENSOR %s %lu %u %u %u %u %u %u\n",mac,
-      (unsigned long)value.id,value.radius,value.threshold,value.clearMaximum,
-      value.referenceEdges,value.samples,value.confidence);
+    if(!duplicate) Serial.printf("EVENT CALIBRATION_SENSOR %s %lu %u %u %u %u %u %u\n",mac,
+        (unsigned long)value.id,value.radius,value.threshold,value.clearMaximum,
+        value.referenceEdges,value.samples,value.confidence);
+    bool persisted=false;
     if(c->calibrationReceived==c->count) {
       c->received=c->stagedCount;
       const uint32_t previousAutoSizeRevision=c->lastAutoSizeRevision;
       c->lastAutoSizeRevision=c->stagedRevision;
       if(saveStaged(*c)) {
-        c->remoteRevision=c->revision;c->baseline=true;c->calibrationRevision=0;c->calibrationReceived=0;
+        c->remoteRevision=c->revision;c->baseline=true;c->revisionMismatchAt=0;
+        c->calibrationRevision=0;c->calibrationReceived=0;
         Serial.printf("EVENT CALIBRATION_APPLIED %s %lu %u\n",mac,(unsigned long)c->revision,c->count);
-        Packet ack=makePacket(CALIBRATION_ACK,p.seq,&c->revision,sizeof(c->revision));sendPacket(c->mac,ack);
+        persisted=true;
       } else { c->lastAutoSizeRevision=previousAutoSizeRevision;Serial.printf("EVENT CALIBRATION_ERROR %s storage\n",mac); }
+    }
+    if(c->calibrationReceived<c->count || persisted) {
+      Packet ack=makePacket(CALIBRATION_ACK,p.seq,&value.revision,sizeof(value.revision));
+      sendPacket(c->mac,ack);
     }
   } else if(p.type>=SNAPSHOT_BEGIN && p.type<=SNAPSHOT_END) handleSnapshot(*c,p);
 }
@@ -910,6 +948,7 @@ void setup() {
   if(ssid.length()) WiFi.begin(ssid.c_str(),password.c_str());
   else esp_wifi_set_channel(START_CHANNEL,WIFI_SECOND_CHAN_NONE);
   inbox=xQueueCreate(32,sizeof(Received));
+  if(!inbox) { Serial.println("ERR esp_now queue_allocation");return; }
   if(esp_now_init()!=ESP_OK) Serial.println("ERR esp_now init");
   else esp_now_register_recv_cb(onReceive);
   if(WiFi.status()==WL_CONNECTED) radioChannel=WiFi.channel();
@@ -919,7 +958,9 @@ void setup() {
   Serial.printf("READY bridge %s channel=%u\n",BRIDGE_VERSION,radioChannel);
 }
 void loop() {
-  serviceSerial();Received r;
+  serviceSerial();
+  if(!inbox) { delay(100);return; }
+  Received r;
   for(int i=0;i<32 && xQueueReceive(inbox,&r,0)==pdTRUE;++i) handleRadio(r);
   uint32_t now=millis();
   for(auto &c:cameras) if(c.used) {
