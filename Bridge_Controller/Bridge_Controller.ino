@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.17"
+#define BRIDGE_VERSION "0.1.18"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -10,27 +10,25 @@
 #include <esp_partition.h>
 #include <stddef.h>
 
-// Keep these packed declarations in step with Camera_Module.ino protocol v1.
+// Keep these packed declarations in step with Camera_Module.ino protocol v2.
 constexpr uint16_t MAGIC=0x5243;
-constexpr uint8_t VERSION=1, START_CHANNEL=1, MAX_CAMERAS=8; // Conservative ESP32-C3 RAM budget.
+constexpr uint8_t VERSION=2, START_CHANNEL=1, MAX_CAMERAS=8; // Conservative ESP32-C3 RAM budget.
 constexpr uint16_t MAX_CELLS=300;
 constexpr size_t PAYLOAD=200;
 constexpr uint32_t ACK_TIMEOUT=1500, CAMERA_TIMEOUT=15000;
 const uint8_t BROADCAST[6]={255,255,255,255,255,255};
 enum Type:uint8_t { HELLO=1,CONFIG_BEGIN=2,CONFIG_CELL=3,CONFIG_COMMIT=4,
-  CAPTURE_BASELINE=5,SNAPSHOT_REQUEST=6,ACK=7,STATE=8,HEALTH=9,
+  CAPTURE_BASELINE=5,SNAPSHOT_REQUEST=6,ACK=7,HEALTH=9,
   SNAPSHOT_BEGIN=10,SNAPSHOT_CHUNK=11,SNAPSHOT_END=12,SNAPSHOT_ACK=13,DIAGNOSTIC=14,DIAGNOSTIC_ACK=15,HEALTH_ACK=16,
   ANALYSIS_REQUEST=17,CELL_ANALYSIS=18,CALIBRATE_REQUEST=19,CALIBRATION_RESULT=20,CALIBRATION_ACK=21,STATE_BITMAP=22,SCORE_BATCH=23 };
 enum CellState:uint8_t { UNKNOWN=0,CLEAR=1,OCCUPIED=2 };
 struct __attribute__((packed)) Packet { uint16_t magic; uint8_t version,type; uint32_t seq; uint16_t length; uint8_t payload[PAYLOAD]; };
 struct __attribute__((packed)) CameraSettings { uint8_t resolution; int8_t brightness,contrast,saturation; uint8_t vflip,hmirror; };
 struct __attribute__((packed)) Begin { uint32_t revision; uint16_t count; CameraSettings settings; };
-struct __attribute__((packed)) Cell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t tolerance,enter,clear; uint32_t createdRevision; };
+struct __attribute__((packed)) Cell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t enter,clear; uint32_t createdRevision; };
 struct __attribute__((packed)) CellMessage { uint16_t index; Cell cell; };
 struct __attribute__((packed)) HelloMessage { uint8_t mac[6]; uint32_t revision; uint16_t width,height,count; uint8_t channel,baseline; };
 struct __attribute__((packed)) AckMessage { uint8_t type,status; uint16_t detail; };
-struct __attribute__((packed)) StateMessage { uint32_t id,revision,frame; uint16_t score; uint8_t state,grouped; };
-struct __attribute__((packed)) StateRecord { uint32_t id;uint16_t score;uint8_t state,grouped; };
 constexpr uint16_t STATE_BITMAP_BYTES=(MAX_CELLS*2+7)/8;
 struct __attribute__((packed)) StateBitmapMessage {
   uint32_t revision,frame;uint16_t count;uint8_t encoding;uint8_t states[STATE_BITMAP_BYTES];
@@ -64,7 +62,8 @@ struct __attribute__((packed)) DiagnosticPayload {
 struct __attribute__((packed)) FileHeader { uint32_t magic,revision,lastAutoSizeRevision; uint16_t count; CameraSettings settings; uint32_t crc; };
 struct __attribute__((packed)) LegacyFileHeader { uint32_t magic,revision; uint16_t count; CameraSettings settings; uint32_t crc; };
 struct __attribute__((packed)) LegacyCell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t tolerance,enter,clear; };
-static_assert(sizeof(Packet)==210 && sizeof(Cell)==25 && sizeof(HealthMessage)==26,"wire layout mismatch");
+struct __attribute__((packed)) PreviousCell { uint32_t id,group; uint16_t x,y; uint8_t radius,shape; uint16_t floor,threshold; uint8_t tolerance,enter,clear; uint32_t createdRevision; };
+static_assert(sizeof(Packet)==210 && sizeof(Cell)==24 && sizeof(HealthMessage)==26,"wire layout mismatch");
 static_assert(sizeof(AnalysisMessage)<=PAYLOAD,"analysis wire layout");
 
 struct Camera {
@@ -259,7 +258,7 @@ bool validCell(const Cell &x,const CameraSettings &s) {
   const uint16_t w[]={320,640,800,1024},h[]={240,480,600,768};
   return s.resolution<4 && x.id && x.x<w[s.resolution] && x.y<h[s.resolution] &&
     x.radius>=3 && x.radius<=50 && x.shape<=1 && x.floor>=10 && x.floor<=500 &&
-    x.threshold>=50 && x.threshold<=1000 && x.tolerance<=20 && x.enter && x.clear;
+    x.threshold>=50 && x.threshold<=1000 && x.enter && x.clear;
 }
 bool validSettings(const CameraSettings &s) {
   return s.resolution<4 && s.brightness>=-2 && s.brightness<=2 && s.contrast>=-2 && s.contrast<=2 &&
@@ -277,7 +276,7 @@ bool blankStorage(const esp_partition_t *partition) {
 bool save(Camera &c) {
   String tmp=pathFor(c.mac)+".tmp",path=pathFor(c.mac);
   File f=LittleFS.open(tmp,"w");if(!f) return false;
-  FileHeader h={0x52434632,c.revision,c.lastAutoSizeRevision,c.count,c.settings,0};
+  FileHeader h={0x52434633,c.revision,c.lastAutoSizeRevision,c.count,c.settings,0};
   h.crc=~crcStep(0xFFFFFFFF,(const uint8_t *)c.cells,c.count*sizeof(Cell));
   bool ok=f.write((const uint8_t *)&h,sizeof(h))==sizeof(h) &&
     f.write((const uint8_t *)c.cells,c.count*sizeof(Cell))==c.count*sizeof(Cell);
@@ -321,7 +320,7 @@ bool load(Camera &c,const String &path) {
     Cell *items=ok?(Cell *)malloc((h.count?h.count:1)*sizeof(Cell)):nullptr;
     if(ok) ok=items;
     if(ok) for(uint16_t i=0;i<h.count;++i) {
-      const LegacyCell &x=old[i];items[i]={x.id,x.group,x.x,x.y,x.radius,x.shape,x.floor,x.threshold,x.tolerance,x.enter,x.clear,h.revision};
+      const LegacyCell &x=old[i];items[i]={x.id,x.group,x.x,x.y,x.radius,x.shape,x.floor,x.threshold,x.enter,x.clear,h.revision};
       if(!validCell(items[i],h.settings)) ok=false;
     }
     free(old);f.close();
@@ -334,7 +333,29 @@ bool load(Camera &c,const String &path) {
     c.states=states;c.cellStates=cellStates;
     save(c);return true;
   }
-  FileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.magic==0x52434632 &&
+  if(magic==0x52434632) {
+    FileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.count<=MAX_CELLS &&
+      validSettings(h.settings) && f.size()==sizeof(h)+h.count*sizeof(PreviousCell);
+    PreviousCell *old=ok?(PreviousCell *)malloc((h.count?h.count:1)*sizeof(PreviousCell)):nullptr;
+    if(ok) ok=old && f.read((uint8_t *)old,h.count*sizeof(PreviousCell))==h.count*sizeof(PreviousCell) &&
+      ~crcStep(0xFFFFFFFF,(uint8_t *)old,h.count*sizeof(PreviousCell))==h.crc;
+    Cell *items=ok?(Cell *)malloc((h.count?h.count:1)*sizeof(Cell)):nullptr;
+    if(ok) ok=items;
+    if(ok) for(uint16_t i=0;i<h.count;++i) {
+      const PreviousCell &x=old[i];items[i]={x.id,x.group,x.x,x.y,x.radius,x.shape,x.floor,x.threshold,x.enter,x.clear,x.createdRevision};
+      if(!validCell(items[i],h.settings)) ok=false;
+    }
+    free(old);f.close();
+    if(!ok) { free(items);return false; }
+    uint8_t *states=(uint8_t *)malloc(h.count?h.count:1);
+    uint8_t *cellStates=(uint8_t *)malloc(h.count?h.count:1);
+    if(!states || !cellStates) { free(states);free(cellStates);free(items);return false; }
+    memset(states,UNKNOWN,h.count);memset(cellStates,UNKNOWN,h.count);
+    c.cells=items;c.count=h.count;c.revision=h.revision;c.lastAutoSizeRevision=h.lastAutoSizeRevision;c.settings=h.settings;
+    c.states=states;c.cellStates=cellStates;
+    save(c);return true;
+  }
+  FileHeader h={};bool ok=f.read((uint8_t *)&h,sizeof(h))==sizeof(h) && h.magic==0x52434633 &&
     h.count<=MAX_CELLS && validSettings(h.settings) && f.size()==sizeof(h)+h.count*sizeof(Cell);
   if(ok) {
     Cell *items=(Cell *)malloc((h.count?h.count:1)*sizeof(Cell));
@@ -424,23 +445,6 @@ void handleSnapshot(Camera &c,const Packet &p) {
     recordDiagnostic("FRAME_END",mac,detail);
   }
 }
-void applyState(Camera &c,const StateRecord &s,uint32_t revision,uint32_t frame) {
-  const int index=c.cells && !s.grouped?cellIndex(c,s.id):-1;
-  if(!c.cells || !c.baseline || revision!=c.revision || s.state>OCCUPIED ||
-     (s.grouped?!isReported(c,s.id):index<0)) return;
-  char mac[18];macText(c.mac,mac);
-  if(!s.grouped) {
-    if(c.cellStates) c.cellStates[index]=s.state;
-    Serial.printf("EVENT CELL_STATE %s %lu %s %u %lu\n",mac,(unsigned long)s.id,
-      stateName(s.state),s.score,(unsigned long)frame);
-    if(c.cells[index].group) return;
-  }
-  if(c.states) for(uint16_t i=0;i<c.count;++i)
-    if((c.cells[i].group?c.cells[i].group:c.cells[i].id)==s.id) c.states[i]=s.state;
-  Serial.printf("EVENT STATE %s %lu %s %u %lu\n",mac,(unsigned long)s.id,
-    stateName(s.state),s.score,(unsigned long)frame);
-  publish(areaSuffix(s.id),stateName(s.state));
-}
 void handleRadio(const Received &r) {
   const Packet &p=r.packet;Camera *c=findCamera(r.mac);
   if(p.type==HELLO && p.length==sizeof(HelloMessage)) {
@@ -510,12 +514,6 @@ void handleRadio(const Received &r) {
     else if(c->phase==2) ++c->uploadIndex;
     else if(c->phase==3) { c->phase=0;c->remoteRevision=c->revision;char mac[18];macText(c->mac,mac);Serial.printf("EVENT CONFIG_APPLIED %s %lu\n",mac,(unsigned long)c->revision); }
     nextUpload(*c);
-  } else if(p.type==STATE && p.length==sizeof(StateMessage)) {
-    StateMessage s;memcpy(&s,p.payload,sizeof(s));
-    if(c->lastStateSeq && (int32_t)(p.seq-c->lastStateSeq)<=0) return;
-    c->lastStateSeq=p.seq;
-    const StateRecord record={s.id,s.score,s.state,s.grouped};
-    applyState(*c,record,s.revision,s.frame);
   } else if(p.type==STATE_BITMAP && p.length>=offsetof(StateBitmapMessage,states) && p.length<=sizeof(StateBitmapMessage)) {
     StateBitmapMessage bitmap={};memcpy(&bitmap,p.payload,p.length);
     const size_t expected=offsetof(StateBitmapMessage,states)+(bitmap.count*2+7)/8;
@@ -739,7 +737,7 @@ void command(char *input) {
   if(!c) { Serial.println("ERR CAMERA unknown");return; }
   if(!strcmp(cmd,"GET")) {
     char mac[18];macText(c->mac,mac);Serial.printf("CONFIG %s %lu %u %lu %u %d %d %d %u %u\n",mac,(unsigned long)c->revision,c->count,(unsigned long)c->lastAutoSizeRevision,c->settings.resolution,c->settings.brightness,c->settings.contrast,c->settings.saturation,c->settings.vflip,c->settings.hmirror);
-    for(uint16_t i=0;i<c->count;++i) { Cell &x=c->cells[i];Serial.printf("CELL %u %lu %lu %u %u %u %u %u %u %u %u %u %lu\n",i,(unsigned long)x.id,(unsigned long)x.group,x.x,x.y,x.radius,x.shape,x.floor,x.tolerance,x.threshold,x.enter,x.clear,(unsigned long)x.createdRevision); }
+    for(uint16_t i=0;i<c->count;++i) { Cell &x=c->cells[i];Serial.printf("CELL %u %lu %lu %u %u %u %u %u %u %u %u %lu\n",i,(unsigned long)x.id,(unsigned long)x.group,x.x,x.y,x.radius,x.shape,x.floor,x.threshold,x.enter,x.clear,(unsigned long)x.createdRevision); }
     for(uint16_t i=0;i<c->count;++i) {
       uint32_t id=c->cells[i].group?c->cells[i].group:c->cells[i].id;
       bool first=true;for(uint16_t j=0;j<i;++j) if((c->cells[j].group?c->cells[j].group:c->cells[j].id)==id) first=false;
@@ -776,8 +774,8 @@ void command(char *input) {
     Serial.println("OK BEGIN");return;
   }
   if(!strcmp(cmd,"CELL")) {
-    long v[13];for(int i=0;i<13;++i) { char *a=strtok_r(nullptr," \r\n",&saveptr);if(!number(a,v[i],0,2147483647)) { Serial.println("ERR CELL args");return; } }
-    Cell x={(uint32_t)v[1],(uint32_t)v[2],(uint16_t)v[3],(uint16_t)v[4],(uint8_t)v[5],(uint8_t)v[6],(uint16_t)v[7],(uint16_t)v[9],(uint8_t)v[8],(uint8_t)v[10],(uint8_t)v[11],c->stagedRevision};
+    long v[12];for(int i=0;i<12;++i) { char *a=strtok_r(nullptr," \r\n",&saveptr);if(!number(a,v[i],0,2147483647)) { Serial.println("ERR CELL args");return; } }
+    Cell x={(uint32_t)v[1],(uint32_t)v[2],(uint16_t)v[3],(uint16_t)v[4],(uint8_t)v[5],(uint8_t)v[6],(uint16_t)v[7],(uint16_t)v[8],(uint8_t)v[9],(uint8_t)v[10],c->stagedRevision};
     // Creation is bridge-owned metadata. Preserve it for an existing sensor
     // even when a setup app holds a stale draft after its first save.
     for(uint16_t i=0;i<c->count;++i) if(c->cells[i].id==x.id) { x.createdRevision=c->cells[i].createdRevision;break; }

@@ -8,7 +8,7 @@ The bridge target is an **ESP32-C3 SuperMini**. Use Arduino-ESP32 3.x and instal
 
 The bridge sends a beacon every 250 ms for 20 seconds after boot or a Wi-Fi channel change, then every 500 ms. A camera searches channels 1–13 after five seconds without bridge contact, spending two seconds on each channel and sending a HELLO on each new channel. The bridge answers with a targeted prompt and temporarily returns to its faster beacon rate. On hearing a returning bridge the camera promptly announces itself and resends its current sensor states. An associated Wi-Fi network sets the bridge's channel. The app's Network page always shows a radio-channel field. It reads the announced channel from saved diagnostics when available on older bridge firmware; if those entries have expired, it says the channel is unavailable. With the updated bridge firmware it reads the announced and actual Wi-Fi channels directly from STATUS. Bridge diagnostics report beacon send failures. Under normal radio conditions discovery takes seconds; a complete 13-channel search can take up to 26 seconds. Camera initialization, broker connection delays, interference, and long captures can extend it further. The C3 build has **eight camera slots** as an initial RAM guardrail; each camera's cells are allocated to its configured count, and staging rejects an allocation when less than 24 KB of free heap remains. This is a prototype limit, not a measured capacity. The C3 has a single core and much less RAM than an S3, so snapshot throughput, Wi-Fi/MQTT coexistence, and eight loaded cameras need hardware measurement.
 
-Bridge firmware `0.1.17` answers every valid camera HELLO immediately, even when the bridge has not yet reached its 15-second offline timeout. The response is a targeted unicast beacon rather than another broadcast, and any pending command is retransmitted immediately behind it while the scanning camera is still dwelling on the bridge channel. Every regular discovery beacon is also copied by unicast to each known online camera. A HELLO starts a three-second fast-beacon window, giving a scanning camera several broadcast and unicast opportunities and reducing asymmetric links where the bridge receives camera health but the remote camera misses bridge traffic.
+Bridge firmware `0.1.18` uses camera protocol v2, which removes the unused angle-tolerance field and obsolete single-state radio packet. Existing bridge configuration files are migrated automatically, dropping only that unused value. It answers every valid camera HELLO immediately, even when the bridge has not yet reached its 15-second offline timeout. The response is a targeted unicast beacon rather than another broadcast, and any pending command is retransmitted immediately behind it while the scanning camera is still dwelling on the bridge channel. Every regular discovery beacon is also copied by unicast to each known online camera. A HELLO starts a three-second fast-beacon window, giving a scanning camera several broadcast and unicast opportunities and reducing asymmetric links where the bridge receives camera health but the remote camera misses bridge traffic.
 
 ## USB protocol
 
@@ -22,7 +22,7 @@ Commands and responses are UTF-8 lines, separated by `\n`. Fields are separated 
 | `STATES` | Return `SENSOR mac id state` rows for every cell and `OUTPUT mac id state topic-name` rows for MQTT outputs, then `OK STATES`. |
 | `TOPIC mac id name_hex` | Set a unique MQTT area name for a configured output ID. |
 | `BEGIN mac revision count resolution brightness contrast saturation vflip hmirror` | Stage a complete replacement configuration. Revision must increase. Resolution 0–3 is QVGA, VGA, SVGA, XGA. |
-| `CELL mac index id group x y radius shape contrast_floor angle_tolerance threshold_permille enter_frames clear_frames created_revision` | Add an ordered cell. Shape 0 is circle, 1 square; group 0 is independent. Creation revision is bridge-owned: existing sensor IDs retain their original value and new IDs receive the staged revision, regardless of the supplied compatibility field. |
+| `CELL mac index id group x y radius shape contrast_floor threshold_permille enter_frames clear_frames created_revision` | Add an ordered cell. Shape 0 is circle, 1 square; group 0 is independent. Creation revision is bridge-owned: existing sensor IDs retain their original value and new IDs receive the staged revision, regardless of the supplied field. |
 | `COMMIT mac` | Save the complete staged config to flash, then send it to the camera if online. Wait for `EVENT CONFIG_APPLIED` to confirm remote application. |
 | `BASELINE mac` | Tell the camera to capture three fresh frames of the **empty** scene, average them, and save the derived features in camera flash. `EVENT REQUEST_ACK mac 5 0` confirms success. |
 | `ANALYSIS mac sensor_id` | Request the camera's saved baseline buckets and current live buckets for one individual sensor. The asynchronous result is emitted as `EVENT CELL_ANALYSIS`. |
@@ -37,7 +37,7 @@ Example for one independent sensor:
 
 ```text
 BEGIN AA:BB:CC:DD:EE:FF 1 1 0 0 0 0 0 0
-CELL AA:BB:CC:DD:EE:FF 0 101 0 160 120 8 0 80 10 400 1 5 0
+CELL AA:BB:CC:DD:EE:FF 0 101 0 160 120 8 0 80 400 1 5 0
 COMMIT AA:BB:CC:DD:EE:FF
 BASELINE AA:BB:CC:DD:EE:FF
 ```

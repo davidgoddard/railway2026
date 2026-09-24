@@ -120,6 +120,8 @@ One camera can reduce hardware and wiring **per monitored area** when its view c
 
 This diagram is a simplified overview. The current detector also considers coarse edge position and the total number of strong edges. Lighting, shadows, reflections, camera movement, occlusion, and low-texture areas can still affect results, so test representative rolling stock and recapture the clear-track baseline after changing the camera view or sensor configuration.
 
+It should be obvious but place sensors on the parts of the rails that will become obscured by rolling stock i.e. select the rail furthest from the camera.
+
 For implementation details, see the [camera guide](Camera_Module/README.md). The [bridge guide](Bridge_Controller/README.md) covers MQTT, setup controls, connection history, and troubleshooting.
 
 ## Reference documentation

@@ -1,7 +1,7 @@
 'use strict';
 const $ = id => document.getElementById(id);
 const dims = [[320,240],[640,480],[800,600],[1024,768]];
-const defaults = {radius:5,shape:0,floor:80,tolerance:10,threshold:400,enter:1,clear:5,createdRevision:0};
+const defaults = {radius:5,shape:0,floor:80,threshold:400,enter:1,clear:5,createdRevision:0};
 let bridgeState = {connected:false,cameras:[],configs:{},states:{},cellStates:{}}, selectedMac = '', draft = null, selectedId = null, tool = 'select', extendGroup = 0, drag = null, frame = null, liveSensors = false, liveSource = localStorage.getItem('liveSource')==='mqtt'?'mqtt':'usb', view = 'setup', mqttEvents = [], busy = false, receivingFrame = false, frameSettlingUntil = 0, baselinePending = false, baselinePendingAt = 0, calibrationPending = false;
 let soundContext, lastChimeAt = 0;
 let cameraEnterDefault = defaults.enter;

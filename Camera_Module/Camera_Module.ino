@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.15"
+#define CAMERA_MODULE_VERSION "0.2.16"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -35,7 +35,7 @@
 #endif
 
 constexpr uint16_t MAGIC=0x5243;
-constexpr uint8_t PROTOCOL_VERSION=1;
+constexpr uint8_t PROTOCOL_VERSION=2;
 constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
@@ -47,7 +47,7 @@ constexpr uint8_t BROADCAST_MAC[6]={255,255,255,255,255,255};
 enum MessageType : uint8_t {
   HELLO=1, CONFIG_BEGIN=2, CONFIG_CELL=3, CONFIG_COMMIT=4,
   CAPTURE_BASELINE=5, SNAPSHOT_REQUEST=6, ACK=7,
-  STATE=8, HEALTH=9, SNAPSHOT_BEGIN=10, SNAPSHOT_CHUNK=11,
+  HEALTH=9, SNAPSHOT_BEGIN=10, SNAPSHOT_CHUNK=11,
   SNAPSHOT_END=12, SNAPSHOT_ACK=13, DIAGNOSTIC=14, DIAGNOSTIC_ACK=15,
   HEALTH_ACK=16, ANALYSIS_REQUEST=17, CELL_ANALYSIS=18,
   CALIBRATE_REQUEST=19, CALIBRATION_RESULT=20, CALIBRATION_ACK=21,
@@ -80,7 +80,7 @@ struct __attribute__((packed)) CellConfig {
   uint16_t x,y;
   uint8_t radius, shape; // shape: 0 circle, 1 square
   uint16_t contrastFloor, thresholdPermille;
-  uint8_t angleTolerance, enterFrames, clearFrames;
+  uint8_t enterFrames, clearFrames;
   uint32_t createdRevision;
 };
 struct __attribute__((packed)) ConfigCellPayload {
@@ -88,11 +88,7 @@ struct __attribute__((packed)) ConfigCellPayload {
   CellConfig cell;
 };
 struct __attribute__((packed)) AckPayload { uint8_t forType,status; uint16_t detail; };
-struct __attribute__((packed)) StatePayload {
-  uint32_t id, revision, frame;
-  uint16_t scorePermille;
-  uint8_t state, grouped;
-};
+struct __attribute__((packed)) ScorePending { uint32_t id; uint16_t scorePermille; };
 constexpr uint16_t STATE_BITMAP_BYTES=(MAX_CELLS*2+7)/8;
 struct __attribute__((packed)) StateBitmapPayload {
   uint32_t revision,frame;uint16_t count;uint8_t encoding;
@@ -342,18 +338,18 @@ bool captureFrame() {
 }
 
 constexpr uint16_t STATE_QUEUE_CAPACITY=400;
-StatePayload *stateQueue=nullptr;
+ScorePending *stateQueue=nullptr;
 uint16_t stateHead=0,stateCount=0;
 bool stateBitmapDirty=false,scoreReportingEnabled=false;
 uint32_t lastStateBitmap=0;
 constexpr uint32_t STATE_BITMAP_REFRESH_MS=1000;
-void queueState(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
+void queueState(uint32_t id,bool grouped,uint16_t score) {
   stateBitmapDirty=true;
   if(!stateQueue || !scoreReportingEnabled || grouped) return;
-  StatePayload value={id,configRevision,frameNumber,score,state,(uint8_t)grouped};
+  ScorePending value={id,score};
   for(uint16_t i=0;i<stateCount;++i) {
-    StatePayload &slot=stateQueue[(stateHead+i)%STATE_QUEUE_CAPACITY];
-    if(slot.id==id && slot.grouped==grouped) { slot=value;return; }
+    ScorePending &slot=stateQueue[(stateHead+i)%STATE_QUEUE_CAPACITY];
+    if(slot.id==id) { slot=value;return; }
   }
   if(stateCount==STATE_QUEUE_CAPACITY) {
     DEBUGF("state queue full; state %lu will be recovered by refresh\n",(unsigned long)id);
@@ -378,7 +374,7 @@ void sendScores() {
   ScoreBatchPayload batch={};batch.revision=configRevision;batch.frame=frameNumber;
   const uint16_t take=min(stateCount,(uint16_t)MAX_BATCHED_SCORES);
   for(uint16_t offset=0;offset<take;++offset) {
-    const StatePayload &value=stateQueue[(stateHead+offset)%STATE_QUEUE_CAPACITY];
+    const ScorePending &value=stateQueue[(stateHead+offset)%STATE_QUEUE_CAPACITY];
     int index=-1;for(uint16_t i=0;i<cellCount;++i) if(cells[i].config.id==value.id) { index=i;break; }
     if(index>=0) batch.records[batch.count++]={(uint16_t)index,value.scorePermille};
   }
@@ -391,13 +387,7 @@ void sendScores() {
 void queueAllStates() {
   stateBitmapDirty=true;
   for(uint16_t i=0;i<cellCount;++i)
-    queueState(cells[i].config.id,false,cells[i].state,cells[i].scorePermille);
-  for(uint16_t g=0;g<groupCount;++g) {
-    uint16_t score=0;
-    for(uint16_t i=0;i<cellCount;++i)
-      if(cells[i].config.groupId==groups[g].id) score=max(score,cells[i].scorePermille);
-    queueState(groups[g].id,true,groups[g].state,score);
-  }
+    queueState(cells[i].config.id,false,cells[i].scorePermille);
 }
 
 #include "OccupancyDetector.h"
@@ -588,7 +578,7 @@ bool validCell(const CellConfig &c,const CameraSettings &settings) {
   return c.id!=0 && c.x<r.width && c.y<r.height && c.radius>=3 && c.radius<=50 &&
     c.shape<=1 && c.contrastFloor>=10 && c.contrastFloor<=500 &&
     c.thresholdPermille>=50 && c.thresholdPermille<=1000 &&
-    c.angleTolerance<=20 && c.enterFrames>=1 && c.clearFrames>=1;
+    c.enterFrames>=1 && c.clearFrames>=1;
 }
 uint8_t beginConfig(const ConfigBeginPayload &value) {
   if(snapshot.active || calibration.active) return ACK_BUSY;
@@ -666,7 +656,7 @@ bool saveBaseline() {
   const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
   // Runtime features contain the calibration. The full grayscale frame is not
   // needed after reboot and made SVGA baselines require two 480 KB flash files.
-  BaselineHeader h={0x52424C3A,configRevision,0,
+  BaselineHeader h={0x52424C3B,configRevision,0,
     crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
   if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
   File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
@@ -687,7 +677,7 @@ void loadBaseline() {
     LittleFS.rename("/baseline.bak","/baseline.bin");
   File f=LittleFS.open("/baseline.bin","r");if(!f) return;
   BaselineHeader h={};
-  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C3A ||
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C3B ||
      h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
   const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
   if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||
@@ -1007,7 +997,7 @@ char serialLine[180];size_t serialLength=0;
 void handleSerialLine(char *line) {
   char *command=strtok(line," \t");if(!command) return;
   if(strcmp(command,"H")==0) {
-    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast tolerance threshold_permille enter clear | A commit | R baseline | F raw frame | X clear RAM config | Z FORMAT LittleFS");
+    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast threshold_permille enter clear | A commit | R baseline | F raw frame | X clear RAM config | Z FORMAT LittleFS");
   } else if(strcmp(command,"I")==0) printInfo();
   else if(strcmp(command,"P")==0) {
     char *value=strtok(nullptr," \t");uint8_t mac[6];
@@ -1032,18 +1022,18 @@ void handleSerialLine(char *line) {
     } else DEBUGLN("B syntax error");
   } else if(strcmp(command,"S")==0) {
     char *args=strtok(nullptr,"");
-    unsigned index,x,y,radius,contrast,tolerance,threshold,enter,clear;
+    unsigned index,x,y,radius,contrast,threshold,enter,clear;
     unsigned long id,group;char shape;
-    if(args && sscanf(args,"%u %lu %lu %u %u %u %c %u %u %u %u %u",
-       &index,&id,&group,&x,&y,&radius,&shape,&contrast,&tolerance,&threshold,&enter,&clear)==12 &&
+    if(args && sscanf(args,"%u %lu %lu %u %u %u %c %u %u %u %u",
+       &index,&id,&group,&x,&y,&radius,&shape,&contrast,&threshold,&enter,&clear)==11 &&
        index<=MAX_CELLS && id<=UINT32_MAX && group<=UINT32_MAX && x<=UINT16_MAX &&
        y<=UINT16_MAX && radius<=UINT8_MAX && (shape=='C' || shape=='S') &&
-       contrast<=UINT16_MAX && tolerance<=UINT8_MAX && threshold<=UINT16_MAX &&
+       contrast<=UINT16_MAX && threshold<=UINT16_MAX &&
        enter<=UINT8_MAX && clear<=UINT8_MAX) {
       ConfigCellPayload value={};value.index=index;
       value.cell={(uint32_t)id,(uint32_t)group,(uint16_t)x,(uint16_t)y,
         (uint8_t)radius,(uint8_t)(shape=='S'?1:0),(uint16_t)contrast,
-        (uint16_t)threshold,(uint8_t)tolerance,(uint8_t)enter,(uint8_t)clear};
+        (uint16_t)threshold,(uint8_t)enter,(uint8_t)clear};
       DEBUGF("cell status=%u\n",stageCell(value));
     } else DEBUGLN("S syntax error");
   } else if(strcmp(command,"A")==0) DEBUGF("commit status=%u\n",commitConfig(stagingRevision));
@@ -1094,7 +1084,7 @@ void setup() {
   if(!psramFound()) { DEBUGLN("PSRAM required");return; }
   cells=(CellRuntime *)ps_malloc(sizeof(CellRuntime)*MAX_CELLS);
   staging=(CellRuntime *)ps_malloc(sizeof(CellRuntime)*MAX_CELLS);
-  stateQueue=(StatePayload *)ps_malloc(sizeof(StatePayload)*STATE_QUEUE_CAPACITY);
+  stateQueue=(ScorePending *)ps_malloc(sizeof(ScorePending)*STATE_QUEUE_CAPACITY);
   inbox=xQueueCreate(16,sizeof(Received));
   if(!cells || !staging || !stateQueue || !inbox) { DEBUGLN("allocation failed");return; }
   memset(cells,0,sizeof(CellRuntime)*MAX_CELLS);

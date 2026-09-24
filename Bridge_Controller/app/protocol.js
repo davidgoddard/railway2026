@@ -4,13 +4,13 @@ const zlib = require('node:zlib');
 const RESOLUTIONS = [[320, 240], [640, 480], [800, 600], [1024, 768]];
 const MAC = /^[0-9A-F]{2}(?::[0-9A-F]{2}){5}$/;
 const SLUG = /^[a-z0-9_-]{1,32}$/;
-const DEFAULT_CELL = { radius: 5, shape: 0, floor: 80, tolerance: 10, threshold: 400, enter: 1, clear: 5, createdRevision: 0 };
+const DEFAULT_CELL = { radius: 5, shape: 0, floor: 80, threshold: 400, enter: 1, clear: 5, createdRevision: 0 };
 function hex(value) { return Buffer.from(value, 'utf8').toString('hex').toUpperCase() || '-'; }
 function parseRow(line) {
   const p = line.trim().split(/\s+/);
   if (p[0] === 'CAMERA' && MAC.test(p[1])) return { type: 'camera', mac: p[1], online: p[2] === 'online', revision: +p[3], remoteRevision: +p[4], count: +p[5], baseline: p[6] === '1' };
   if (p[0] === 'CONFIG' && MAC.test(p[1])) return { type: 'config', mac: p[1], revision: +p[2], count: +p[3], lastAutoSizeRevision: +p[4], settings: { resolution: +p[5], brightness: +p[6], contrast: +p[7], saturation: +p[8], vflip: +p[9], hmirror: +p[10] } };
-  if (p[0] === 'CELL') return { type: 'cell', cell: { id: +p[2], group: +p[3], x: +p[4], y: +p[5], radius: +p[6], shape: +p[7], floor: +p[8], tolerance: +p[9], threshold: +p[10], enter: +p[11], clear: +p[12], createdRevision: +p[13] } };
+  if (p[0] === 'CELL') return { type: 'cell', cell: { id: +p[2], group: +p[3], x: +p[4], y: +p[5], radius: +p[6], shape: +p[7], floor: +p[8], threshold: +p[9], enter: +p[10], clear: +p[11], createdRevision: +p[12] } };
   if (p[0] === 'TOPIC') return { type: 'topic', id: +p[1], name: p[2] };
   return null;
 }
@@ -61,7 +61,7 @@ function validateConfig(config, otherIds = []) {
     if (!Number.isInteger(cell.x) || cell.x < 0 || cell.x >= width || !Number.isInteger(cell.y) || cell.y < 0 || cell.y >= height) throw Error(`Sensor ${cell.id} at ${cell.x}, ${cell.y} is outside the selected ${width} × ${height} image`);
     if (!Number.isInteger(cell.radius) || cell.radius < 3 || cell.radius > 50) throw Error('Sensor radius must be 3–50 px');
     if (cell.shape !== 0 && cell.shape !== 1) throw Error('Invalid sensor shape');
-    if (cell.floor < 10 || cell.floor > 500 || cell.tolerance < 0 || cell.tolerance > 20 || !Number.isInteger(cell.threshold) || cell.threshold < 50 || cell.threshold > 1000 || !Number.isInteger(cell.enter) || cell.enter < 1 || cell.enter > 255 || !Number.isInteger(cell.clear) || cell.clear < 1 || cell.clear > 255 || !Number.isInteger(cell.createdRevision ?? 0) || (cell.createdRevision ?? 0) < 0) throw Error('Invalid sensor thresholds');
+    if (cell.floor < 10 || cell.floor > 500 || !Number.isInteger(cell.threshold) || cell.threshold < 50 || cell.threshold > 1000 || !Number.isInteger(cell.enter) || cell.enter < 1 || cell.enter > 255 || !Number.isInteger(cell.clear) || cell.clear < 1 || cell.clear > 255 || !Number.isInteger(cell.createdRevision ?? 0) || (cell.createdRevision ?? 0) < 0) throw Error('Invalid sensor thresholds');
   }
   if (groups.size > 64) throw Error('Camera supports at most 64 blocks');
   for (const cell of cells) {
@@ -80,7 +80,7 @@ function commandsForConfig(mac, config) {
   const s = config.settings;
   return [
     `BEGIN ${mac} ${config.revision + 1} ${config.cells.length} ${s.resolution} ${s.brightness} ${s.contrast} ${s.saturation} ${s.vflip} ${s.hmirror}`,
-    ...config.cells.map((c, i) => `CELL ${mac} ${i} ${c.id} ${c.group} ${c.x} ${c.y} ${c.radius} ${c.shape} ${c.floor} ${c.tolerance} ${c.threshold} ${c.enter} ${c.clear} ${c.createdRevision || 0}`),
+    ...config.cells.map((c, i) => `CELL ${mac} ${i} ${c.id} ${c.group} ${c.x} ${c.y} ${c.radius} ${c.shape} ${c.floor} ${c.threshold} ${c.enter} ${c.clear} ${c.createdRevision || 0}`),
     `COMMIT ${mac}`,
     ...[...new Set(config.cells.map(c => c.group || c.id))].map(id => `TOPIC ${mac} ${id} ${hex(config.topics?.[id] || String(id))}`)
   ];

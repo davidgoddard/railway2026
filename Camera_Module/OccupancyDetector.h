@@ -5,7 +5,7 @@ class OccupancyDetector {
  public:
   // Provisional saturation limit; tune from frames captured on the layout.
   static constexpr uint8_t FRAME_CLIP_PERCENT=20;
-  using StateCallback = void (*)(uint32_t id, bool grouped, uint8_t state, uint16_t score);
+  using StateCallback = void (*)(uint32_t id, bool grouped, uint16_t score);
   void bind(const uint8_t *pixels, uint16_t width, uint16_t height,
             CellRuntime *cells, uint16_t cellCount, GroupRuntime *groups,
             uint16_t groupCount, StateCallback callback) {
@@ -41,8 +41,8 @@ class OccupancyDetector {
   int16_t directionX_[FIXED_DIRECTIONS]={},directionY_[FIXED_DIRECTIONS]={};
   int16_t classifierX_[FIXED_DIRECTIONS]={},classifierY_[FIXED_DIRECTIONS]={};
   uint32_t analysisNumber_=0;
-  void emit(uint32_t id,bool grouped,uint8_t state,uint16_t score) {
-    if(callback_) callback_(id,grouped,state,score);
+  void emit(uint32_t id,bool grouped,uint16_t score) {
+    if(callback_) callback_(id,grouped,score);
   }
   void gradientAt(const uint8_t *pixels,int p,int &gx,int &gy);
   bool insideCell(const CellConfig &c,int x,int y);
@@ -291,7 +291,7 @@ void OccupancyDetector::updateGroups() {
     const uint8_t next=occupied?OCCUPIED:unknown?UNKNOWN:CLEAR;
     if(next!=groups_[g].state) {
       groups_[g].state=next;
-      emit(groups_[g].id,true,next,score);
+      emit(groups_[g].id,true,score);
     }
   }
 }
@@ -310,7 +310,7 @@ void OccupancyDetector::analyseAllCells() {
       cell.scorePermille=0;
       if(cell.state!=UNKNOWN) {
         cell.state=UNKNOWN;
-        emit(cell.config.id,false,UNKNOWN,0);
+        emit(cell.config.id,false,0);
         changed=true;
       }
     }
@@ -393,7 +393,7 @@ void OccupancyDetector::analyseAllCells() {
         cell.state==OCCUPIED?"occupied":"clear",cell.scorePermille,
         cell.reference.textured?FIXED_DIRECTIONS:0,live.edges,cell.reference.edges,
         live.maxGradient,cell.reference.maxGradient);
-      emit(cell.config.id,false,cell.state,cell.scorePermille);
+      emit(cell.config.id,false,cell.scorePermille);
     }
   }
   updateGroups();

@@ -4,7 +4,7 @@ function sameCameraConfiguration(draft, saved) {
   if (!draft || !saved || draft.cells?.length !== saved.cells?.length) return false;
   const settings = ['resolution', 'brightness', 'contrast', 'saturation', 'vflip', 'hmirror'];
   if (settings.some(key => draft.settings?.[key] !== saved.settings?.[key])) return false;
-  const fields = ['id', 'group', 'x', 'y', 'radius', 'shape', 'floor', 'tolerance', 'threshold', 'enter', 'clear'];
+  const fields = ['id', 'group', 'x', 'y', 'radius', 'shape', 'floor', 'threshold', 'enter', 'clear'];
   const savedCells = new Map(saved.cells.map(cell => [cell.id, cell]));
   if (savedCells.size !== saved.cells.length) return false;
   for (const cell of draft.cells) {
