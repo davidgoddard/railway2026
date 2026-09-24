@@ -62,6 +62,20 @@ When both baseline and live patches are untextured, the camera treats their diff
 
 One full-frame clipping pass, one pass over the union of sensor pixels, twelve fixed-direction projections per qualifying unique pixel, and up to eight extra comparisons for a cell whose first score would trigger can reduce frame rate. A background camera task and two application-owned PSRAM buffers form a latest-frame mailbox, allowing capture to overlap detector work. If capture outruns analysis, intermediate frames are replaced rather than queued. Every completed frame has a sequence number and is analysed at most once, so skipped frames cannot falsely advance frame-based enter/clear persistence. The serial health log reports capture FPS, analysis FPS, and frame age. Measure the actual board, resolution, and cell set before using it for traffic decisions. Fixed direction boundaries can still amplify small angle movements between adjacent buckets, so test ordinary lighting and representative rolling stock before relying on a threshold.
 
+### Implementation optimisations
+
+The detector is deliberately written for the limited CPU and memory bandwidth of an ESP32 rather than as a direct desktop-style image-processing pipeline:
+
+- The generic 3×3 Scharr matrix operation is reduced algebraically to the eight contributing pixels and the kernel's `3` and `10` coefficients. The centre pixel and zero multiplications disappear, opposite kernel terms are combined as differences, and the result stays in integer arithmetic.
+- Trigonometry is performed once during detector startup. Runtime direction classification uses precomputed fixed-point vectors and integer dot products instead of calling `atan2`, `sin`, or `cos` for every gradient.
+- A configuration-specific sparse work map stores the union of all sensor pixels and which sensors use each pixel. Overlapping sensors therefore share one image lookup, Scharr calculation, magnitude calculation, and direction classification instead of repeating that work independently.
+- The lowest active contrast cutoff provides an early rejection for non-edge pixels. Direction classification and per-sensor bucket updates are performed only when a gradient could contribute to at least one sensor.
+- The more expensive eight-neighbour, one-pixel shift search runs only when the first comparison could change an occupancy decision or prevent an occupied sensor from clearing. Ordinary clear frames stay on the fast path.
+- Camera acquisition runs concurrently with analysis through two reusable PSRAM buffers and a latest-frame mailbox. Frames are never allowed to form an unbounded queue, and configuration-dependent work buffers are retained until the configuration changes rather than allocated on every frame.
+- State transport is similarly compact: all sensor states fit in a two-bit bitmap, while optional diagnostic scores are batched separately. The score mailbox keeps only the newest pending value for each sensor.
+
+These changes remove repeated convolution, trigonometry, overlapping-region work, unnecessary shift comparisons, transient allocation, and radio overhead from the normal frame path. They preserve the detector's decisions; they are implementation optimisations rather than approximations added merely to make the benchmark faster.
+
 ## ESP-NOW wire protocol
 
 All fields are packed and little-endian, as sent by ESP32. The packet starts with `uint16 magic=0x5243`, `uint8 version=2`, `uint8 type`, `uint32 seq`, `uint16 payload_length`, followed by exactly that many payload bytes. Maximum packet size is **210 bytes**, within the legacy 250-byte ESP-NOW payload limit. A bridge should implement this exact format and reject wrong lengths, versions, source MACs, and stale revisions. The receive callback only queues valid packets; the main loop handles configuration and camera work. The queue has 16 slots, so configuration senders must wait for each application-level ACK before sending the next item. [Espressif documents the 250-byte v1 limit and the need for application acknowledgements.](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32/api-reference/network/esp_now.html)
