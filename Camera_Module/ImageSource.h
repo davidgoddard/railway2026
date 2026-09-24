@@ -102,19 +102,18 @@ class ImageSource {
   DEBUGF("camera %ux%u grayscale ready\n",frameWidth,frameHeight);
   return true;
 }
-  // Lease the newest completed frame. The producer will not overwrite it
-  // until a later frame is leased, so analysis and snapshot reads are safe.
+  // Lease the one completed frame. Consuming it releases the producer to
+  // acquire exactly one successor while this frame is being analysed.
   bool capture(uint8_t *&framePixels,uint16_t,uint16_t,Frame &frame) {
     if(!ready_) return false;
     const uint32_t started=millis();
     do {
       portENTER_CRITICAL(&mailboxMux_);
       if(published_>=0 && published_!=writing_ && publishedSequence_!=leasedSequence_) {
-        const uint32_t advanced=publishedSequence_-leasedSequence_;
-        if(leasedSequence_ && advanced>1) replacedFrames_+=advanced-1;
         leased_=published_;leasedSequence_=publishedSequence_;
         framePixels=buffers_[leased_];frame={framePixels,leasedSequence_,publishedAtMs_};
         portEXIT_CRITICAL(&mailboxMux_);
+        xSemaphoreGive(captureSlot_);
         return true;
       }
       portEXIT_CRITICAL(&mailboxMux_);
@@ -140,7 +139,7 @@ class ImageSource {
   bool ready_=false;
   uint8_t *buffers_[2]={nullptr,nullptr};
   TaskHandle_t captureTask_=nullptr;
-  SemaphoreHandle_t frameReady_=nullptr,stopped_=nullptr,paused_=nullptr;
+  SemaphoreHandle_t frameReady_=nullptr,captureSlot_=nullptr,stopped_=nullptr,paused_=nullptr;
   portMUX_TYPE mailboxMux_=portMUX_INITIALIZER_UNLOCKED;
   volatile bool stopRequested_=false,pauseRequested_=false,taskRunning_=false;
   volatile int8_t published_=-1,leased_=-1,writing_=-1;
@@ -163,8 +162,16 @@ class ImageSource {
         while(pauseRequested_ && !stopRequested_) delay(1);
         continue;
       }
+      // Do not acquire and copy frames faster than the detector can consume
+      // them. Timed waits keep pause and stop responsive when a frame is
+      // sitting in the single pending slot.
+      if(xSemaphoreTake(captureSlot_,pdMS_TO_TICKS(10))!=pdTRUE) continue;
+      if(stopRequested_ || pauseRequested_) {
+        xSemaphoreGive(captureSlot_);
+        continue;
+      }
       camera_fb_t *fb=esp_camera_fb_get();
-      if(!fb) { ++acquisitionFailures_;delay(1);continue; }
+      if(!fb) { ++acquisitionFailures_;xSemaphoreGive(captureSlot_);delay(1);continue; }
       int8_t target;
       portENTER_CRITICAL(&mailboxMux_);
       target=leased_==0?1:0;
@@ -184,6 +191,7 @@ class ImageSource {
       } else {
         ++acquisitionFailures_;
         portENTER_CRITICAL(&mailboxMux_);writing_=-1;portEXIT_CRITICAL(&mailboxMux_);
+        xSemaphoreGive(captureSlot_);
       }
     }
     xSemaphoreGive(stopped_);
@@ -191,10 +199,12 @@ class ImageSource {
   }
   bool startCaptureTask() {
     if(!frameReady_) frameReady_=xSemaphoreCreateBinary();
+    if(!captureSlot_) captureSlot_=xSemaphoreCreateBinary();
     if(!stopped_) stopped_=xSemaphoreCreateBinary();
     if(!paused_) paused_=xSemaphoreCreateBinary();
-    if(!frameReady_ || !stopped_ || !paused_) return false;
+    if(!frameReady_ || !captureSlot_ || !stopped_ || !paused_) return false;
     xSemaphoreTake(frameReady_,0);xSemaphoreTake(stopped_,0);xSemaphoreTake(paused_,0);
+    xSemaphoreTake(captureSlot_,0);xSemaphoreGive(captureSlot_);
     stopRequested_=pauseRequested_=false;taskRunning_=true;
     if(xTaskCreate(captureTaskEntry,"camera-capture",4096,this,2,&captureTask_)==pdPASS) return true;
     taskRunning_=false;captureTask_=nullptr;return false;

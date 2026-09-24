@@ -219,6 +219,7 @@ app.whenReady().then(() => {
   ipcMain.handle('cached-frame', (_, mac) => loadFrame(frameDirectory(), mac).catch(() => null));
   ipcMain.handle('baseline', (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); return run(`BASELINE ${mac}`); });
   ipcMain.handle('calibrate', (_, mac, mode = 'new') => { if (!MAC.test(mac) || !['new','all'].includes(mode)) throw Error('Invalid calibration request'); return run(`CALIBRATE ${mac} ${mode}`); });
+  ipcMain.handle('retune', (_, mac, target) => { if (!MAC.test(mac) || !(target === 'occupied' || Number.isInteger(target) && target > 0)) throw Error('Invalid lighting re-tune request'); return run(`RETUNE ${mac} ${target}`); });
   ipcMain.handle('analysis', (_, mac, id) => { if (!MAC.test(mac) || !Number.isInteger(id) || id < 1) throw Error('Invalid sensor'); return run(`ANALYSIS ${mac} ${id}`); });
   ipcMain.handle('save', async (_, mac, config) => {
     if (!MAC.test(mac) || !configs.has(mac)) throw Error('Unknown camera');

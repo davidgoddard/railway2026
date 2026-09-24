@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.19"
+#define BRIDGE_VERSION "0.1.20"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -10,9 +10,9 @@
 #include <esp_partition.h>
 #include <stddef.h>
 
-// Keep these packed declarations in step with Camera_Module.ino protocol v2.
+// Keep these packed declarations in step with Camera_Module.ino protocol v3.
 constexpr uint16_t MAGIC=0x5243;
-constexpr uint8_t VERSION=2, START_CHANNEL=1, MAX_CAMERAS=8; // Conservative ESP32-C3 RAM budget.
+constexpr uint8_t VERSION=3, START_CHANNEL=1, MAX_CAMERAS=8; // Conservative ESP32-C3 RAM budget.
 constexpr uint16_t MAX_CELLS=300;
 constexpr size_t PAYLOAD=200;
 constexpr uint32_t ACK_TIMEOUT=1500, CAMERA_TIMEOUT=15000;
@@ -44,7 +44,8 @@ struct __attribute__((packed)) AnalysisMessage {
   uint16_t angles[12],referenceBuckets[37],liveBuckets[37];
 };
 static_assert(sizeof(AnalysisMessage)<=PAYLOAD,"Analysis payload exceeds ESP-NOW payload");
-struct __attribute__((packed)) CalibrationRequest { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples; };
+enum CalibrationMode:uint8_t { AUTO_SIZE=0,RETUNE_LIGHTING=1 };
+struct __attribute__((packed)) CalibrationRequest { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples,mode;uint32_t targetId; };
 struct __attribute__((packed)) CalibrationResult {
   uint32_t revision,id;uint16_t index,count,threshold,clearMaximum,referenceEdges,samples;
   uint8_t radius,confidence;
@@ -93,6 +94,7 @@ struct Camera {
   uint32_t calibrationRevision=0;
   uint32_t lastAutoSizeRevision=0;
   uint16_t calibrationReceived=0;
+  bool calibrationLighting=false;
   uint8_t calibrationSeen[(MAX_CELLS+7)/8]={};
   uint16_t snapWidth=0,snapHeight=0;
 };
@@ -585,6 +587,8 @@ void handleRadio(const Received &r) {
     for(int i=0;i<37;++i) Serial.printf("%s%u",i?",":"",a.liveBuckets[i]);Serial.println();
   } else if(p.type==CALIBRATION_RESULT && p.length==sizeof(CalibrationResult)) {
     CalibrationResult value;memcpy(&value,p.payload,sizeof(value));
+    const bool lighting=(value.confidence&0x80)!=0,adjusted=(value.confidence&0x20)!=0;
+    const bool needsBaseline=(value.confidence&0x40)!=0;
     // A repeated result after a lost final ACK is safe once this revision has
     // already been persisted. Acknowledge it without rebuilding staging.
     if(value.revision==c->revision && value.count==c->count && value.index<c->count &&
@@ -600,8 +604,9 @@ void handleRadio(const Received &r) {
       if(!next) return;
       c->staged=next;memcpy(c->staged,c->cells,c->count*sizeof(Cell));
       c->stagedCount=c->count;c->stagedSettings=c->settings;c->stagedRevision=value.revision;
-      c->calibrationRevision=value.revision;c->calibrationReceived=0;memset(c->calibrationSeen,0,sizeof(c->calibrationSeen));
+      c->calibrationRevision=value.revision;c->calibrationReceived=0;c->calibrationLighting=lighting;memset(c->calibrationSeen,0,sizeof(c->calibrationSeen));
     }
+    if(c->calibrationLighting!=lighting) return;
     const uint8_t mask=(uint8_t)(1u<<(value.index&7));
     const bool duplicate=c->calibrationSeen[value.index>>3]&mask;
     if(!duplicate) {
@@ -610,18 +615,20 @@ void handleRadio(const Received &r) {
       ++c->calibrationReceived;
     }
     char mac[18];macText(c->mac,mac);
-    if(!duplicate) Serial.printf("EVENT CALIBRATION_SENSOR %s %lu %u %u %u %u %u %u\n",mac,
+    if(!duplicate && lighting && adjusted) Serial.printf("EVENT LIGHTING_SENSOR %s %lu %u %u %u %u\n",mac,
+        (unsigned long)value.id,value.threshold,value.clearMaximum,value.samples,needsBaseline?1:0);
+    else if(!duplicate && !lighting) Serial.printf("EVENT CALIBRATION_SENSOR %s %lu %u %u %u %u %u %u\n",mac,
         (unsigned long)value.id,value.radius,value.threshold,value.clearMaximum,
         value.referenceEdges,value.samples,value.confidence);
     bool persisted=false;
     if(c->calibrationReceived==c->count) {
       c->received=c->stagedCount;
       const uint32_t previousAutoSizeRevision=c->lastAutoSizeRevision;
-      c->lastAutoSizeRevision=c->stagedRevision;
+      if(!lighting) c->lastAutoSizeRevision=c->stagedRevision;
       if(saveStaged(*c)) {
         c->remoteRevision=c->revision;c->baseline=true;c->revisionMismatchAt=0;
         c->calibrationRevision=0;c->calibrationReceived=0;
-        Serial.printf("EVENT CALIBRATION_APPLIED %s %lu %u\n",mac,(unsigned long)c->revision,c->count);
+        Serial.printf("EVENT %s %s %lu %u\n",lighting?"LIGHTING_APPLIED":"CALIBRATION_APPLIED",mac,(unsigned long)c->revision,c->count);
         persisted=true;
       } else { c->lastAutoSizeRevision=previousAutoSizeRevision;Serial.printf("EVENT CALIBRATION_ERROR %s storage\n",mac); }
     }
@@ -833,6 +840,17 @@ void command(char *input) {
     c->pending=p;c->pendingType=p.type;c->pendingSeq=p.seq;c->pendingAt=millis();c->retries=0;
     if(!sendPacket(c->mac,p)) { c->pendingType=0;Serial.println("ERR CALIBRATE radio");return; }
     Serial.println("OK CALIBRATE");return;
+  }
+  if(!strcmp(cmd,"RETUNE")) {
+    if(!c->seen || c->phase || c->pendingType || c->snapshot || !c->count || !c->baseline) { Serial.println("ERR RETUNE unavailable");return; }
+    char *target=strtok_r(nullptr," \r\n",&saveptr);long id=0;
+    if(!target || (strcmp(target,"occupied") && (!number(target,id,1,2147483647) || cellIndex(*c,(uint32_t)id)<0))) { Serial.println("ERR RETUNE target");return; }
+    if(!strcmp(target,"occupied")) { bool any=false;for(uint16_t i=0;i<c->count;++i) if(c->cellStates && c->cellStates[i]==OCCUPIED) any=true;if(!any) { Serial.println("ERR RETUNE no_occupied_sensors");return; } }
+    CalibrationRequest value={c->revision+1,10000,0,50,RETUNE_LIGHTING,(uint32_t)id};
+    Packet p=makePacket(CALIBRATE_REQUEST,sequence++,&value,sizeof(value));
+    c->pending=p;c->pendingType=p.type;c->pendingSeq=p.seq;c->pendingAt=millis();c->retries=0;
+    if(!sendPacket(c->mac,p)) { c->pendingType=0;Serial.println("ERR RETUNE radio");return; }
+    Serial.println("OK RETUNE");return;
   }
   Serial.println("ERR command");
 }

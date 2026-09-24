@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.16"
+#define CAMERA_MODULE_VERSION "0.2.19"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -35,7 +35,7 @@
 #endif
 
 constexpr uint16_t MAGIC=0x5243;
-constexpr uint8_t PROTOCOL_VERSION=2;
+constexpr uint8_t PROTOCOL_VERSION=3;
 constexpr size_t RADIO_PAYLOAD=200; // Fits legacy ESP-NOW's 250-byte limit.
 constexpr uint16_t MAX_CELLS=300;
 constexpr uint16_t MAX_GROUPS=64;
@@ -108,7 +108,10 @@ struct __attribute__((packed)) AnalysisPayload {
   uint16_t referenceBuckets[SPATIAL_BUCKETS],liveBuckets[SPATIAL_BUCKETS];
 };
 static_assert(sizeof(AnalysisPayload)<=RADIO_PAYLOAD,"Analysis payload exceeds ESP-NOW payload");
-struct __attribute__((packed)) CalibrationRequestPayload { uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples; };
+enum CalibrationMode:uint8_t { AUTO_SIZE=0, RETUNE_LIGHTING=1 };
+struct __attribute__((packed)) CalibrationRequestPayload {
+  uint32_t revision,durationMs,sinceRevision;uint8_t maxSamples,mode;uint32_t targetId;
+};
 struct __attribute__((packed)) CalibrationResultPayload {
   uint32_t revision,id;uint16_t index,count,thresholdPermille,clearMaximum,referenceEdges,samples;
   uint8_t radius,confidence;
@@ -168,7 +171,11 @@ uint32_t lastBridgeBeacon=0,lastChannelScan=0,lastBridgeBeaconSeq=0;
 // Stay long enough for several normal bridge beacons. A 600 ms dwell gave a
 // scanning camera only one marginal receive opportunity on each channel and
 // produced repeated one-way discoveries at noisy installations.
-constexpr uint32_t BRIDGE_SEARCH_AFTER_MS=5000,CHANNEL_DWELL_MS=2000;
+// Normal beacons arrive every 500 ms and health acknowledgements also prove
+// contact. Require roughly thirty missed beacon periods before abandoning the
+// known channel; leaving after five seconds made brief coexistence delays turn
+// into a disruptive 13-channel search.
+constexpr uint32_t BRIDGE_SEARCH_AFTER_MS=15000,CHANNEL_DWELL_MS=2000;
 
 struct Feature {
   uint16_t edges=0,maxGradient=0;
@@ -435,6 +442,78 @@ bool captureBaseline() {
   sendHello();lastHello=millis();
   DEBUGF("baseline ready: %u cells frames=%u last_frame=%lu duration_ms=%lu\n",cellCount,BASELINE_FRAMES,(unsigned long)frameNumber,(unsigned long)(millis()-started));
   rtcDiagnostic.outcome=3;queueDiagnostic(DIAG_BASELINE_DONE,millis()-started);rtcDiagnostic.operation=0;
+  return true;
+}
+
+// Preserve the saved visual baseline and move selected empty sensors above the
+// worst mismatch observed under the current lighting. A zero target selects
+// cells that are occupied when the operation starts.
+bool retuneLighting(const CalibrationRequestPayload &request) {
+  if(!configured || !baselineReady || snapshot.active || !cellCount ||
+     request.revision!=configRevision+1 || request.durationMs<2000 ||
+     request.durationMs>30000 || !request.maxSamples) return false;
+  struct Stats { uint16_t maximum=0,samples=0;bool target=false; };
+  Stats *stats=(Stats *)ps_malloc((size_t)cellCount*sizeof(Stats));
+  CellRuntime *previous=(CellRuntime *)ps_malloc((size_t)cellCount*sizeof(CellRuntime));
+  if(!stats || !previous) { free(stats);free(previous);return false; }
+  memset(stats,0,(size_t)cellCount*sizeof(Stats));
+  memcpy(previous,cells,(size_t)cellCount*sizeof(CellRuntime));
+  uint16_t targets=0;
+  for(uint16_t i=0;i<cellCount;++i) {
+    stats[i].target=request.targetId ? cells[i].config.id==request.targetId : cells[i].state==OCCUPIED;
+    if(stats[i].target) ++targets;
+  }
+  if(!targets) { free(stats);free(previous);return false; }
+  const uint32_t started=millis(),interval=max((uint32_t)1,request.durationMs/request.maxSamples);
+  uint32_t nextSample=started;
+  detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,nullptr);
+  while(millis()-started<request.durationMs) {
+    baselineHeartbeat();
+    if((int32_t)(millis()-nextSample)<0) { delay(1);continue; }
+    nextSample+=interval;
+    if(!captureFrame()) continue;
+    for(uint16_t i=0;i<cellCount;++i) if(stats[i].target) {
+      Feature live={};uint16_t buckets[SPATIAL_BUCKETS]={};
+      stats[i].maximum=max(stats[i].maximum,detector.inspectCell(cells[i],live,buckets));
+      ++stats[i].samples;
+      if((i&15)==15) baselineHeartbeat();
+    }
+  }
+  CalibrationResultPayload *results=(CalibrationResultPayload *)ps_malloc(
+    (size_t)cellCount*sizeof(CalibrationResultPayload));
+  if(!results) { free(stats);free(previous);return false; }
+  for(uint16_t i=0;i<cellCount;++i) {
+    uint8_t flags=0x80;
+    if(stats[i].target) {
+      flags|=0x20;
+      const uint16_t proposed=(uint16_t)(((uint32_t)stats[i].maximum+109)/10*10);
+      if(stats[i].samples<3 || proposed>1000) flags|=0x40;
+      else {
+        cells[i].config.thresholdPermille=max(cells[i].config.thresholdPermille,proposed);
+        cells[i].state=CLEAR;cells[i].enterCount=cells[i].clearCount=0;cells[i].scorePermille=0;
+      }
+    }
+    results[i]={request.revision,cells[i].config.id,i,cellCount,
+      cells[i].config.thresholdPermille,stats[i].maximum,cells[i].reference.edges,
+      stats[i].samples,cells[i].config.radius,(uint8_t)(flags|(stats[i].samples>=40?2:stats[i].samples>=15?1:0))};
+  }
+  const uint32_t previousRevision=configRevision;configRevision=request.revision;
+  if(!saveBaseline()) {
+    configRevision=previousRevision;memcpy(cells,previous,(size_t)cellCount*sizeof(CellRuntime));
+    free(results);free(stats);free(previous);return false;
+  }
+  for(uint16_t g=0;g<groupCount;++g) {
+    groups[g].state=CLEAR;
+    for(uint16_t i=0;i<cellCount;++i) if(cells[i].config.groupId==groups[g].id && cells[i].state==OCCUPIED) groups[g].state=OCCUPIED;
+  }
+  free(calibration.results);calibration=CalibrationTransfer();
+  calibration.active=true;calibration.results=results;calibration.count=cellCount;
+  calibration.revision=configRevision;calibration.seq=nextSeq++;
+  detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+  queueAllStates();sendHello();lastHello=millis();
+  free(stats);free(previous);
+  DEBUGF("lighting retune revision=%lu targets=%u duration_ms=%lu\n",
+    (unsigned long)configRevision,targets,(unsigned long)(millis()-started));
   return true;
 }
 
@@ -854,7 +933,7 @@ void handleRadio(const Received &message) {
       const bool scoresRequested=beacon.baselineReady!=0;
       scoreReportingEnabled=scoresRequested;
       if(!scoreReportingEnabled) stateHead=stateCount=0;
-      if(lastBridgeBeacon && now-lastBridgeBeacon>12000) queueDiagnostic(DIAG_BRIDGE_REJOIN,now-lastBridgeBeacon);
+      if(lastBridgeBeacon && now-lastBridgeBeacon>=BRIDGE_SEARCH_AFTER_MS) queueDiagnostic(DIAG_BRIDGE_REJOIN,now-lastBridgeBeacon);
       lastBridgeBeacon=now;lastBridgeBeaconSeq=p.seq;
       if(newBridge || missedBridge || bridgeRestarted) {
         if((bridgeRestarted || missedBridge) && calibration.active) {
@@ -945,9 +1024,9 @@ void handleRadio(const Received &message) {
     CalibrationRequestPayload value={};
     if(p.length!=sizeof(value)) { sendAck(message.mac,p.seq,p.type,ACK_BAD_PAYLOAD);return; }
     memcpy(&value,p.payload,sizeof(value));
-    if(!configured || snapshot.active || calibration.active || value.revision!=configRevision+1) { sendAck(message.mac,p.seq,p.type,ACK_BAD_ORDER);return; }
+    if(!configured || snapshot.active || calibration.active || value.revision!=configRevision+1 || value.mode>RETUNE_LIGHTING) { sendAck(message.mac,p.seq,p.type,ACK_BAD_ORDER);return; }
     sendAck(message.mac,p.seq,p.type,ACK_OK);
-    autoCalibrate(value);
+    if(value.mode==RETUNE_LIGHTING) retuneLighting(value); else autoCalibrate(value);
   }
 }
 
