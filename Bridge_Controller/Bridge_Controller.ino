@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.18"
+#define BRIDGE_VERSION "0.1.19"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -392,7 +392,10 @@ void startUpload(Camera &c) { c.phase=1;c.uploadIndex=0;c.pendingType=0;c.baseli
 void reconcileRevision(Camera &c,uint32_t remoteRevision) {
   if(remoteRevision==c.revision) { c.revisionMismatchAt=0;return; }
   if(!c.cells || c.phase) return;
-  if(c.calibrationRevision==remoteRevision) return;
+  // Zero means no calibration transfer is active. Do not confuse a freshly
+  // reset/unconfigured camera at revision zero with calibration revision zero,
+  // or its saved bridge configuration will never be uploaded.
+  if(c.calibrationRevision && c.calibrationRevision==remoteRevision) return;
   if(!c.revisionMismatchAt) c.revisionMismatchAt=millis();
   // Auto-calibration advances the camera by exactly one revision and its
   // reliable result stream follows the first status packet. Give that stream
