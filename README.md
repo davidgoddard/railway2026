@@ -45,7 +45,9 @@ Every camera target must provide:
 
 The same `OccupancyDetector` is used on every target. Hardware-specific image acquisition belongs in `ImageSource`; the detector, cell configuration, baseline comparison, persistence rules, and sensor messages do not change. The current image-source implementations support the AI Thinker ESP32-CAM and ESP32-S3-EYE DVP pin maps. Another DVP board needs its own verified pin map. A different camera interface needs an `ImageSource` adapter that produces the same grayscale buffer contract.
 
-The setup application can auto-size sensors in one ten-second empty-track calibration. Each current radius is treated as a maximum, five nested radii are tested at the fixed user-selected centre, and the camera returns the smallest stable choice plus an individual clear-state threshold. After the first run, users can tune only sensors added since the last successful auto-size or deliberately retune all sensors. The bridge persists sensor creation revisions and the last auto-size revision, so later manual radius and threshold adjustments are not mistaken for new sensors.
+The setup application can size and tune sensors in one ten-second empty-track calibration. Each current radius is treated as a maximum, five nested radii are tested at the fixed user-selected centre, and the camera returns the smallest stable choice with coherent directional structure plus an individual clear-state threshold. The threshold is derived from that sensor's worst empty-scene score with a noise allowance. After the first run, the normal action tunes sensors added since the last successful calibration; **Recalibrate all sensors** deliberately replaces every automatic radius and threshold. The bridge persists sensor creation revisions and the last calibration revision, so later manual adjustments are retained by the new-sensors-only action.
+
+For diagnosing a sensor that fires while the scene appears unchanged, follow the [sensor stability and false-trigger guide](Documentation/sensor-stability-guide.md).
 
 ## Application workflow
 
@@ -53,7 +55,7 @@ The web and desktop applications share the same workflow and terminology:
 
 1. **Overview** shows bridge, connection, camera, calibration, and detector-test readiness, with the next recommended action for each camera.
 2. **Cameras** keeps the camera image visible while sensors and blocks are edited. Blocks appear as expandable railway outputs, draft geometry is marked separately from deployed live state, and **Save & deploy** reports the number of pending changes.
-3. **Calibrate empty track** normally tunes only sensors added or changed since the previous automatic calibration. **More** contains deliberate recalibration of every sensor and baseline-only capture.
+3. **Calibrate empty track** normally tunes only sensors added since the previous automatic calibration. **More** contains deliberate recalibration of every sensor and baseline-only capture.
 4. **Test detector** records traversal transitions, peak scores, intermittent results, and suspect internal block sensors. Selecting a result identifies it in both the image and output tree; a firing sensor offers contextual lighting re-tuning.
 5. **Monitor** groups named railway outputs into Occupied, Attention, and Clear, retains recent transitions, and continues through MQTT when USB is disconnected.
 6. **System** summarizes bridge, radio, Wi-Fi, MQTT, firmware, and camera health. Raw connection diagnostics remain collapsed until requested.
@@ -108,7 +110,7 @@ The C6 image is flashed separately through the board's ESP32-C6 UART header whil
 2. Mount and power each camera so that the monitored track is clearly visible. Keep the camera fixed and provide consistent lighting.
 3. Connect the bridge to your computer by USB. Open the [web setup app](https://davidgoddard.github.io/railway2026/) in desktop Chrome or Edge, choose its USB device, and connect to the bridge. The desktop app is also available; see the [bridge guide](Bridge_Controller/README.md).
 4. Select each discovered camera, fetch a frame, and draw sensor areas over the track. Combine sensors into blocks where needed, then save the configuration.
-5. With all monitored track clear, run **Auto-size empty track** for each camera. Choose **new sensors only** for an initial run or after adding sensors; choose **all sensors** only when you intend to replace every automatically chosen radius and threshold. The shared ten-second run also creates the compatible baseline. Manual baseline capture remains available when sensor sizes and thresholds are already settled.
+5. With all monitored track clear, run **Calibrate empty track** for each camera. The normal action calibrates sensors added since the previous run; use **More → Recalibrate all** when you intend to replace every automatically chosen radius and threshold. The shared ten-second run also creates the compatible baseline. **New baseline** refreshes only the visual reference when geometry and tuning are already settled.
 6. Configure the bridge's Wi-Fi and MQTT connection. Check sensor and block transitions with your rolling stock in the setup app and in your railway control software.
 7. Leave the cameras and bridge powered for normal operation. Reconnect the setup app whenever you need to change settings or inspect the system.
 
@@ -131,7 +133,7 @@ One camera can reduce hardware and wiring **per monitored area** when its view c
 
 ![Step-by-step overview of the virtual sensor algorithm](Documentation/assets/algorithm-explained.png)
 
-This diagram is a simplified overview. The current detector compares the five strongest empty-track directions using both coarse side/centre position bands and three equal-area concentric rings, normalized only within those five directions. Other angles remain diagnostic and cannot dilute the selected structure. Low selected-direction counts reduce confidence rather than directly reporting occupancy. Lighting, shadows, reflections, camera movement, occlusion, and low-texture areas can still affect results, so test representative rolling stock and recapture the clear-track baseline after changing the camera view or sensor configuration.
+This diagram is a conceptual overview; the written rules here and in the camera guide are authoritative. The current detector compares the five strongest empty-track directions using coarse side/centre position bands and three equal-area concentric rings, normalised only within those directions. A low-texture baseline fires only when at least 16 gradients form coherent structure across at least two projected bands and two rings. A structured baseline losing coherent support is also a full change. Other angles remain diagnostic and cannot dilute selected structure, and absolute brightness is not an occupancy input. Lighting can still alter visible structure, so test representative rolling stock and recapture the baseline after changing the camera view or sensor geometry.
 
 It should be obvious but place sensors on the parts of the rails that will become obscured by rolling stock i.e. select the rail furthest from the camera.  At some angles the camera may otherwise still see the rail.  If rolling stock can obscure other rails then consider another camera module and use it above the problematic area - they are deliberately designed to be cheap enough to use a few on a layout.
 

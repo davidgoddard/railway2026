@@ -3,8 +3,6 @@
 // CellRuntime and GroupRuntime are the persisted protocol/runtime records.
 class OccupancyDetector {
  public:
-  // Provisional saturation limit; tune from frames captured on the layout.
-  static constexpr uint8_t FRAME_CLIP_PERCENT=20;
   static constexpr uint8_t DOMINANT_DIRECTIONS=5;
   static constexpr uint8_t RELIABLE_EDGE_COUNT=32;
   using StateCallback = void (*)(uint32_t id, bool grouped, uint16_t score);
@@ -53,6 +51,10 @@ class OccupancyDetector {
   uint8_t directionBucket(int gx,int gy);
   uint8_t spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y);
   uint8_t radialBucket(const CellRuntime &cell,uint8_t peak,int x,int y);
+  uint16_t strongestDirectionSupport(const uint16_t buckets[SPATIAL_BUCKETS]);
+  bool hasCoherentStructure(const uint16_t buckets[SPATIAL_BUCKETS],uint16_t minimumSupport);
+  bool hasWidespreadStructure(const uint16_t buckets[SPATIAL_BUCKETS],
+                              const uint16_t radialBuckets[SPATIAL_BUCKETS],uint16_t edges);
   Feature analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
                   uint16_t radialBuckets[SPATIAL_BUCKETS],
                   int offsetX=0,int offsetY=0);
@@ -114,6 +116,38 @@ uint8_t OccupancyDetector::radialBucket(const CellRuntime &cell,uint8_t peak,int
   const uint8_t ring=distance2*3<radius2 ? 0 : distance2*3<radius2*2 ? 1 : 2;
   return peak*POSITION_BANDS+ring;
 }
+uint16_t OccupancyDetector::strongestDirectionSupport(const uint16_t buckets[SPATIAL_BUCKETS]) {
+  uint16_t strongestDirection=0;
+  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+    uint16_t support=0;
+    for(uint8_t band=0;band<POSITION_BANDS;++band)
+      support+=buckets[direction*POSITION_BANDS+band];
+    strongestDirection=max(strongestDirection,support);
+  }
+  return strongestDirection;
+}
+bool OccupancyDetector::hasCoherentStructure(const uint16_t buckets[SPATIAL_BUCKETS],uint16_t minimumSupport) {
+  return strongestDirectionSupport(buckets)>=minimumSupport;
+}
+bool OccupancyDetector::hasWidespreadStructure(const uint16_t buckets[SPATIAL_BUCKETS],
+                                                const uint16_t radialBuckets[SPATIAL_BUCKETS],uint16_t edges) {
+  // A low-texture baseline is intentionally insensitive to sparse rearranged
+  // gradients. In one frame, require a meaningful coherent line plus evidence
+  // spread through at least two projected portions and two concentric rings.
+  // This is gradient-only: absolute pixel brightness is not consulted.
+  if(edges<16 || strongestDirectionSupport(buckets)<6) return false;
+  uint8_t projectedBands=0,radialRings=0;
+  for(uint8_t band=0;band<POSITION_BANDS;++band) {
+    uint16_t projected=0,radial=0;
+    for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+      projected+=buckets[direction*POSITION_BANDS+band];
+      radial+=radialBuckets[direction*POSITION_BANDS+band];
+    }
+    if(projected>=2) ++projectedBands;
+    if(radial>=2) ++radialRings;
+  }
+  return projectedBands>=2 && radialRings>=2;
+}
 Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
                                    uint16_t radialBuckets[SPATIAL_BUCKETS],
                                    int offsetX,int offsetY) {
@@ -146,7 +180,11 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
     ++buckets[spatialBucket(cell,direction,x,y)];
     ++radialBuckets[radialBucket(cell,direction,x,y)];
   }
-  f.textured=f.edges>=8;
+  // A saved baseline needs a little more support than an individual live line
+  // so marginal four-pixel structure is treated as low texture, not as a
+  // structure that repeatedly disappears. Live structure uses four samples
+  // for comparisons against an already-structured reference.
+  f.textured=hasCoherentStructure(buckets,referenceMode?6:4);
   return f;
 }
 float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets,
@@ -219,12 +257,10 @@ void OccupancyDetector::calibrateCell(CellRuntime &cell) {
 
 uint16_t OccupancyDetector::compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets,
                                         const uint16_t *radialBuckets) {
-  // Direction buckets from very few edges are too sparse to compare reliably.
-  // Treat a weak reference as clear until the live patch has real detail.
-  if(!cell.reference.textured && cell.reference.edges<16 && live.edges<16) return 0;
   float score=0;
-  if(!cell.reference.textured && !live.textured) score=0;
-  else if(!cell.reference.textured && live.textured) score=1;
+  if(!cell.reference.textured)
+    score=hasWidespreadStructure(buckets,radialBuckets,live.edges)?1:0;
+  else if(!live.textured) score=1;
   else score=projectionDistance(cell,live,buckets,radialBuckets);
   return (uint16_t)constrain((int)lroundf(score*1000),0,1000);
 }
@@ -360,30 +396,11 @@ void OccupancyDetector::updateGroups() {
 }
 void OccupancyDetector::analyseAllCells() {
   ++analysisNumber_;
-  // The camera source supplies one grayscale byte per pixel. Count saturation
-  // across the whole frame once, before comparing any individual sensor.
-  const uint32_t total=(uint32_t)width_*height_;
-  uint32_t clipped=0;
-  for(uint32_t p=0;p<total;++p) if(pixels_[p]>=250) ++clipped;
-  if(total && clipped*100>=total*FRAME_CLIP_PERCENT) {
-    bool changed=false;
-    for(uint16_t i=0;i<cellCount_;++i) {
-      CellRuntime &cell=cells_[i];
-      cell.enterCount=cell.clearCount=0;
-      cell.scorePermille=0;
-      if(cell.state!=UNKNOWN) {
-        cell.state=UNKNOWN;
-        emit(cell.config.id,false,0);
-        changed=true;
-      }
-    }
-    if(changed || analysisNumber_%16==0) DEBUGF(
-      "unreliable frame clipped=%lu/%lu (%lu%%) threshold=%u%%\n",
-      (unsigned long)clipped,(unsigned long)total,
-      (unsigned long)(100UL*clipped/total),FRAME_CLIP_PERCENT);
-    updateGroups();
-    return;
-  }
+  // Do not infer camera failure from absolute pixel brightness. A legitimate
+  // layout can contain large black or white areas, and automatic exposure can
+  // briefly move either across a fixed clipping boundary. Capture failures
+  // are handled by the image source; exposure-quality detection would need to
+  // compare whole-frame statistics with this camera's saved baseline.
   const bool sharedPass=prepareWorkMap();
   if(sharedPass && cellCount_) {
     memset(liveFeatures_,0,(size_t)cellCount_*sizeof(Feature));
@@ -416,7 +433,8 @@ void OccupancyDetector::analyseAllCells() {
       }
     }
     for(uint16_t cell=0;cell<cellCount_;++cell)
-      liveFeatures_[cell].textured=liveFeatures_[cell].edges>=8;
+      liveFeatures_[cell].textured=hasCoherentStructure(
+        liveBuckets_+(size_t)cell*SPATIAL_BUCKETS,4);
   }
 
   for(uint16_t i=0;i<cellCount_;++i) {

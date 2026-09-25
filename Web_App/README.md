@@ -25,8 +25,9 @@ Opening `index.html` directly with `file://` is not supported because Web Serial
 - Previously known cameras, configurations, and cached images remain selectable without USB, allowing the MQTT overlay to operate as a standalone layout view.
 - Camera settings, per-sensor persistence settings and mismatch thresholds.
 - Fetched-frame texture preview using the camera's Scharr gradients and twelve fixed 15° direction buckets.
-- On-demand camera baseline comparison showing all fixed direction/position measurements; camera scoring normalizes within the five strongest baseline directions, ignores other angles for occupancy, and reduces confidence for sparse selected gradients.
-- Ten-second fixed-centre automatic radius and threshold calibration for new sensors only or all sensors.
+- On-demand live camera comparison against the saved baseline. Structured baselines use normalised projected bands and concentric rings within their five strongest directions; low-texture baselines require newly appearing, coherent, spatially widespread structure.
+- Ten-second fixed-centre radius and threshold calibration for newly added sensors, with an explicit recalibrate-all option. New baseline refreshes only the visual reference.
+- The same persistent Cameras workspace, live USB/MQTT overlay, traversal test, sensor focus, keyboard movement, and continuous radius control as the Electron app.
 - Bridge Wi-Fi and MQTT configuration.
 - Diagnostics, USB MQTT events and local state history.
 - Direct MQTT state monitoring when the broker exposes MQTT over WebSockets.

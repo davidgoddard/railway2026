@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.22"
+#define CAMERA_MODULE_VERSION "0.2.26"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -587,17 +587,27 @@ bool autoCalibrate(const CalibrationRequestPayload &request) {
     uint8_t chosen=CANDIDATES-1;
     if(tune) for(uint8_t candidate=0;candidate<CANDIDATES;++candidate) {
       const size_t n=(size_t)i*CANDIDATES+candidate;
-      if(trials[n].reference.edges>=100 && stats[n].samples>=3 && stats[n].maximum<=150) { chosen=candidate;break; }
+      // The detector's definition of useful structure is coherent directional
+      // support, not a large absolute edge count. Requiring 100 pixels made
+      // normal small sensors ineligible and silently retained their maximum
+      // radius.
+      if(trials[n].reference.textured && stats[n].samples>=3 && stats[n].maximum<=150) {
+        chosen=candidate;break;
+      }
     }
     const size_t n=(size_t)i*CANDIDATES+chosen;
     cells[i]=trials[n];
-    // Ten seconds cannot represent every later daylight condition. Preserve
-    // the user's existing threshold and add a deliberately conservative
-    // margin above the worst empty score observed during calibration.
+    // Ten seconds cannot represent every later daylight condition. Give the
+    // measured empty-scene maximum a 2x noise allowance plus 100 points. An
+    // explicitly requested calibration must be allowed to lower an inherited
+    // camera-wide value; otherwise a newly added sensor can never escape 800.
+    // Existing/manual values are retained for sensors outside this run's scope.
     uint16_t threshold=staging[i].config.thresholdPermille;
     if(tune) {
-      threshold=(uint16_t)constrain((int)stats[n].maximum*2+100,400,800);
-      threshold=max(threshold,staging[i].config.thresholdPermille);
+      // Keep at least 300 points of usable separation. Stable-scene monitoring
+      // found a sensor calibrated to 200 subsequently idling around 158–159,
+      // which left too little allowance for ordinary exposure movement.
+      threshold=(uint16_t)constrain((int)stats[n].maximum*2+100,300,800);
       threshold=(uint16_t)(((threshold+9)/10)*10);
     }
     cells[i].config.thresholdPermille=threshold;
@@ -782,6 +792,15 @@ void loadBaseline() {
   uint16_t found=0;
   for(uint16_t i=0;i<h.count;++i) {
     cells[i].state=UNKNOWN;cells[i].enterCount=cells[i].clearCount=0;
+    uint16_t strongestDirection=0;
+    for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+      uint16_t support=0;
+      for(uint8_t band=0;band<POSITION_BANDS;++band)
+        support+=cells[i].referenceBuckets[direction*POSITION_BANDS+band];
+      strongestDirection=max(strongestDirection,support);
+    }
+    // Reclassify saved 0.2.22 descriptors without requiring a new baseline.
+    cells[i].reference.textured=strongestDirection>=6;
     uint32_t id=cells[i].config.groupId;if(!id) continue;
     bool known=false;for(uint16_t j=0;j<found;++j) if(groups[j].id==id) known=true;
     if(!known) { if(found>=MAX_GROUPS) return;groups[found++].id=id; }
@@ -1047,8 +1066,17 @@ void setChannel(uint8_t channel) {
     radioChannel=channel;addPeer(BROADCAST_MAC);
     if(bridgeKnown) addPeer(bridgeMac);
     DEBUGF("ESP-NOW channel=%u\n",radioChannel);
-    // Probe each scanned channel instead of relying on one periodic beacon.
-    sendHello();lastHello=millis();
+    // Probe each scanned channel immediately. Broadcast discovery can be
+    // missed, so a camera that knows its bridge also sends a unicast HELLO
+    // during the finite dwell on this candidate channel.
+    sendHello();
+    if(bridgeKnown) {
+      HelloPayload payload={};memcpy(payload.mac,localMac,6);
+      payload.revision=configRevision;payload.width=frameWidth;payload.height=frameHeight;
+      payload.count=cellCount;payload.channel=radioChannel;payload.baselineReady=baselineReady;
+      transmit(bridgeMac,HELLO,nextSeq++,&payload,sizeof(payload));
+    }
+    lastHello=millis();
   }
 }
 

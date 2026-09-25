@@ -1,171 +1,69 @@
-# Railway camera occupancy toolkit — functional specification (draft)
+# Railway camera occupancy toolkit — current functional specification
 
-## Goal
+## Purpose and architecture
 
-Provide configurable virtual sensors and blocks for a model railway without modifying rails or rolling stock. A camera module detects changes in assigned areas of its own image that indicate rolling stock may be present. The controller publishes each area's resulting state to MQTT for layout automation.
+The system provides virtual point sensors and multi-sensor blocks for a model railway. Each fixed camera processes its own grayscale frames and sends compact state, score, health, configuration, and diagnostic messages over ESP-NOW. An ESP32-C3 bridge persists configuration and publishes outputs to MQTT. Continuous monitoring does not require the setup application.
 
-The system consists of an Electron setup and monitoring application, one ESP32-S3 controller, and ESP32-S3 camera modules. The application is needed for setup and diagnosis; normal monitoring continues without the computer. **Each camera captures and processes its frames locally. ESP-NOW carries compact state, configuration, health, and acknowledgement messages, not continuous images.** The controller bridges camera states to MQTT over Wi-Fi.
+The supported setup clients are the Electron application in `Bridge_Controller/app` and the browser application in `Web_App`. They intentionally provide the same camera workspace and workflow. The browser uses Web Serial and requires a secure context; its direct MQTT viewer additionally requires MQTT over WebSockets.
 
-The initial scope is presence detection for configured areas. Train identity, vehicle counts, direction of travel, and complete layout tracking are future possibilities, not requirements for the first release.
+## State and output model
 
-## Terms and state model
+- A **sensor** is a circular image area with a stable ID, centre, radius, contrast floor, mismatch threshold, and enter/clear frame counts.
+- A **block** is a shared output ID assigned to several independently analysed sensors. It is occupied if any member is occupied, clear if all members are clear, and unknown otherwise.
+- Every sensor and block is `clear`, `occupied`, or `unknown`. Unknown must never be interpreted as clear.
+- New sensors default to radius 5 px, mismatch threshold 400/1000, one frame to occupy, and five frames to clear.
+- A score at or above the sensor threshold qualifies for occupancy. A previously occupied sensor begins clearing below 70% of its threshold. The intermediate range holds its state.
+- Single-frame occupancy is supported and is the production default. Additional enter frames are optional filtering, not a detector requirement.
 
-- **Camera view:** a fixed image from one mounted camera at a configured resolution and orientation.
-- **Region of interest (ROI):** a polygon drawn in a camera view, with a stable ID, display name, and type (sensor or block).
-- **Sensor:** a small ROI for detecting a train at a point. **Block:** a larger ROI covering a track section. Both use the same state model.
-- **Baseline:** an empty-track description captured during calibration and tied to ROI geometry and camera settings.
-- **Change:** enough usable parts of an ROI differ from its baseline. Change is evidence of occupation but can also result from hands, shadows, lighting, or camera movement.
-- **State:** `clear`, `occupied`, or `unknown`. Unknown means the system cannot make a trustworthy assertion and must never be interpreted as clear.
+## Detector
 
-A sustained qualifying change makes an ROI occupied. A sustained return to the calibrated empty appearance makes it clear. Invalid or stale evidence makes it unknown. A single frame must not directly toggle a published state.
+Camera firmware `0.2.26` uses normalized 3×3 Scharr gradients. Every qualifying gradient is assigned to one of twelve fixed physical-line directions at 15-degree intervals. For each direction it records three projected side/centre bands and three equal-area concentric rings.
 
-## Component responsibilities
+For a structured empty baseline, the detector selects the five strongest baseline directions. It compares normalized projected and radial distributions within those directions, combines the two spatial distances, discounts sparse evidence, and checks eight neighbouring one-pixel offsets when the initial result could affect state. Absolute brightness and absolute dark/bright pixel coverage are not comparison inputs.
 
-| Component | Responsibilities |
-| --- | --- |
-| Electron application | Pair devices; store and back up each camera's full-frame empty-layout snapshot; show setup and diagnostic views; draw and edit ROIs; calibrate; tune thresholds; show live states and faults; deploy configuration. |
-| Camera ESP32-S3 | Capture frames; derive and persist compact baseline features for assigned cells; process its ROIs locally; filter state over time; persist assigned configuration; send state changes and periodic health. |
-| Controller ESP32-S3 | Persist the deployed configuration; distribute camera settings; validate ESP-NOW reports; track freshness; publish MQTT state and health without the application. |
-| MQTT broker | Distribute current state and health to external automation clients. |
+A baseline is structured when at least six gradients support one direction. Losing coherent support from a structured baseline is a full structural change. A low-texture baseline is deliberately asymmetric: sparse rearranged gradients remain clear, while one live frame occupies only when it contains all of the following:
 
-The preview and initial provisioning transport is a separate setup path. It must permit images without making continuous images part of the ESP-NOW state path. The first camera firmware tests on-demand full-frame grayscale snapshots over ESP-NOW, with chunk acknowledgements and monitoring paused during transfer. The controller must mark observations stale during that interval. A faster setup transport remains a future option. Closing previews must have no effect on normal monitoring after transfer ends.
+- at least 16 qualifying gradients;
+- at least six gradients supporting one direction;
+- evidence in at least two projected regions; and
+- evidence in at least two concentric rings.
 
-## Setup and normal network modes (proposed)
+This makes a normally blank sensor respond to substantial structure appearing across its area without returning to the retired total-edge-count class boundary. Camera capture failures stop new analysis; absolute scene brightness does not make all sensors unknown. Any future exposure-quality classifier must be relative to that camera's saved scene.
 
-| Mode | Controller | Camera modules | Application |
-| --- | --- | --- | --- |
-| Setup | Offers a temporary Wi-Fi hotspot and a provisioning service. Can configure the home Wi-Fi and MQTT connection. | A camera being configured joins the temporary hotspot and serves images and diagnostics over IP. | The laptop joins the temporary hotspot to view and configure cameras. Image transfer is allowed at a modest rate. |
-| Normal | Joins the user's home Wi-Fi as a station for MQTT; receives compact camera reports over ESP-NOW. | Captures and processes frames locally. Sends only state and health messages over ESP-NOW; does not need home Wi-Fi credentials or an IP connection. | Can close or return to the home Wi-Fi; the controller and cameras continue without it. |
-| Recovery | Reports missing cameras and marks their ROIs unknown. Provides an explicit way to re-enter setup. | Keeps its saved identity, keys, and configuration; searches for the paired controller if the radio channel has changed. | Shows which cameras have rejoined and their configuration versions. |
+## Baselines and calibration
 
-The application may fetch a camera preview directly over the controller's hotspot rather than relaying image bytes through the controller application protocol. The first setup implementation may configure one camera at a time to keep hotspot capacity and traffic bounded.
+**New baseline** averages three fresh empty-scene frames and replaces the saved detector features for the current geometry. It does not resize sensors or change thresholds.
 
-ESP-NOW is connectionless and uses a Wi-Fi channel rather than a home-network SSID. Once the controller is connected to a home access point, its ESP-NOW channel must match that access point's channel. Provision cameras with controller identity, pairing keys, and the last known channel. If contact is lost after a router or network change, cameras should search permitted channels for an authenticated controller announcement, then resume normal reporting. The controller must mark their ROIs unknown during the gap. Channel discovery and reconnection time need hardware tests before an availability target is set.
+**Calibrate empty track** performs a shared ten-second run. For each selected sensor, its current radius is the maximum search size and five nested radii are tested. The smallest candidate with coherent baseline structure, at least three samples, and a worst clear score no greater than 150 is selected; otherwise the maximum radius is retained. Its threshold is twice the worst measured clear score plus 100, rounded upward to ten and limited to 300–800. Calibration may lower an inherited threshold.
 
-A wired state link remains an option. I²C has sufficient bandwidth for compact state messages, but bus length, pull-ups, capacitance, addressing, and fault isolation must be tested across the physical layout. If long cable runs are required, evaluate a bus designed for distributed wiring before choosing I²C. The camera algorithm and state-message format should not depend on the physical link.
+Normal calibration selects sensors created since the last successful automatic calibration. **More → Recalibrate all sensors** deliberately replaces every automatic radius and threshold. Sensors outside a new-sensors-only run retain manual values, while the compatible baseline is rebuilt for the complete configuration. Calibration results are transferred reliably one sensor at a time and saved as one new revision. The clients allow 120 seconds for completion because radio retries and large configurations can finish well after the ten-second sampling period.
 
-## Configuration workflow
+**Re-tune lighting** preserves geometry and baseline features. With the target definitely empty, it samples current scores for ten seconds and only raises thresholds where a safe margin exists. It is a recovery tool for current false firing, not a replacement for calibration or a new baseline.
 
-**Prototype implementation note:** The current bridge stores camera cell assignments in its LittleFS partition and exposes them through a USB serial command protocol. The current camera stores its explicitly captured grayscale baseline image and derived features in its own LittleFS partition. The Electron editor and historical-image redeployment workflow below remain future work; the prototype does not yet send an older saved image back to a camera after sensor edits.
+## Application workflow
 
-1. Pair each camera explicitly and assign a stable device ID. Reports from unpaired devices cannot alter states.
-2. Display a representative camera image with its resolution and orientation. Draw polygonal ROIs around visible track and assign unique IDs and names. Warn about out-of-frame regions; label low-texture cells as blank backgrounds rather than rejecting them. Permit intentional overlap.
-3. With the whole visible layout empty, capture a full-frame baseline snapshot for each camera and save it in the setup application's project data. Record camera identity, image dimensions, camera settings, image checksum, and revision. Derive each ROI's cell features from that snapshot and persist the compact results on the camera with its ROI geometry and cell layout. Require a new full-frame snapshot after camera movement, resolution or relevant exposure changes.
-4. Show the live change score, state, and recent transitions for threshold tuning. Apply versioned configuration atomically. The controller shows which version each camera has acknowledged.
-5. Keep the controller's configuration and each camera's assignment across power loss. Reject unsupported or oversized configurations with a reason, leaving the last valid version active.
-6. At startup, each ROI is unknown until the camera has valid configuration and enough fresh frames for a decision.
+1. Connect the USB bridge and select a camera.
+2. Fetch a frame, place or paint sensors, name outputs, and save/deploy the configuration.
+3. Keep the complete view empty and run **Calibrate empty track**. Use **Recalibrate all sensors** when existing automatic values must be replaced. Use baseline-only capture when geometry and thresholds are already correct.
+4. Use the live USB overlay to inspect individual sensor states and scores. MQTT overlay displays published output state; every circle in a block therefore shares the combined block state.
+5. Run **Test detector** and move rolling stock through one block or all blocks. For each internal block sensor, the two nearest sensors in that block are its neighbours. A neighbour-to-neighbour traversal records a pass, miss, or intermittent result; endpoints are not tested.
+6. Use **Compare now** for the camera's current live comparison against its saved baseline. The fetched-frame texture preview describes the last fetched still image and is not live. A brief trigger may be gone before a manual comparison arrives.
+7. Use Monitor for output state/history and System for bridge, Wi-Fi, MQTT, radio, firmware, and diagnostic history.
 
-The setup application's full-frame snapshot must survive power loss and remain available for months, including through an export/import or backup workflow so it can be moved to another computer. Adding or changing a sensor or block later derives its baseline from the original snapshot without requiring the layout to be empty again; removing an ROI does not delete the snapshot. The application must show the snapshot and revision so the user can confirm that a newly selected area was empty when it was taken. It verifies the camera identity, image geometry, and relevant settings before use. If the camera was moved or its image geometry changed, the user must capture a new empty-layout snapshot.
+Selecting a sensor in the image, sensor tree, or traversal results keeps the selection synchronized, scrolls it into view, and highlights it on the image. Arrow keys move a selected sensor one pixel. Radius dragging updates continuously and refreshes the expensive texture/layout views after release.
 
-During setup, the application sends the saved snapshot, or the necessary lossless pixel regions with their gradient borders, to the camera over a setup transport. The camera uses the same feature extractor as normal calibration, returns the new cell features for review, and atomically saves its compact configuration and feature data. The camera and controller continue to operate with the application closed. Replacing the snapshot is an explicit operation that recalculates affected ROIs and keeps the prior working configuration if deployment fails. The first firmware can send a current grayscale frame to the bridge over chunked ESP-NOW on request; receiving a historical application snapshot for later cell additions is not yet implemented.
+## Connectivity and recovery
 
-Full-frame persistent storage belongs to the application's project data; cameras only need enough flash for paired identity, configuration, and derived cell features. The ESP32 controller need not store copies of every camera image. The application must report a missing or corrupt snapshot and must not silently substitute a newer occupied view as the empty baseline.
+Bridge firmware `0.1.21` waits up to twelve seconds for saved Wi-Fi to associate before initializing ESP-NOW, so it normally begins on the router's channel. The bridge sends fast beacons after startup or a channel change and normal beacons thereafter.
 
-## Local detection
+After fifteen seconds without valid bridge contact, a camera searches channels 1–13, dwelling for two seconds on each and repeating forever. On every candidate channel it sends both a broadcast HELLO and an immediate unicast HELLO to the known bridge. The bridge answers promptly and the camera republishes its complete state.
 
-The proposed first algorithm converts captured data to luminance, divides each ROI into small cells, and distinguishes blank from textured backgrounds. A blank cell is a valid reference: the appearance of significant texture is a change. Where texture is present, local edge or gradient orientations describe rails, sleepers, ballast, or scenery. The ROI score combines the proportion and spread of changed cells. A cell must become unknown only when the image evidence itself is unavailable or unreliable, not merely because the empty background lacks edges.
+## Persistence and transport
 
-Calibration observes an averaged three-frame empty reference and, during auto-size, up to ten seconds of empty-scene variation. This is especially important for blank cells, where sensor noise or automatic exposure changes could otherwise look like newly arrived texture. The configurable contrast floor and temporal persistence remain additional safeguards.
+The bridge stores camera configuration, MQTT aliases, sensor creation revisions, and the last automatic-calibration revision in LittleFS. Cameras store their applied configuration and compact derived baseline features. The applications cache the last successfully fetched frame per camera for editing and offline/MQTT viewing; that cached image is not the detector baseline.
 
-The feature extractor, cell size, aggregation, and thresholds are prototype choices to benchmark on the selected ESP32-S3 board and image sensor. Orientation features may tolerate moderate brightness changes, but cannot make detection lighting independent. Broad scene shifts, severe blur, saturation, and capture failure must lead to unknown when they prevent a reliable comparison. The system must not learn a stationary train into the empty baseline automatically.
+Configuration, snapshots, baselines, calibration results, diagnostics, and state bitmaps use protocol v3 with application acknowledgements and retries where required. A full state bitmap is repeated periodically so loss of a transition packet self-heals. Snapshot transfer pauses monitoring and is intended for setup, not continuous video.
 
-Rapid sunlight changes can briefly saturate the camera while automatic exposure settles, making a textured empty cell appear blank. Track near-white pixel fraction, brightness change, and loss of reference detail. If evidence is washed out, report the affected cell or camera view as unknown and suspend enter/clear persistence until fresh usable frames arrive; do not turn missing gradients directly into occupied or clear. Distinguish whole-view lighting disruption from local objects where possible. A pale vehicle can resemble overexposure, so uncertain evidence must remain unknown rather than be silently accepted as empty track. Qualify the thresholds using both sunlight transitions and light-coloured rolling stock.
+## Current limitations
 
-The first hardware experiment is [the Arduino camera angle sketch](../experiments/camera_module/README.md). It accepts blank or textured background references and historically measured 18 gradient-angle bins with up to three dominant directions. The production camera assigns every qualifying gradient to one of twelve fixed 15° physical-line directions, one of three coarse projected position bands, and one of three equal-area concentric rings. It compares the five directions strongest in the baseline and normalizes both spatial descriptions only within those five directions. Complementary projected-band and radial changes are combined, while other angles remain diagnostic and cannot dilute the selected structure. Sparse selected-direction support reduces confidence; total edge loss does not directly create an occupied score. The cutoff, fixed direction boundaries, confidence floor, thresholds, and persistence periods remain provisional and need empty-track and rolling-stock tests.
-
-Angle proportions alone can miss a narrow object against a weakly patterned background: a carpet test produced a 0.240 angle mismatch while the previous event threshold was 0.30. An earlier detector therefore used proportional edge-count change, but testing showed that exposure-driven edge loss could trigger clear track. The current dominant-direction comparison removes that direct term and discounts sparse evidence. New sensors default to a 0.40 mismatch threshold and one qualifying frame to occupy. Qualify this combination against sudden lighting changes and representative rolling stock before adopting it in production.
-
-At resolutions where sleepers cannot be resolved, a rail and a carriage can both produce long edges with similar angles. The production detector uses projected position and concentric-ring position within the five strongest baseline directions so sleeper, ballast, and surface structure can help distinguish empty track from rolling stock without allowing newly visible weak angles to dominate. The setup application applies the same extraction to a fetched frame and shows a nearest-neighbour cell crop with physical line directions overlaid. This lets an operator move or resize a sensor until it contains useful secondary texture. Production does not save exact edge locations because small camera movements caused avoidable sensitivity.
-
-Each ROI has distinct enter and exit thresholds and configurable persistence periods. Occupied requires a qualifying change across the enter period. Clear requires a sustained return to baseline across the exit period. Brief missing or low-confidence frames cannot clear an occupied area. The current prototype defaults new production sensors to a 0.40 mismatch threshold, one frame to occupy, and five frames to clear; these values still need layout testing.
-
-## Line-drawn blocks (proposed)
-
-The editor lets the user drag a line or polyline along a visible track section. It places separately calibrated cells along that path at a configurable spacing, with enough overlap that the monitored path has no gaps. The user can inspect, remove, or reposition individual cells and see their current states. A point sensor may consist of one cell; a block normally consists of many.
-
-Each cell applies its own temporal filtering. The block becomes **occupied if any cell is occupied**. It is **clear only if every cell is clear**. If no cell is occupied and at least one cell is unknown, the block is **unknown**. The block publishes one state event; per-cell states remain available for setup and diagnosis. A single noisy cell can therefore affect the whole block, so calibration and false-trigger tests must be performed at block scale.
-
-At normal operation the camera should evaluate a cell only once per fresh frame and reuse its result for every sensor or block that references it. Shape masks or scanline spans should be computed when configuration is deployed, not rebuilt for every frame. Capacity qualification must include the maximum number of cells across all blocks on a camera, not merely the number of MQTT topics.
-
-The camera may skip or downsample pixels outside ROIs, provided all active ROIs are evaluated using fresh frames. Reports carry a frame timestamp or age and monotonically increasing sequence number.
-
-## Failure and recovery behavior
-
-| Situation | Required behavior |
-| --- | --- |
-| Sustained changed ROI | Transition to occupied and report promptly. |
-| Sustained baseline-like ROI | Transition to clear and report promptly. |
-| Startup, missing calibration, or config mismatch | Report unknown; never publish clear based only on saved state. |
-| Capture or analysis failure | Report unknown after a short configured fault window and include a health reason. |
-| Camera heartbeat expires | Controller publishes unknown for all that camera's ROIs. |
-| Controller loses MQTT | Continue monitoring. Keep the latest state per ROI and republish a fresh snapshot on reconnect. |
-| Controller restarts | Publish unknown until fresh, version-matched camera observations arrive. |
-| ROI or camera removed | Retire its retained MQTT topics explicitly; define the exact removal policy before integration. |
-
-Cameras send periodic health even without state changes. A changed frame produces a complete two-bit sensor-state bitmap indexed by the saved configuration, allowing up to 300 clear, occupied or unknown states in one ESP-NOW message. The controller derives block states locally. Mismatch scores are lower-priority diagnostics sent separately only while the USB application is active, so they do not hold up the next capture. The controller validates identity, configuration version, sensor count, encoding, sequence, and freshness. Duplicate or delayed reports cannot roll state backward. ESP-NOW send success alone does not prove application-level receipt; periodic full-state refresh ensures a missed bitmap cannot leave a permanently wrong state.
-
-## MQTT contract (proposed)
-
-Use a configurable root such as `railway/<layout-id>`. Machine IDs remain stable if display names change. Example topics and payloads:
-
-| Topic | Example payload |
-| --- | --- |
-| `railway/home/areas/block-1/state` | `occupied` |
-| `railway/home/areas/block-1/health` | `{"camera":"cam-3","reason":"ok","age_ms":82}` |
-| `railway/home/cameras/cam-3/health` | `{"status":"online","fps":10.4,"config_version":7}` |
-| `railway/home/controller/health` | `online` |
-
-State payloads are exactly clear, occupied, or unknown. Publish current states retained, with QoS 1 proposed; consumers must tolerate duplicate messages. Controller health uses an MQTT last will to become offline on an ungraceful disconnect. Retained state alone cannot prove current observation, so consumers also check controller health and state age. Republish all states after reconnect or configuration change. Store broker address, credentials, root topic, and layout ID on the controller.
-
-## Performance and capacity guardrails
-
-- **Frame rate:** each camera acquires and evaluates at least 10 fresh frames per second with ESP-NOW active, at a resolution where rails and sleepers in its ROIs are visibly distinguishable. The selected resolution and maximum ROI load must be demonstrated on the chosen board, not inferred from the sensor's maximum resolution.
-- **State latency:** after the configured persistence period, 95% of qualifying transitions reach the broker within 500 ms of the decisive frame on a healthy local network. This is a provisional acceptance target pending measurements.
-- **Overload:** report measured fps and overload status. Do not repeatedly assert clear from old frames.
-- **Traffic:** normal operation sends state changes and low-rate health, not images. Preview traffic must be limited so it does not break the qualified monitoring performance.
-- **Capacity:** publish tested limits for cameras per controller, ROIs and ROI area per camera, memory, radio range, and power. Do not promise 40 paired ESP-NOW cameras; Espressif documents a 20-peer unicast pairing limit and a lower configurable encrypted-peer limit.
-- **Block geometry:** measured cell count and spacing must cover the drawn line. The editor must report the estimated per-frame cell work before deploying a line that exceeds the camera's frame-rate budget.
-
-Prototype measurements must compare sensor output modes, grayscale acquisition, JPEG decode cost if used, ROI sampling, memory use, and frame rate with Wi-Fi/ESP-NOW active. High-resolution uncompressed capture can consume substantial memory bandwidth. Only qualify a processing path after it meets the frame rate and latency targets with the intended ROI load.
-
-## Security and diagnostic guardrails
-
-- Pairing requires a setup action. Ignore unsolicited reports and unauthorized configuration changes.
-- Authenticate to the MQTT broker. Determine whether encrypted MQTT meets the board's measured performance budget.
-- Keep Wi-Fi and MQTT secrets out of routine application views and diagnostic exports.
-- Include protocol and configuration versions so incompatible firmware is visible.
-- Show camera identity, last contact, applied configuration version, measured fps, and per-ROI state in the application.
-- Provide a diagnostic mode showing change scores and transitions for calibration and fault finding.
-
-## First-prototype acceptance scenarios
-
-1. A calibrated empty ROI remains clear during representative normal lighting changes and passing shadows agreed for the test layout.
-2. A locomotive and the smallest expected wagon or carriage each cause occupied in every ROI they cover, including while stopped.
-3. An ROI clears only after the tested vehicle has fully left and the exit persistence period has elapsed.
-4. Camera failure makes its ROIs unknown within the configured freshness timeout. Restart never briefly publishes a stale clear.
-5. MQTT reconnection restores the latest valid snapshot while the Electron application is closed.
-6. At the selected maximum ROI load, sustained testing records at least 10 evaluated frames per second and the qualified latency target, along with missed frames, false transitions, and free memory.
-7. Lost, duplicate, and delayed ESP-NOW reports converge to the camera's current state through refresh or acknowledgement recovery.
-
-## Open decisions and measurements
-
-| Item | Needed |
-| --- | --- |
-| Camera hardware | Board, PSRAM, image sensor, lens, mounting distance, field of view, and power arrangement. |
-| Image path | Resolution and pixel format that show rail/sleeper texture and sustain 10 fps with radio active. |
-| ROI capacity | Maximum count, dimensions, and cell density per camera. |
-| Detection tuning | Thresholds, persistence, baseline update policy, and behavior at turnouts, tunnels, reflections, and low light. |
-| Preview/provisioning | How a factory-new camera securely joins the temporary hotspot (for example, a pairing button and one-time token), and how the application reaches its preview. |
-| Radio topology | ESP-NOW and router Wi-Fi channel coordination, encrypted-peer capacity, channel search, and interference recovery. |
-| Wired alternative | Whether the physical layout can support I²C cable length and fault isolation, or needs a more robust wired bus. |
-| Reliability | Acceptable false clear/occupied rates, heartbeat interval, freshness timeout, and outage recovery time. |
-| MQTT integration | Final topic schema, retained topic retirement, payload versioning, and security settings. |
-
-## Hardware references
-
-- [Espressif camera driver](https://github.com/espressif/esp32-camera/blob/master/README.md): ESP32-S3 support, PSRAM and frame buffer considerations, and RGB/YUV load with Wi-Fi.
-- [Espressif ESP-NOW guide](https://docs.espressif.com/projects/esp-idf/en/release-v5.3/esp32s3/api-reference/network/esp_now.html): pairing limit and channel constraints.
-- [Espressif ESP-NOW FAQ](https://docs.espressif.com/projects/esp-faq/en/latest/application-solution/esp-now.html): shared Wi-Fi channel and encrypted-peer limits.
-- [Espressif Wi-Fi overview](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-guides/wifi-driver/overview.html): simultaneous AP/station mode and precedence of the external access point's channel.
-- [Espressif I²C guide](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/peripherals/i2c.html): bus timing, pull-ups, and wire-capacitance considerations.
-- [Espressif ESP-MQTT guide](https://docs.espressif.com/projects/esp-idf/en/v5.5.4/esp32s3/api-reference/protocols/mqtt.html): retained messages, QoS, and last will.
+The system remains under active development. Pairing is not authenticated, there is no OTA firmware path, and camera/image quality, radio coexistence, sensor capacity, and performance require validation on the installed layout. Lighting, shadows, reflections, focus, vibration, and occlusion can still alter gradient evidence. Test representative rolling stock at operating speed before relying on an output.

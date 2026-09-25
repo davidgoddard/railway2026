@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.20"
+#define BRIDGE_VERSION "0.1.21"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -110,6 +110,7 @@ uint32_t sequence=1,lastMqttAttempt=0,lastWifiAttempt=0;
 uint32_t lastUsbCommandAt=0;
 constexpr uint32_t MQTT_RETRY_MS=30000;
 constexpr uint32_t MQTT_EARLY_RETRY_MS=10000;
+constexpr uint32_t WIFI_STARTUP_WAIT_MS=12000;
 uint8_t mqttStartupFailures=0;
 uint8_t radioChannel=START_CHANNEL;
 uint32_t lastBeacon=0,fastBeaconUntil=0,lastBeaconFailureLog=0;
@@ -964,13 +965,20 @@ void setup() {
     root.close();
   }
   WiFi.mode(WIFI_STA);WiFi.setSleep(false);
-  if(ssid.length()) WiFi.begin(ssid.c_str(),password.c_str());
+  if(ssid.length()) {
+    // Wi-Fi and ESP-NOW share one radio. Do not advertise on channel 1 and
+    // then disappear when association moves the radio to the router channel.
+    WiFi.begin(ssid.c_str(),password.c_str());
+    const uint32_t wifiStarted=millis();
+    while(WiFi.status()!=WL_CONNECTED && millis()-wifiStarted<WIFI_STARTUP_WAIT_MS)
+      delay(50);
+  }
+  if(WiFi.status()==WL_CONNECTED) radioChannel=WiFi.channel();
   else esp_wifi_set_channel(START_CHANNEL,WIFI_SECOND_CHAN_NONE);
   inbox=xQueueCreate(32,sizeof(Received));
   if(!inbox) { Serial.println("ERR esp_now queue_allocation");return; }
   if(esp_now_init()!=ESP_OK) Serial.println("ERR esp_now init");
   else esp_now_register_recv_cb(onReceive);
-  if(WiFi.status()==WL_CONNECTED) radioChannel=WiFi.channel();
   addPeer(BROADCAST);
   fastBeaconUntil=millis()+FAST_BEACON_WINDOW_MS;
   broadcastBeacon();

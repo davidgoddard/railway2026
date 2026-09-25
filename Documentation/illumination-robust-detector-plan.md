@@ -1,19 +1,21 @@
-# Illumination-robust occupancy detector plan
+# Historical illumination-robust detector design review
 
 ## Status and purpose
 
-This record reviews the proposal to make the camera occupancy detector less
-sensitive to illumination changes. It separates changes whose benefit follows
-directly from the current implementation from ideas that need controlled
-comparison before they become part of the production detector.
+This is an archived design review, not the current specification. Some proposals
+below were investigated, superseded, or deliberately not adopted. Use the
+[functional specification](functional-specification.md), [camera guide](../Camera_Module/README.md),
+and [stability guide](sensor-stability-guide.md) for production behaviour.
 
-The current firmware uses Scharr gradients, twelve hard 15-degree direction
-buckets, three hard position bands per direction, and a baseline-derived
-gradient cutoff. Each qualifying gradient contributes one vote. The mismatch
-is the larger of the 36-bucket distribution distance and proportional change
-in the number of qualifying gradients. This is more robust than raw-pixel
-comparison, but it is not illumination invariant: a contrast change can move
-gradients across the cutoff and can therefore change both terms of the score.
+Firmware 0.2.26 uses Scharr gradients and twelve fixed 15-degree directions. A
+structured baseline compares normalised projected bands and concentric rings
+within its five strongest directions; it does not combine that distance with a
+total-edge-count term. Low-texture baselines use a separate widespread-structure
+gate. Absolute brightness is not an occupancy input.
+
+The remaining sections preserve the reasoning and candidate experiments as a
+historical engineering record. Their imperative wording does not mean that an
+item is scheduled or present in production.
 
 ## Do now
 
