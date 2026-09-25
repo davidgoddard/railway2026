@@ -2,8 +2,8 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
-const { DEFAULT_CELL, crc32, Snapshot, parseRow, validateConfig, commandsForConfig } = require('./protocol');
-const { sameCameraConfiguration, alignConfigurationToFrame, frameMatchesConfiguration } = require('./config-match');
+const { DEFAULT_CELL, crc32, Snapshot, parseRow, validateConfig, commandsForConfig, committedConfig } = require('./protocol');
+const { sameCameraConfiguration, countCameraChanges, alignConfigurationToFrame, frameMatchesConfiguration } = require('./config-match');
 const mac = 'AA:BB:CC:DD:EE:FF';
 test('new production sensors default to one occupancy frame and a 400 score', () => {
   assert.equal(DEFAULT_CELL.enter, 1);
@@ -106,4 +106,29 @@ test('Live view accepts the same saved config with default topics and parsed fie
   assert.equal(sameCameraConfiguration(draft, saved), true);
   saved.cells[0].x++;
   assert.equal(sameCameraConfiguration(draft, saved), false);
+});
+test('counts changed, added, removed, and renamed camera items', () => {
+  const saved = config(), draft = structuredClone(saved);
+  assert.equal(countCameraChanges(draft, saved), 0);
+  draft.cells[0].x++;
+  draft.cells.push({ ...draft.cells[1], id: 3 });
+  draft.topics[20] = 'platform-renamed';
+  assert.equal(countCameraChanges(draft, saved), 3);
+  draft.cells = draft.cells.filter(cell => cell.id !== 2);
+  assert.equal(countCameraChanges(draft, saved), 4);
+});
+test('records a committed draft locally without waiting for a bridge refresh', () => {
+  const current = config();
+  current.revision = 7;
+  current.lastAutoSizeRevision = 6;
+  current.cells[0].createdRevision = 2;
+  const draft = structuredClone(current);
+  draft.cells[0].x = 123;
+  draft.cells.push({ ...draft.cells[1], id: 99, createdRevision: 0 });
+  const saved = committedConfig(current, draft);
+  assert.equal(saved.revision, 8);
+  assert.equal(saved.lastAutoSizeRevision, 6);
+  assert.equal(saved.cells[0].x, 123);
+  assert.equal(saved.cells[0].createdRevision, 2);
+  assert.equal(saved.cells[2].createdRevision, 8);
 });

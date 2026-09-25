@@ -5,6 +5,8 @@ class OccupancyDetector {
  public:
   // Provisional saturation limit; tune from frames captured on the layout.
   static constexpr uint8_t FRAME_CLIP_PERCENT=20;
+  static constexpr uint8_t DOMINANT_DIRECTIONS=5;
+  static constexpr uint8_t RELIABLE_EDGE_COUNT=32;
   using StateCallback = void (*)(uint32_t id, bool grouped, uint16_t score);
   void bind(const uint8_t *pixels, uint16_t width, uint16_t height,
             CellRuntime *cells, uint16_t cellCount, GroupRuntime *groups,
@@ -36,6 +38,7 @@ class OccupancyDetector {
   uint16_t *workMembers_=nullptr;
   Feature *liveFeatures_=nullptr;
   uint16_t *liveBuckets_=nullptr;
+  uint16_t *liveRadialBuckets_=nullptr;
   uint16_t *liveCutoffs_=nullptr;
   uint32_t workPixelCount_=0,workMemberCount_=0,workSignature_=0;
   int16_t directionX_[FIXED_DIRECTIONS]={},directionY_[FIXED_DIRECTIONS]={};
@@ -49,10 +52,14 @@ class OccupancyDetector {
   void bounds(const CellConfig &c,int &x0,int &x1,int &y0,int &y1);
   uint8_t directionBucket(int gx,int gy);
   uint8_t spatialBucket(const CellRuntime &cell,uint8_t peak,int x,int y);
+  uint8_t radialBucket(const CellRuntime &cell,uint8_t peak,int x,int y);
   Feature analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
+                  uint16_t radialBuckets[SPATIAL_BUCKETS],
                   int offsetX=0,int offsetY=0);
-  float projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets);
-  uint16_t compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets);
+  float projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets,
+                           const uint16_t *radialBuckets);
+  uint16_t compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets,
+                       const uint16_t *radialBuckets);
   void updateGroups();
   uint32_t configurationSignature() const;
   bool prepareWorkMap();
@@ -100,10 +107,19 @@ uint8_t OccupancyDetector::spatialBucket(const CellRuntime &cell,uint8_t peak,in
   const uint8_t band=rhoQ8 < -limitQ8 ? 0 : rhoQ8 > limitQ8 ? 2 : 1;
   return peak*POSITION_BANDS+band;
 }
+uint8_t OccupancyDetector::radialBucket(const CellRuntime &cell,uint8_t peak,int x,int y) {
+  const int32_t dx=x-(int)cell.config.x,dy=y-(int)cell.config.y;
+  const int32_t distance2=dx*dx+dy*dy,radius2=(int32_t)cell.config.radius*cell.config.radius;
+  // Equal-area rings keep the naturally larger outer region from dominating.
+  const uint8_t ring=distance2*3<radius2 ? 0 : distance2*3<radius2*2 ? 1 : 2;
+  return peak*POSITION_BANDS+ring;
+}
 Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t buckets[SPATIAL_BUCKETS],
+                                   uint16_t radialBuckets[SPATIAL_BUCKETS],
                                    int offsetX,int offsetY) {
   Feature f={};
   memset(buckets,0,(SPATIAL_BUCKETS)*sizeof(uint16_t));
+  memset(radialBuckets,0,(SPATIAL_BUCKETS)*sizeof(uint16_t));
   int x0,x1,y0,y1;bounds(cell.config,x0,x1,y0,y1);
   for(int y=y0;y<=y1;++y) for(int x=x0;x<=x1;++x) {
     if(!insideCell(cell.config,x,y)) continue;
@@ -128,21 +144,68 @@ Feature OccupancyDetector::analyse(CellRuntime &cell,bool referenceMode,uint16_t
     ++f.edges;
     const uint8_t direction=directionBucket(gx,gy);
     ++buckets[spatialBucket(cell,direction,x,y)];
+    ++radialBuckets[radialBucket(cell,direction,x,y)];
   }
   f.textured=f.edges>=8;
   return f;
 }
-float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
-  if(!cell.reference.edges || !live.edges) return 1;
-  float sum=0;
-  for(int i=0;i<SPATIAL_BUCKETS;++i)
-    sum+=fabsf((float)cell.referenceBuckets[i]/cell.reference.edges
-             -(float)buckets[i]/live.edges);
-  return min(1.0f,0.5f*sum);
+float OccupancyDetector::projectionDistance(const CellRuntime &cell,const Feature &live,const uint16_t *buckets,
+                                             const uint16_t *radialBuckets) {
+  // Compare only directions that were strong in the empty-track reference.
+  // Weak directions move between adjacent buckets when exposure or shadows
+  // change and previously made an otherwise unchanged sensor look occupied.
+  if(!cell.reference.edges || !live.edges) return 0;
+  uint16_t support[FIXED_DIRECTIONS]={};
+  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction)
+    for(uint8_t band=0;band<POSITION_BANDS;++band)
+      support[direction]+=cell.referenceBuckets[direction*POSITION_BANDS+band];
+  bool selected[FIXED_DIRECTIONS]={};
+  for(uint8_t choice=0;choice<DOMINANT_DIRECTIONS;++choice) {
+    int8_t best=-1;
+    for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction)
+      if(!selected[direction] && (best<0 || support[direction]>support[(uint8_t)best])) best=direction;
+    if(best<0 || !support[(uint8_t)best]) break;
+    selected[(uint8_t)best]=true;
+  }
+  uint32_t referenceSelected=0,liveSelected=0;
+  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+    if(!selected[direction]) continue;
+    for(uint8_t band=0;band<POSITION_BANDS;++band) {
+      const uint8_t index=direction*POSITION_BANDS+band;
+      referenceSelected+=cell.referenceBuckets[index];
+      liveSelected+=buckets[index];
+    }
+  }
+  if(!referenceSelected || !liveSelected) return 0;
+  float projectedSum=0,radialSum=0;
+  for(uint8_t direction=0;direction<FIXED_DIRECTIONS;++direction) {
+    if(!selected[direction]) continue;
+    for(uint8_t band=0;band<POSITION_BANDS;++band) {
+      const uint8_t index=direction*POSITION_BANDS+band;
+      projectedSum+=fabsf((float)cell.referenceBuckets[index]/referenceSelected
+                        -(float)buckets[index]/liveSelected);
+      radialSum+=fabsf((float)cell.referenceRadialBuckets[index]/referenceSelected
+                     -(float)radialBuckets[index]/liveSelected);
+    }
+  }
+  // Sparse selected directions are poor evidence of a structural change.
+  const float confidence=min(1.0f,(float)min(referenceSelected,liveSelected)/RELIABLE_EDGE_COUNT);
+  // Both descriptors are normalised over the same selected directions, so a
+  // broad contrast change does not score merely because it exposes more edge
+  // pixels. Radial position adds sensitivity to changed edge extent without
+  // giving up the projected bands' side/centre information.
+  const float projectedDistance=min(1.0f,0.5f*projectedSum);
+  const float radialDistance=min(1.0f,0.5f*radialSum);
+  // Treat the two spatial views as complementary evidence. This preserves the
+  // old projected-band score and raises it when the concentric distribution
+  // independently changed, without using absolute brightness or edge count.
+  const float combined=projectedDistance+radialDistance-projectedDistance*radialDistance;
+  return min(1.0f,combined*confidence);
 }
 void OccupancyDetector::calibrateCell(CellRuntime &cell) {
   memset(cell.referenceBuckets,0,sizeof(cell.referenceBuckets));
-  cell.reference=analyse(cell,true,cell.referenceBuckets);
+  memset(cell.referenceRadialBuckets,0,sizeof(cell.referenceRadialBuckets));
+  cell.reference=analyse(cell,true,cell.referenceBuckets,cell.referenceRadialBuckets);
   cell.state=CLEAR;cell.enterCount=cell.clearCount=0;cell.scorePermille=0;
   DEBUGF("base id=%lu group=%lu centre=(%u,%u) r=%u edges=%u angles=%u",
     (unsigned long)cell.config.id,(unsigned long)cell.config.groupId,
@@ -154,24 +217,21 @@ void OccupancyDetector::calibrateCell(CellRuntime &cell) {
 #endif
 }
 
-uint16_t OccupancyDetector::compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets) {
+uint16_t OccupancyDetector::compareCell(CellRuntime &cell,const Feature &live,const uint16_t *buckets,
+                                        const uint16_t *radialBuckets) {
   // Direction buckets from very few edges are too sparse to compare reliably.
   // Treat a weak reference as clear until the live patch has real detail.
   if(!cell.reference.textured && cell.reference.edges<16 && live.edges<16) return 0;
   float score=0;
   if(!cell.reference.textured && !live.textured) score=0;
-  else if(cell.reference.textured!=live.textured) score=1;
-  else {
-    score=projectionDistance(cell,live,buckets);
-    const float edgeDensity=fabsf((float)cell.reference.edges-live.edges)
-      /max((float)cell.reference.edges,(float)live.edges);
-    score=max(score,edgeDensity);
-  }
+  else if(!cell.reference.textured && live.textured) score=1;
+  else score=projectionDistance(cell,live,buckets,radialBuckets);
   return (uint16_t)constrain((int)lroundf(score*1000),0,1000);
 }
 uint16_t OccupancyDetector::inspectCell(CellRuntime &cell,Feature &live,uint16_t buckets[SPATIAL_BUCKETS]) {
-  live=analyse(cell,false,buckets);
-  uint16_t score=compareCell(cell,live,buckets);
+  uint16_t radialBuckets[SPATIAL_BUCKETS]={};
+  live=analyse(cell,false,buckets,radialBuckets);
+  uint16_t score=compareCell(cell,live,buckets,radialBuckets);
   const uint16_t toleranceTarget=cell.state==OCCUPIED
     ? (uint16_t)(cell.config.thresholdPermille*0.7f)
     : cell.config.thresholdPermille;
@@ -179,8 +239,9 @@ uint16_t OccupancyDetector::inspectCell(CellRuntime &cell,Feature &live,uint16_t
     for(int dx=-1;dx<=1 && score>=toleranceTarget;++dx) {
       if(!dx && !dy) continue;
       uint16_t shiftedBuckets[SPATIAL_BUCKETS]={};
-      const Feature shifted=analyse(cell,false,shiftedBuckets,dx,dy);
-      const uint16_t shiftedScore=compareCell(cell,shifted,shiftedBuckets);
+      uint16_t shiftedRadialBuckets[SPATIAL_BUCKETS]={};
+      const Feature shifted=analyse(cell,false,shiftedBuckets,shiftedRadialBuckets,dx,dy);
+      const uint16_t shiftedScore=compareCell(cell,shifted,shiftedBuckets,shiftedRadialBuckets);
       if(shiftedScore<score) {
         score=shiftedScore;live=shifted;
         memcpy(buckets,shiftedBuckets,sizeof(shiftedBuckets));
@@ -204,8 +265,9 @@ uint32_t OccupancyDetector::configurationSignature() const {
 }
 
 void OccupancyDetector::releaseWorkMap() {
-  free(workPixels_);free(workMembers_);free(liveFeatures_);free(liveBuckets_);free(liveCutoffs_);
+  free(workPixels_);free(workMembers_);free(liveFeatures_);free(liveBuckets_);free(liveRadialBuckets_);free(liveCutoffs_);
   workPixels_=nullptr;workMembers_=nullptr;liveFeatures_=nullptr;liveBuckets_=nullptr;liveCutoffs_=nullptr;
+  liveRadialBuckets_=nullptr;
   workPixelCount_=workMemberCount_=workSignature_=0;
 }
 
@@ -235,9 +297,10 @@ bool OccupancyDetector::prepareWorkMap() {
   workMembers_=(uint16_t *)ps_malloc((size_t)totalMembers*sizeof(uint16_t));
   liveFeatures_=(Feature *)ps_malloc((size_t)cellCount_*sizeof(Feature));
   liveBuckets_=(uint16_t *)ps_malloc((size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
+  liveRadialBuckets_=(uint16_t *)ps_malloc((size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
   liveCutoffs_=(uint16_t *)ps_malloc((size_t)cellCount_*sizeof(uint16_t));
   if((uniquePixels && !workPixels_) ||
-     (totalMembers && !workMembers_) || !liveFeatures_ || !liveBuckets_ || !liveCutoffs_) {
+     (totalMembers && !workMembers_) || !liveFeatures_ || !liveBuckets_ || !liveRadialBuckets_ || !liveCutoffs_) {
     free(mask);releaseWorkMap();return false;
   }
   uint32_t nextPixel=0;
@@ -325,6 +388,7 @@ void OccupancyDetector::analyseAllCells() {
   if(sharedPass && cellCount_) {
     memset(liveFeatures_,0,(size_t)cellCount_*sizeof(Feature));
     memset(liveBuckets_,0,(size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
+    memset(liveRadialBuckets_,0,(size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
     uint16_t lowestCutoff=UINT16_MAX;
     for(uint16_t cell=0;cell<cellCount_;++cell) {
       liveCutoffs_[cell]=(uint16_t)max((int)cells_[cell].config.contrastFloor,
@@ -347,6 +411,8 @@ void OccupancyDetector::analyseAllCells() {
         ++live.edges;
         ++liveBuckets_[(size_t)cellIndex*SPATIAL_BUCKETS+
           spatialBucket(cell,direction,item.x,item.y)];
+        ++liveRadialBuckets_[(size_t)cellIndex*SPATIAL_BUCKETS+
+          radialBucket(cell,direction,item.x,item.y)];
       }
     }
     for(uint16_t cell=0;cell<cellCount_;++cell)
@@ -356,10 +422,13 @@ void OccupancyDetector::analyseAllCells() {
   for(uint16_t i=0;i<cellCount_;++i) {
     CellRuntime &cell=cells_[i];
     uint16_t fallbackBuckets[SPATIAL_BUCKETS]={};
-    const Feature live=sharedPass?liveFeatures_[i]:analyse(cell,false,fallbackBuckets);
+    uint16_t fallbackRadialBuckets[SPATIAL_BUCKETS]={};
+    const Feature live=sharedPass?liveFeatures_[i]:analyse(cell,false,fallbackBuckets,fallbackRadialBuckets);
     const uint16_t *buckets=sharedPass
       ? liveBuckets_+(size_t)i*SPATIAL_BUCKETS : fallbackBuckets;
-    cell.scorePermille=compareCell(cell,live,buckets);
+    const uint16_t *radialBuckets=sharedPass
+      ? liveRadialBuckets_+(size_t)i*SPATIAL_BUCKETS : fallbackRadialBuckets;
+    cell.scorePermille=compareCell(cell,live,buckets,radialBuckets);
     // A one-pixel image shift can replace several edge samples in a small
     // cell. Search neighbouring image positions only when the current score
     // could enter occupancy or prevent an occupied cell from clearing.
@@ -371,8 +440,9 @@ void OccupancyDetector::analyseAllCells() {
         for(int dx=-1;dx<=1 && cell.scorePermille>=toleranceTarget;++dx) {
           if(!dx && !dy) continue;
           uint16_t shiftedBuckets[SPATIAL_BUCKETS]={};
-          const Feature shifted=analyse(cell,false,shiftedBuckets,dx,dy);
-          cell.scorePermille=min(cell.scorePermille,compareCell(cell,shifted,shiftedBuckets));
+          uint16_t shiftedRadialBuckets[SPATIAL_BUCKETS]={};
+          const Feature shifted=analyse(cell,false,shiftedBuckets,shiftedRadialBuckets,dx,dy);
+          cell.scorePermille=min(cell.scorePermille,compareCell(cell,shifted,shiftedBuckets,shiftedRadialBuckets));
         }
       }
     }

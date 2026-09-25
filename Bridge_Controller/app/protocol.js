@@ -85,4 +85,13 @@ function commandsForConfig(mac, config) {
     ...[...new Set(config.cells.map(c => c.group || c.id))].map(id => `TOPIC ${mac} ${id} ${hex(config.topics?.[id] || String(id))}`)
   ];
 }
-module.exports = { RESOLUTIONS, DEFAULT_CELL, MAC, SLUG, hex, parseRow, crc32, Snapshot, validateConfig, commandsForConfig };
+function committedConfig(current, draft) {
+  const revision = current.revision + 1;
+  const existing = new Map(current.cells.map(cell => [cell.id, cell.createdRevision]));
+  return {
+    ...JSON.parse(JSON.stringify(draft)), revision,
+    lastAutoSizeRevision: current.lastAutoSizeRevision,
+    cells: draft.cells.map(cell => ({ ...cell, createdRevision: existing.get(cell.id) || revision }))
+  };
+}
+module.exports = { RESOLUTIONS, DEFAULT_CELL, MAC, SLUG, hex, parseRow, crc32, Snapshot, validateConfig, commandsForConfig, committedConfig };

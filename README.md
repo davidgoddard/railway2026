@@ -47,6 +47,19 @@ The same `OccupancyDetector` is used on every target. Hardware-specific image ac
 
 The setup application can auto-size sensors in one ten-second empty-track calibration. Each current radius is treated as a maximum, five nested radii are tested at the fixed user-selected centre, and the camera returns the smallest stable choice plus an individual clear-state threshold. After the first run, users can tune only sensors added since the last successful auto-size or deliberately retune all sensors. The bridge persists sensor creation revisions and the last auto-size revision, so later manual radius and threshold adjustments are not mistaken for new sensors.
 
+## Application workflow
+
+The web and desktop applications share the same workflow and terminology:
+
+1. **Overview** shows bridge, connection, camera, calibration, and detector-test readiness, with the next recommended action for each camera.
+2. **Cameras** keeps the camera image visible while sensors and blocks are edited. Blocks appear as expandable railway outputs, draft geometry is marked separately from deployed live state, and **Save & deploy** reports the number of pending changes.
+3. **Calibrate empty track** normally tunes only sensors added or changed since the previous automatic calibration. **More** contains deliberate recalibration of every sensor and baseline-only capture.
+4. **Test detector** records traversal transitions, peak scores, intermittent results, and suspect internal block sensors. Selecting a result identifies it in both the image and output tree; a firing sensor offers contextual lighting re-tuning.
+5. **Monitor** groups named railway outputs into Occupied, Attention, and Clear, retains recent transitions, and continues through MQTT when USB is disconnected.
+6. **System** summarizes bridge, radio, Wi-Fi, MQTT, firmware, and camera health. Raw connection diagnostics remain collapsed until requested.
+
+Keyboard users can reach all controls using Tab. A high-contrast amber focus ring identifies the active control, and changing operation, test, transfer, and system status is announced to assistive technology.
+
 ESP32-P4 camera hardware is capable of DVP, MIPI-CSI, SPI, and USB camera input through Espressif's [ESP Video components](https://docs.espressif.com/projects/esp-video-components/en/latest/esp32p4/Get_Started/index.html). It does not use the legacy `esp_camera` path used by the current ESP32 and S3 adapters. P4 boards also require a radio companion. Stock ESP-Hosted provides ordinary Wi-Fi through common P4 companion arrangements, but the existing railway camera protocol also requires ESP-NOW. P4 support must therefore include both an ESP Video image-source adapter and a verified route through companion firmware for the ESP-NOW packets.
 
 ## Camera module choices
@@ -118,7 +131,7 @@ One camera can reduce hardware and wiring **per monitored area** when its view c
 
 ![Step-by-step overview of the virtual sensor algorithm](Documentation/assets/algorithm-explained.png)
 
-This diagram is a simplified overview. The current detector also considers coarse edge position and the total number of strong edges. Lighting, shadows, reflections, camera movement, occlusion, and low-texture areas can still affect results, so test representative rolling stock and recapture the clear-track baseline after changing the camera view or sensor configuration.
+This diagram is a simplified overview. The current detector compares the five strongest empty-track directions using both coarse side/centre position bands and three equal-area concentric rings, normalized only within those five directions. Other angles remain diagnostic and cannot dilute the selected structure. Low selected-direction counts reduce confidence rather than directly reporting occupancy. Lighting, shadows, reflections, camera movement, occlusion, and low-texture areas can still affect results, so test representative rolling stock and recapture the clear-track baseline after changing the camera view or sensor configuration.
 
 It should be obvious but place sensors on the parts of the rails that will become obscured by rolling stock i.e. select the rail furthest from the camera.  At some angles the camera may otherwise still see the rail.  If rolling stock can obscure other rails then consider another camera module and use it above the problematic area - they are deliberately designed to be cheap enough to use a few on a layout.
 

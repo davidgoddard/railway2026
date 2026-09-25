@@ -2,7 +2,7 @@
 const { app, BrowserWindow, ipcMain, safeStorage } = require('electron');
 const { SerialPort } = require('serialport');
 const path = require('node:path');
-const { parseRow, Snapshot, validateConfig, commandsForConfig, MAC } = require('./protocol');
+const { parseRow, Snapshot, validateConfig, commandsForConfig, committedConfig, MAC } = require('./protocol');
 const { saveFrame, loadFrame } = require('./frame-cache');
 const { createMonitor } = require('./mqtt-monitor');
 
@@ -10,7 +10,7 @@ let win, port, pending, queue = Promise.resolve(), buffer = '', refreshTimer, co
 const snapshots = new Map(), frameTimers = new Map();
 const configs = new Map(), cameras = new Map(), states = new Map(), cellStates = new Map();
 const healthSamples = new Map();
-let network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null };
+let network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null, bridgeVersion: '' };
 let monitor;
 let monitorStarted = false;
 function frameDirectory() { return path.join(app.getPath('userData'), 'camera-frames'); }
@@ -59,6 +59,7 @@ function handleLine(line) {
   if (!line) return;
   const parts = line.split(' ');
   if (parts[0] === 'READY') {
+    network.bridgeVersion = parts[2] || '';
     const channel = +(/\bchannel=(\d+)/.exec(line)?.[1] || 0);
     if (channel >= 1 && channel <= 13) network.radioChannel = channel;
     state(); send('bridge:notice', `Bridge ${parts[2]} connected`); return;
@@ -173,6 +174,14 @@ function refresh() {
   }
   return refreshPromise;
 }
+function verifySavedState() {
+  let attempts = 0;
+  const attempt = () => setTimeout(() => refresh().catch(() => {
+    if (++attempts < 3 && port?.isOpen) attempt();
+    else if (port?.isOpen) send('bridge:notice', 'Configuration is saved, but the bridge status refresh is delayed. It will retry automatically.');
+  }), attempts ? 2000 : 750);
+  attempt();
+}
 async function connect(serialPath) {
   if (port?.isOpen) await disconnect();
   ++connectionGeneration;
@@ -199,7 +208,7 @@ async function disconnect() {
   refreshPromise=null;
   clearInterval(refreshTimer); clearFrameRequest();failPending('Bridge disconnected');
   if (port?.isOpen) await new Promise(resolve => port.close(() => resolve()));
-  port = null; cameras.clear(); configs.clear(); states.clear(); cellStates.clear(); healthSamples.clear(); network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null }; state();
+  port = null; cameras.clear(); configs.clear(); states.clear(); cellStates.clear(); healthSamples.clear(); network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null, bridgeVersion: '' }; state();
 }
 function createWindow() {
   win = new BrowserWindow({ width: 1440, height: 900, minWidth: 1080, minHeight: 700, backgroundColor: '#0c1420', title: 'Railway Bridge Controller', webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
@@ -229,7 +238,12 @@ app.whenReady().then(() => {
     for (const id of new Set(config.cells.map(cell => cell.group || cell.id))) if (otherTopics.has(config.topics?.[id] || String(id))) throw Error(`Topic name for area ${id} is already used by another camera`);
     const current = configs.get(mac); config.revision = current.revision;
     for (const command of commandsForConfig(mac, config)) await run(command, 30000);
-    await refresh(); return true;
+    const saved = committedConfig(current, config);
+    configs.set(mac, saved);
+    const camera = cameras.get(mac);
+    if (camera) Object.assign(camera, { revision: saved.revision, count: saved.cells.length, baseline: false });
+    state(); verifySavedState();
+    return { saved: true, revision: saved.revision, verificationPending: true };
   });
   ipcMain.handle('wifi', (_, ssid, password) => run(`WIFI ${require('./protocol').hex(ssid)} ${require('./protocol').hex(password)}`));
   ipcMain.handle('mqtt', (_, host, portNumber, root, user, password) => run(`MQTT ${require('./protocol').hex(host)} ${portNumber} ${require('./protocol').hex(root)} ${require('./protocol').hex(user)} ${require('./protocol').hex(password)}`));

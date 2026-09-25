@@ -25,7 +25,7 @@ Opening `index.html` directly with `file://` is not supported because Web Serial
 - Previously known cameras, configurations, and cached images remain selectable without USB, allowing the MQTT overlay to operate as a standalone layout view.
 - Camera settings, per-sensor persistence settings and mismatch thresholds.
 - Fetched-frame texture preview using the camera's Scharr gradients and twelve fixed 15° direction buckets.
-- On-demand camera baseline comparison with 27 direction/position buckets and proportional edge-count change.
+- On-demand camera baseline comparison showing all fixed direction/position measurements; camera scoring normalizes within the five strongest baseline directions, ignores other angles for occupancy, and reduces confidence for sparse selected gradients.
 - Ten-second fixed-centre automatic radius and threshold calibration for new sensors only or all sensors.
 - Bridge Wi-Fi and MQTT configuration.
 - Diagnostics, USB MQTT events and local state history.

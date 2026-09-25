@@ -532,7 +532,7 @@ void handleRadio(const Received &r) {
       const uint8_t next=(bitmap.states[i/4]>>((i%4)*2))&3;
       if(c->cellStates[i]!=next) {
         c->cellStates[i]=next;
-        Serial.printf("EVENT CELL_STATE %s %lu %s 0 %lu\n",mac,(unsigned long)c->cells[i].id,
+        Serial.printf("EVENT CELL_STATE %s %lu %s - %lu\n",mac,(unsigned long)c->cells[i].id,
           stateName(next),(unsigned long)bitmap.frame);
       }
     }
@@ -548,7 +548,7 @@ void handleRadio(const Received &r) {
       const uint8_t old=c->states[i];
       for(uint16_t j=0;j<c->count;++j) if((c->cells[j].group?c->cells[j].group:c->cells[j].id)==id) c->states[j]=next;
       if(old!=next) {
-        Serial.printf("EVENT STATE %s %lu %s 0 %lu\n",mac,(unsigned long)id,stateName(next),(unsigned long)bitmap.frame);
+        Serial.printf("EVENT STATE %s %lu %s - %lu\n",mac,(unsigned long)id,stateName(next),(unsigned long)bitmap.frame);
         publish(areaSuffix(id),stateName(next));
       }
     }

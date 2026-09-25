@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.19"
+#define CAMERA_MODULE_VERSION "0.2.22"
 #define CAMERA_DEBUG_SERIAL 1
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
@@ -187,6 +187,10 @@ struct CellRuntime {
   uint8_t state=UNKNOWN,enterCount=0,clearCount=0;
   uint16_t scorePermille=0;
   uint16_t referenceBuckets[SPATIAL_BUCKETS]={};
+  // A second, illumination-normalised view of the same gradients.  The
+  // projected bands retain which side of a line changed; these equal-area
+  // rings retain whether its extent moved towards or away from the centre.
+  uint16_t referenceRadialBuckets[SPATIAL_BUCKETS]={};
 };
 struct GroupRuntime {
   uint32_t id=0;
@@ -486,8 +490,13 @@ bool retuneLighting(const CalibrationRequestPayload &request) {
     uint8_t flags=0x80;
     if(stats[i].target) {
       flags|=0x20;
-      const uint16_t proposed=(uint16_t)(((uint32_t)stats[i].maximum+109)/10*10);
-      if(stats[i].samples<3 || proposed>1000) flags|=0x40;
+      // The sampled scene must also sit below the fixed 70% clearing boundary,
+      // otherwise the sensor clears now but sticks after its next real trigger.
+      const uint32_t occupySafe=(uint32_t)stats[i].maximum+100;
+      const uint32_t clearSafe=((uint32_t)stats[i].maximum+20)*10/7+1;
+      const uint32_t required=max(occupySafe,clearSafe);
+      const uint16_t proposed=(uint16_t)(((required+9)/10)*10);
+      if(stats[i].samples<3 || required>1000) flags|=0x40;
       else {
         cells[i].config.thresholdPermille=max(cells[i].config.thresholdPermille,proposed);
         cells[i].state=CLEAR;cells[i].enterCount=cells[i].clearCount=0;cells[i].scorePermille=0;
@@ -735,7 +744,7 @@ bool saveBaseline() {
   const size_t cellsBytes=(size_t)cellCount*sizeof(CellRuntime);
   // Runtime features contain the calibration. The full grayscale frame is not
   // needed after reboot and made SVGA baselines require two 480 KB flash files.
-  BaselineHeader h={0x52424C3B,configRevision,0,
+  BaselineHeader h={0x52424C3C,configRevision,0,
     crc32((const uint8_t *)cells,cellsBytes),0,cellCount,cameraSettings};
   if(LittleFS.exists("/baseline.bin")) LittleFS.remove("/baseline.bak");
   File f=LittleFS.open("/baseline.tmp","w");if(!f) { baselineStorageError=2;return false; }
@@ -756,7 +765,7 @@ void loadBaseline() {
     LittleFS.rename("/baseline.bak","/baseline.bin");
   File f=LittleFS.open("/baseline.bin","r");if(!f) return;
   BaselineHeader h={};
-  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C3B ||
+  if(f.read((uint8_t *)&h,sizeof(h))!=sizeof(h) || h.magic!=0x52424C3C ||
      h.count>MAX_CELLS || h.settings.resolution>XGA) { f.close();return; }
   const size_t cellsBytes=(size_t)h.count*sizeof(CellRuntime);
   if(f.size()!=sizeof(h)+cellsBytes+h.bytes || !initCamera(h.settings) ||
@@ -1223,6 +1232,8 @@ void loop() {
     lastChannelScan=millis();
     setChannel(radioChannel==13?1:radioChannel+1);
   }
-  if(millis()-lastFullStateRefresh>=30000) { lastFullStateRefresh=millis();queueAllStates(); }
+  // Keep live tuning useful even when a sensor's state does not change. State
+  // transitions are immediate; this refresh supplies a recent supporting score.
+  if(millis()-lastFullStateRefresh>=5000) { lastFullStateRefresh=millis();queueAllStates(); }
   yield();
 }
