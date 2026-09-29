@@ -23,7 +23,13 @@ class OccupancyDetector {
     }
   }
   void calibrateCell(CellRuntime &cell);
-  void analyseAllCells();
+  struct AnalysisTiming {
+    uint32_t prepareUs=0,sharedUs=0,shiftUs=0,shiftComparisons=0;
+    bool fallback=false;
+  };
+  const AnalysisTiming &lastTiming() const { return timing_; }
+  // Optional injected clock keeps the detector independent of platform timers.
+  void analyseAllCells(uint32_t (*clockMicros)()=nullptr);
   uint16_t inspectCell(CellRuntime &cell,Feature &live,uint16_t buckets[SPATIAL_BUCKETS]);
  private:
   const uint8_t *pixels_=nullptr;
@@ -42,6 +48,7 @@ class OccupancyDetector {
   int16_t directionX_[FIXED_DIRECTIONS]={},directionY_[FIXED_DIRECTIONS]={};
   int16_t classifierX_[FIXED_DIRECTIONS]={},classifierY_[FIXED_DIRECTIONS]={};
   uint32_t analysisNumber_=0;
+  AnalysisTiming timing_;
   void emit(uint32_t id,bool grouped,uint16_t score) {
     if(callback_) callback_(id,grouped,score);
   }
@@ -394,14 +401,20 @@ void OccupancyDetector::updateGroups() {
     }
   }
 }
-void OccupancyDetector::analyseAllCells() {
+void OccupancyDetector::analyseAllCells(uint32_t (*clockMicros)()) {
   ++analysisNumber_;
+  timing_={};
+  const auto stamp=[clockMicros]() -> uint32_t { return clockMicros?clockMicros():0; };
+  const uint32_t prepareStarted=stamp();
   // Do not infer camera failure from absolute pixel brightness. A legitimate
   // layout can contain large black or white areas, and automatic exposure can
   // briefly move either across a fixed clipping boundary. Capture failures
   // are handled by the image source; exposure-quality detection would need to
   // compare whole-frame statistics with this camera's saved baseline.
   const bool sharedPass=prepareWorkMap();
+  const uint32_t sharedStarted=stamp();
+  timing_.prepareUs=sharedStarted-prepareStarted;
+  timing_.fallback=!sharedPass;
   if(sharedPass && cellCount_) {
     memset(liveFeatures_,0,(size_t)cellCount_*sizeof(Feature));
     memset(liveBuckets_,0,(size_t)cellCount_*SPATIAL_BUCKETS*sizeof(uint16_t));
@@ -437,6 +450,7 @@ void OccupancyDetector::analyseAllCells() {
         liveBuckets_+(size_t)cell*SPATIAL_BUCKETS,4);
   }
 
+  timing_.sharedUs=stamp()-sharedStarted;
   for(uint16_t i=0;i<cellCount_;++i) {
     CellRuntime &cell=cells_[i];
     uint16_t fallbackBuckets[SPATIAL_BUCKETS]={};
@@ -454,15 +468,18 @@ void OccupancyDetector::analyseAllCells() {
       ? (uint16_t)(cell.config.thresholdPermille*0.7f)
       : cell.config.thresholdPermille;
     if(cell.scorePermille>=toleranceTarget) {
+      const uint32_t shiftStarted=stamp();
       for(int dy=-1;dy<=1 && cell.scorePermille>=toleranceTarget;++dy) {
         for(int dx=-1;dx<=1 && cell.scorePermille>=toleranceTarget;++dx) {
           if(!dx && !dy) continue;
           uint16_t shiftedBuckets[SPATIAL_BUCKETS]={};
           uint16_t shiftedRadialBuckets[SPATIAL_BUCKETS]={};
+          ++timing_.shiftComparisons;
           const Feature shifted=analyse(cell,false,shiftedBuckets,shiftedRadialBuckets,dx,dy);
           cell.scorePermille=min(cell.scorePermille,compareCell(cell,shifted,shiftedBuckets,shiftedRadialBuckets));
         }
       }
+      timing_.shiftUs+=stamp()-shiftStarted;
     }
     const uint8_t old=cell.state;
     if(cell.scorePermille>=cell.config.thresholdPermille) {

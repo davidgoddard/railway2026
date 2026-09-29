@@ -1,5 +1,6 @@
-#define CAMERA_MODULE_VERSION "0.2.26"
+#define CAMERA_MODULE_VERSION "0.2.31"
 #define CAMERA_DEBUG_SERIAL 1
+#include <Arduino.h> // Load target macros before selecting the board pin map.
 // Override these in the build flags for another supported camera board.
 #if !defined(CAMERA_BOARD_AI_THINKER) && !defined(CAMERA_BOARD_ESP32S3_EYE)
 #if defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -10,7 +11,6 @@
 #endif
 
 // Railway camera firmware. ESP-NOW uses the Wi-Fi radio without an IP network.
-#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
@@ -163,6 +163,10 @@ uint32_t frameNumber=0, configRevision=0, captureFailures=0;
 uint32_t lastHello=0,lastHealth=0,lastCapture=0,nextSeq=1;
 uint32_t frameCapturedAt=0,analysisCount=0,analysisWindowStarted=0;
 uint32_t lastPerformanceCaptureCount=0,lastPerformanceAnalysisCount=0;
+struct PipelineTiming {
+  uint64_t waitUs=0,analysisUs=0,prepareUs=0,sharedUs=0,shiftUs=0;
+  uint32_t attempts=0,frames=0,shifts=0,fallbackFrames=0,maxWaitUs=0,maxAnalysisUs=0;
+} pipelineTiming;
 uint32_t lastFullStateRefresh=0;
 uint8_t localMac[6]={},bridgeMac[6]={};
 bool bridgeKnown=false;
@@ -236,6 +240,8 @@ struct __attribute__((packed)) BaselineHeader {
 bool saveBaseline();
 void loadBaseline();
 
+uint32_t pipelineClockMicros() { return micros(); }
+
 void macText(const uint8_t *mac,char *out) {
   sprintf(out,"%02X:%02X:%02X:%02X:%02X:%02X",mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
 }
@@ -277,8 +283,8 @@ void sendHealth() {
   const uint32_t now=millis();
   if(!analysisWindowStarted) analysisWindowStarted=now;
   const uint32_t elapsed=now-analysisWindowStarted;
+  const uint32_t captures=imageSource.acquisitionCount();
   if(elapsed) {
-    const uint32_t captures=imageSource.acquisitionCount();
     DEBUGF("pipeline capture_fps=%lu.%lu analysis_fps=%lu.%lu frame_age_ms=%lu replaced=%lu acquisition_failures=%lu free_psram=%lu largest_psram=%lu\n",
       (unsigned long)(((captures-lastPerformanceCaptureCount)*1000)/elapsed),
       (unsigned long)((((captures-lastPerformanceCaptureCount)*10000)/elapsed)%10),
@@ -289,9 +295,28 @@ void sendHealth() {
       (unsigned long)imageSource.acquisitionFailures(),
       (unsigned long)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
       (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-    lastPerformanceCaptureCount=captures;lastPerformanceAnalysisCount=analysisCount;
-    analysisWindowStarted=now;
+    // Wait is foreground time awaiting a published frame, not sensor exposure
+    // time. Capture runs concurrently with analysis, so do not add its duration.
+    const auto average=[](uint64_t total,uint32_t count) -> unsigned long {
+      return count?(unsigned long)(total/count):0;
+    };
+    DEBUGF("pipeline_timing version=%s resolution=%ux%u cells=%u attempts=%lu frames=%lu capture_wait_us=%lu analysis_us=%lu prepare_us=%lu shared_us=%lu shift_us=%lu shifts=%lu fallback_frames=%lu max_wait_us=%lu max_analysis_us=%lu window_ms=%lu\n",
+      CAMERA_MODULE_VERSION,frameWidth,frameHeight,cellCount,
+      (unsigned long)pipelineTiming.attempts,(unsigned long)pipelineTiming.frames,
+      average(pipelineTiming.waitUs,pipelineTiming.attempts),
+      average(pipelineTiming.analysisUs,pipelineTiming.frames),
+      average(pipelineTiming.prepareUs,pipelineTiming.frames),
+      average(pipelineTiming.sharedUs,pipelineTiming.frames),
+      average(pipelineTiming.shiftUs,pipelineTiming.frames),
+      (unsigned long)pipelineTiming.shifts,(unsigned long)pipelineTiming.fallbackFrames,
+      (unsigned long)pipelineTiming.maxWaitUs,(unsigned long)pipelineTiming.maxAnalysisUs,
+      (unsigned long)elapsed);
   }
+  // Seed counts even on the first report: startup frames must not be divided
+  // by only the second reporting interval.
+  lastPerformanceCaptureCount=captures;
+  lastPerformanceAnalysisCount=analysisCount;
+  analysisWindowStarted=now;pipelineTiming={};
 }
 void queueDiagnostic(uint8_t event,uint32_t detail=0,uint32_t offset=0) {
   if(diagnosticCount==16) { diagnosticHead=(diagnosticHead+1)%16;--diagnosticCount;++diagnosticDropped; }
@@ -429,11 +454,13 @@ bool captureBaseline() {
     baselineHeartbeat();
   }
   if(!captured) { free(meanPixels);rtcDiagnostic.outcome=1;queueDiagnostic(DIAG_BASELINE_FAILED,1);rtcDiagnostic.operation=0;return false; }
-  memcpy(framePixels,meanPixels,frameBytes);free(meanPixels);
-  detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+  // Calibrate directly from the mean; the leased driver frame remains untouched.
+  detector.bind(meanPixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
   for(uint16_t i=0;i<cellCount;++i) {
     detector.calibrateCell(cells[i]);baselineHeartbeat();
   }
+  detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
+  free(meanPixels);
   if(!saveBaseline()) {
     const uint32_t freeBytes=storageReady?LittleFS.totalBytes()-LittleFS.usedBytes():0;
     DEBUGF("baseline flash write failed stage=%u free_bytes=%lu\n",baselineStorageError,(unsigned long)freeBytes);
@@ -1247,9 +1274,24 @@ void loop() {
   // captured; optional score diagnostics never delay capture.
   sendStateBitmap();sendScores();
   if(cameraReady && !snapshot.active) {
-    if(captureFrame()) {
+    const uint32_t waitStarted=micros();
+    const bool captured=captureFrame();
+    const uint32_t waitUs=micros()-waitStarted;
+    ++pipelineTiming.attempts;pipelineTiming.waitUs+=waitUs;
+    pipelineTiming.maxWaitUs=max(pipelineTiming.maxWaitUs,waitUs);
+    if(captured) {
+      const uint32_t analysisStarted=micros();
       detector.bind(framePixels,frameWidth,frameHeight,cells,cellCount,groups,groupCount,queueState);
-      if(baselineReady) { detector.analyseAllCells();++analysisCount; }
+      if(baselineReady) {
+        detector.analyseAllCells(pipelineClockMicros);++analysisCount;
+        const uint32_t analysisUs=micros()-analysisStarted;
+        const auto &timing=detector.lastTiming();
+        ++pipelineTiming.frames;pipelineTiming.analysisUs+=analysisUs;
+        pipelineTiming.prepareUs+=timing.prepareUs;pipelineTiming.sharedUs+=timing.sharedUs;
+        pipelineTiming.shiftUs+=timing.shiftUs;pipelineTiming.shifts+=timing.shiftComparisons;
+        pipelineTiming.fallbackFrames+=timing.fallback;
+        pipelineTiming.maxAnalysisUs=max(pipelineTiming.maxAnalysisUs,analysisUs);
+      }
     }
   }
   sendStateBitmap();sendScores();

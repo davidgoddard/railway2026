@@ -39,7 +39,7 @@ Every camera target must provide:
 
 - a supported camera sensor, electrical interface, and pin map;
 - a driver that can deliver grayscale, row-major, one-byte-per-pixel frames to `ImageSource`;
-- PSRAM large enough for the camera-driver framebuffer, two application-owned grayscale frames, detector state, and one temporary averaging frame during baseline capture;
+- PSRAM large enough for two camera-driver grayscale framebuffers, detector state, and one temporary averaging frame during baseline capture;
 - a LittleFS partition for configuration and calibrated baseline features; and
 - an ESP-NOW-capable 2.4 GHz radio, either integrated or exposed completely by a companion processor.
 

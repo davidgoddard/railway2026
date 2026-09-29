@@ -1,6 +1,20 @@
 #pragma once
 #include <esp_camera.h>
 
+// Set to 0 to compare against the unmodified sensor driver clock.
+#ifndef CAMERA_OV2640_VGA_CLOCK_TRIAL
+#define CAMERA_OV2640_VGA_CLOCK_TRIAL 1
+#endif
+
+// Default 4 restores the measured ~3 FPS setting. Divisor 2 produced short
+// frames on the tested AI Thinker and is retained only for explicit experiments.
+#ifndef CAMERA_OV2640_VGA_CLOCK_DIVISOR
+#define CAMERA_OV2640_VGA_CLOCK_DIVISOR 4
+#endif
+#if CAMERA_OV2640_VGA_CLOCK_DIVISOR != 2 && CAMERA_OV2640_VGA_CLOCK_DIVISOR != 4
+#error CAMERA_OV2640_VGA_CLOCK_DIVISOR must be 2 or 4
+#endif
+
 // Select the board pin map here. Additional DVP boards need only a new map.
 #if defined(CAMERA_BOARD_AI_THINKER) && defined(CAMERA_BOARD_ESP32S3_EYE)
 #error Select one camera board
@@ -63,23 +77,20 @@ class ImageSource {
   }
   bool begin(const CameraSettings &settings,uint8_t *&framePixels,uint16_t &frameWidth,uint16_t &frameHeight) {
   if(settings.resolution>XGA) return false;
-  if(ready_) { stopCaptureTask();esp_camera_deinit();ready_=false; }
-  free(buffers_[0]);free(buffers_[1]);buffers_[0]=buffers_[1]=nullptr;framePixels=nullptr;
+  if(ready_) { stopCaptureTask();releaseFrames();esp_camera_deinit();ready_=false; }
+  framePixels=nullptr;
   const Resolution &r=RESOLUTIONS[settings.resolution];
   frameWidth=r.width;frameHeight=r.height;
   captureWidth_=r.width;captureHeight_=r.height;
-  buffers_[0]=(uint8_t *)ps_malloc((size_t)r.width*r.height);
-  buffers_[1]=(uint8_t *)ps_malloc((size_t)r.width*r.height);
-  if(!buffers_[0] || !buffers_[1]) {
-    free(buffers_[0]);free(buffers_[1]);buffers_[0]=buffers_[1]=nullptr;return false;
-  }
   camera_config_t c={};
   c.pin_pwdn=PWDN;c.pin_reset=RESET;c.pin_xclk=XCLK;c.pin_sccb_sda=SIOD;c.pin_sccb_scl=SIOC;
   c.pin_d0=D0;c.pin_d1=D1;c.pin_d2=D2;c.pin_d3=D3;c.pin_d4=D4;c.pin_d5=D5;c.pin_d6=D6;c.pin_d7=D7;
   c.pin_vsync=VSYNC;c.pin_href=HREF;c.pin_pclk=PCLK;c.xclk_freq_hz=20000000;
   c.ledc_timer=LEDC_TIMER_0;c.ledc_channel=LEDC_CHANNEL_0;
   c.pixel_format=PIXFORMAT_GRAYSCALE;c.frame_size=r.frameSize;
-  c.fb_location=CAMERA_FB_IN_PSRAM;c.fb_count=1;c.grab_mode=CAMERA_GRAB_WHEN_EMPTY;
+  // Experimental grayscale double buffering: validate FPS and image integrity
+  // on each board. WHEN_EMPTY keeps queued/leased frames out of reuse.
+  c.fb_location=CAMERA_FB_IN_PSRAM;c.fb_count=2;c.grab_mode=CAMERA_GRAB_WHEN_EMPTY;
   const esp_err_t error=esp_camera_init(&c);
   if(error!=ESP_OK) {
     DEBUGF("camera init failed board=%s sensor_sda=%d sensor_scl=%d error=0x%X\n",
@@ -87,32 +98,34 @@ class ImageSource {
     // esp_camera_init can leave partially installed GPIO/LEDC state behind.
     // Tear it down so a later cold-start recovery attempt can succeed.
     esp_camera_deinit();
-    free(buffers_[0]);free(buffers_[1]);buffers_[0]=buffers_[1]=nullptr;return false;
+    return false;
   }
   ready_=true;
-  if(!applyControls(settings)) {
-    esp_camera_deinit();ready_=false;free(buffers_[0]);free(buffers_[1]);
-    buffers_[0]=buffers_[1]=nullptr;return false;
+  if(!applyControls(settings) || !applyCaptureClock(settings)) {
+    esp_camera_deinit();ready_=false;return false;
   }
   resetMailbox();
   if(!startCaptureTask()) {
-    esp_camera_deinit();ready_=false;free(buffers_[0]);free(buffers_[1]);
-    buffers_[0]=buffers_[1]=nullptr;return false;
+    esp_camera_deinit();ready_=false;return false;
   }
-  DEBUGF("camera %ux%u grayscale ready\n",frameWidth,frameHeight);
+  DEBUGF("camera %ux%u grayscale ready (direct driver buffers, experimental)\n",frameWidth,frameHeight);
   return true;
 }
-  // Lease the one completed frame. Consuming it releases the producer to
-  // acquire exactly one successor while this frame is being analysed.
+  // The current lease stays valid until a successful capture replaces it, or
+  // begin() rebuilds the driver. Timeouts and pause() preserve it for snapshots.
+  // Returning the previous lease lets the driver capture the next frame while
+  // the detector reads this one; no application-owned image or pixel copy.
   bool capture(uint8_t *&framePixels,uint16_t,uint16_t,Frame &frame) {
     if(!ready_) return false;
     const uint32_t started=millis();
     do {
       portENTER_CRITICAL(&mailboxMux_);
-      if(published_>=0 && published_!=writing_ && publishedSequence_!=leasedSequence_) {
-        leased_=published_;leasedSequence_=publishedSequence_;
-        framePixels=buffers_[leased_];frame={framePixels,leasedSequence_,publishedAtMs_};
+      if(published_) {
+        camera_fb_t *previous=leased_;
+        leased_=published_;published_=nullptr;
+        framePixels=leased_->buf;frame={framePixels,publishedSequence_,publishedAtMs_};
         portEXIT_CRITICAL(&mailboxMux_);
+        if(previous) esp_camera_fb_return(previous);
         xSemaphoreGive(captureSlot_);
         return true;
       }
@@ -136,21 +149,57 @@ class ImageSource {
   uint32_t replacedFrames() const { return replacedFrames_; }
 
  private:
+  bool applyCaptureClock(const CameraSettings &settings) {
+#if defined(CAMERA_BOARD_AI_THINKER) && CAMERA_OV2640_VGA_CLOCK_TRIAL
+    sensor_t *sensor=esp_camera_sensor_get();
+    if(!sensor) return false;
+    // Espressif's OV2640 non-JPEG VGA path sets CLKRC divider bits to 7.
+    // CLKRC encodes divisor minus one. Preserve the other CLKRC bits,
+    // the external 20 MHz clock, pixel-clock control and exposure controls.
+    // get_reg/set_reg encode sensor bank 1 in bit 8 of the register address.
+    if(settings.resolution!=VGA || sensor->id.PID!=OV2640_PID) return true;
+    if(!sensor->get_reg || !sensor->set_reg) return false;
+    constexpr int CLKRC_REGISTER=0x111,DIVIDER_MASK=0x3f;
+    constexpr int trialDivider=CAMERA_OV2640_VGA_CLOCK_DIVISOR-1;
+    const int before=sensor->get_reg(sensor,CLKRC_REGISTER,0xff);
+    if(before<0) return false;
+    if(before!=7) {
+      DEBUGF("capture clock trial skipped: unexpected OV2640 CLKRC=0x%02X\n",before);
+      return true;
+    }
+    const int written=sensor->set_reg(sensor,CLKRC_REGISTER,DIVIDER_MASK,trialDivider);
+    const int after=sensor->get_reg(sensor,CLKRC_REGISTER,0xff);
+    if(written!=0 || after!=trialDivider) {
+      sensor->set_reg(sensor,CLKRC_REGISTER,0xff,before);
+      DEBUGF("capture clock trial failed: write=%d readback=%d; restarting camera\n",written,after);
+      return false;
+    }
+    DEBUGF("capture clock trial: OV2640 VGA CLKRC=0x%02X -> 0x%02X (divider /8 -> /%d)\n",before,after,CAMERA_OV2640_VGA_CLOCK_DIVISOR);
+#else
+    (void)settings;
+#endif
+    return true;
+  }
   bool ready_=false;
-  uint8_t *buffers_[2]={nullptr,nullptr};
+  camera_fb_t *published_=nullptr,*leased_=nullptr;
   TaskHandle_t captureTask_=nullptr;
   SemaphoreHandle_t frameReady_=nullptr,captureSlot_=nullptr,stopped_=nullptr,paused_=nullptr;
   portMUX_TYPE mailboxMux_=portMUX_INITIALIZER_UNLOCKED;
   volatile bool stopRequested_=false,pauseRequested_=false,taskRunning_=false;
-  volatile int8_t published_=-1,leased_=-1,writing_=-1;
-  volatile uint32_t publishedSequence_=0,leasedSequence_=0,publishedAtMs_=0;
+  volatile uint32_t publishedSequence_=0,publishedAtMs_=0;
   volatile uint32_t acquisitionCount_=0,acquisitionFailures_=0,replacedFrames_=0;
   uint16_t captureWidth_=0,captureHeight_=0;
 
   void resetMailbox() {
     portENTER_CRITICAL(&mailboxMux_);
-    published_=leased_=writing_=-1;publishedSequence_=leasedSequence_=publishedAtMs_=0;
+    published_=leased_=nullptr;publishedSequence_=publishedAtMs_=0;
     portEXIT_CRITICAL(&mailboxMux_);
+  }
+  // Only after the producer has stopped, and before driver deinitialisation.
+  void releaseFrames() {
+    if(published_) esp_camera_fb_return(published_);
+    if(leased_) esp_camera_fb_return(leased_);
+    resetMailbox();
   }
   static void captureTaskEntry(void *context) {
     static_cast<ImageSource *>(context)->captureLoop();
@@ -162,7 +211,7 @@ class ImageSource {
         while(pauseRequested_ && !stopRequested_) delay(1);
         continue;
       }
-      // Do not acquire and copy frames faster than the detector can consume
+      // Do not acquire frames faster than the detector can consume
       // them. Timed waits keep pause and stop responsive when a frame is
       // sitting in the single pending slot.
       if(xSemaphoreTake(captureSlot_,pdMS_TO_TICKS(10))!=pdTRUE) continue;
@@ -172,25 +221,17 @@ class ImageSource {
       }
       camera_fb_t *fb=esp_camera_fb_get();
       if(!fb) { ++acquisitionFailures_;xSemaphoreGive(captureSlot_);delay(1);continue; }
-      int8_t target;
-      portENTER_CRITICAL(&mailboxMux_);
-      target=leased_==0?1:0;
-      writing_=target;
-      portEXIT_CRITICAL(&mailboxMux_);
       const size_t bytes=(size_t)captureWidth_*captureHeight_;
       const bool valid=fb->format==PIXFORMAT_GRAYSCALE && fb->width==captureWidth_ &&
-        fb->height==captureHeight_ && buffers_[target] && fb->len>=bytes;
-      if(valid) memcpy(buffers_[target],fb->buf,bytes);
-      esp_camera_fb_return(fb);
+        fb->height==captureHeight_ && fb->buf && fb->len>=bytes;
       if(valid) {
         portENTER_CRITICAL(&mailboxMux_);
-        published_=target;publishedAtMs_=millis();++publishedSequence_;++acquisitionCount_;
-        writing_=-1;
+        published_=fb;publishedAtMs_=millis();++publishedSequence_;++acquisitionCount_;
         portEXIT_CRITICAL(&mailboxMux_);
         xSemaphoreGive(frameReady_);
       } else {
+        esp_camera_fb_return(fb);
         ++acquisitionFailures_;
-        portENTER_CRITICAL(&mailboxMux_);writing_=-1;portEXIT_CRITICAL(&mailboxMux_);
         xSemaphoreGive(captureSlot_);
       }
     }
