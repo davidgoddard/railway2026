@@ -47,7 +47,9 @@ inline void vTaskDelete(void *) {}
 using esp_err_t=int;
 constexpr int ESP_OK=0,LEDC_TIMER_0=0,LEDC_CHANNEL_0=0;
 constexpr int PIXFORMAT_GRAYSCALE=0,CAMERA_FB_IN_PSRAM=1,CAMERA_GRAB_WHEN_EMPTY=0;
-enum framesize_t { FRAMESIZE_QVGA,FRAMESIZE_VGA,FRAMESIZE_SVGA,FRAMESIZE_XGA };
+enum framesize_t { FRAMESIZE_QVGA,FRAMESIZE_VGA,FRAMESIZE_SVGA,FRAMESIZE_XGA,
+  FRAMESIZE_96X96,FRAMESIZE_128X128,FRAMESIZE_QCIF,FRAMESIZE_HQVGA,
+  FRAMESIZE_240X240,FRAMESIZE_320X320,FRAMESIZE_HVGA };
 struct camera_config_t {
   int pin_pwdn,pin_reset,pin_xclk,pin_sccb_sda,pin_sccb_scl;
   int pin_d0,pin_d1,pin_d2,pin_d3,pin_d4,pin_d5,pin_d6,pin_d7;
@@ -57,7 +59,8 @@ struct camera_config_t {
 struct camera_fb_t { uint8_t *buf;size_t len;uint16_t width,height;int format; };
 constexpr int OV2640_PID=0x26;
 inline int clockRegister=7,clockWrites=0;
-inline bool failClockWrite=false;
+inline bool failClockWrite=false,failCrop=false;
+inline int cropRegisters[6]={};
 struct sensor_t {
   struct { int PID=OV2640_PID; } id;
   static int readRegister(sensor_t *,int reg,int mask) {
@@ -70,6 +73,13 @@ struct sensor_t {
   }
   int (*get_reg)(sensor_t *,int,int)=readRegister;
   int (*set_reg)(sensor_t *,int,int,int)=writeRegister;
+  static int crop(sensor_t *,int mode,int,int,int,int x,int y,int width,int height,int outputWidth,int outputHeight,bool,bool) {
+    assert(mode==1);cropRegisters[0]=x;cropRegisters[1]=y;
+    cropRegisters[2]=width;cropRegisters[3]=height;
+    cropRegisters[4]=outputWidth;cropRegisters[5]=outputHeight;
+    clockRegister=7;return failCrop?-1:0;
+  }
+  int (*set_res_raw)(sensor_t *,int,int,int,int,int,int,int,int,int,int,bool,bool)=crop;
   static int control(sensor_t *,int) { return 0; }
   int (*set_brightness)(sensor_t *,int)=control;
   int (*set_contrast)(sensor_t *,int)=control;
@@ -96,7 +106,7 @@ inline esp_err_t esp_camera_init(camera_config_t *config) {
   assert(config->grab_mode==CAMERA_GRAB_WHEN_EMPTY);
   fake::config=*config;fake::initialised=true;
   clockRegister=config->frame_size==FRAMESIZE_QVGA?3:7;
-  const uint16_t widths[]={320,640,800,1024},heights[]={240,480,600,768};
+  const uint16_t widths[]={320,640,800,1024,96,128,176,240,240,320,480},heights[]={240,480,600,768,96,128,144,176,240,320,320};
   for(int i=0;i<2;++i) {
     fake::pixels[i].resize(size_t(widths[config->frame_size])*heights[config->frame_size]);
     fake::frames[i]={fake::pixels[i].data(),fake::pixels[i].size(),widths[config->frame_size],heights[config->frame_size],PIXFORMAT_GRAYSCALE};
@@ -138,6 +148,6 @@ inline void esp_camera_fb_return(camera_fb_t *f) {
   fake::held[i]=false;++fake::returns;
   // Poison returned memory to detect early releases through public capture().
   std::fill(fake::pixels[i].begin(),fake::pixels[i].end(),0xEE);
-  const uint16_t widths[]={320,640,800,1024},heights[]={240,480,600,768};
+  const uint16_t widths[]={320,640,800,1024,96,128,176,240,240,320,480},heights[]={240,480,600,768,96,128,144,176,240,320,320};
   *f={fake::pixels[i].data(),fake::pixels[i].size(),widths[fake::config.frame_size],heights[fake::config.frame_size],PIXFORMAT_GRAYSCALE};
 }

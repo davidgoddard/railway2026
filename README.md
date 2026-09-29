@@ -143,6 +143,7 @@ For implementation details, see the [camera guide](Camera_Module/README.md). The
 
 | Path | Contents |
 | --- | --- |
+| [`CAPTURE_OPTIMISATION.md`](CAPTURE_OPTIMISATION.md) | Capture/FPS measurements, crop experiment instructions, and optimisation handover for future work. |
 | [`Camera_Module/`](Camera_Module/) | Camera firmware, supported hardware, installation, and detector configuration. |
 | [`Bridge_Controller/`](Bridge_Controller/) | Bridge firmware, desktop setup application, MQTT configuration, and troubleshooting. |
 | [`Web_App/`](Web_App/) | Browser setup application and browser-specific capabilities and limitations. |

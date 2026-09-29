@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.31"
+#define CAMERA_MODULE_VERSION "0.2.32"
 #define CAMERA_DEBUG_SERIAL 1
 #include <Arduino.h> // Load target macros before selecting the board pin map.
 // Override these in the build flags for another supported camera board.
@@ -1136,11 +1136,117 @@ void serialSnapshot() {
   DEBUGF("\nsnapshot bytes=%lu crc=%08lx\n",(unsigned long)bytes,(unsigned long)crc);
 #endif
 }
+// Capture-only experiment. It must never feed unverified crop coordinates into
+// OccupancyDetector or overwrite the saved baseline/configuration.
+bool measureCaptureWindow(const char *name,uint8_t *&pixels,uint16_t width,uint16_t height) {
+  ImageSource::Frame sample;
+  for(uint8_t i=0;i<3;++i) {
+    if(!imageSource.capture(pixels,width,height,sample)) return false;
+    baselineHeartbeat();
+  }
+  constexpr uint8_t samples=16;
+  const uint32_t started=micros();
+  uint32_t longest=0;
+  for(uint8_t i=0;i<samples;++i) {
+    const uint32_t before=micros();
+    if(!imageSource.capture(pixels,width,height,sample)) {
+      DEBUGF("crop_benchmark mode=%s failed_at=%u\n",name,i);return false;
+    }
+    longest=max(longest,(uint32_t)(micros()-before));
+    baselineHeartbeat();
+  }
+  const uint32_t elapsed=micros()-started;
+  const uint32_t fpsTenths=elapsed?(uint32_t)((uint64_t)samples*10000000/elapsed):0;
+  DEBUGF("crop_benchmark mode=%s output=%ux%u samples=%u elapsed_us=%lu fps=%lu.%lu max_wait_us=%lu\n",
+    name,width,height,samples,(unsigned long)elapsed,(unsigned long)(fpsTenths/10),
+    (unsigned long)(fpsTenths%10),(unsigned long)longest);
+  return true;
+}
+void writeCropComparisonFrame(const uint8_t *pixels) {
+#if CAMERA_DEBUG_SERIAL
+  constexpr uint32_t bytes=640UL*480;
+  struct __attribute__((packed)) Header {
+    char magic[8];uint32_t frame,bytes,crc;uint16_t width,height;
+  } header={{'R','A','I','L','F','R','M','1'},frameNumber,bytes,crc32(pixels,bytes),640,480};
+  Serial.write((const uint8_t *)&header,sizeof(header));
+  // Keep the bridge aware that detection is suspended during a slow USB export.
+  // Heartbeat logging cannot be interleaved into this binary stream, so health
+  // reports are sent immediately before/after the pair instead.
+  Serial.write(pixels,bytes);Serial.flush();
+#endif
+}
+void cropExperiment(bool exportFrames) {
+#if CAMERA_DEBUG_SERIAL
+  if(!cameraReady || !configured || !cellCount || snapshot.active || calibration.active || stagingOpen) {
+    DEBUGLN("crop experiment unavailable: configure sensors and finish other operations first");return;
+  }
+  if(cameraSettings.resolution!=VGA || cameraSettings.vflip || cameraSettings.hmirror || !imageSource.supportsCrop()) {
+    DEBUGLN("crop experiment requires AI Thinker OV2640, VGA, and no flip/mirror; full frame retained");return;
+  }
+  CaptureWindowPlanner planner;
+  for(uint16_t i=0;i<cellCount;++i) planner.add(cells[i].config.x,cells[i].config.y,cells[i].config.radius);
+  const CaptureWindow crop=planner.finish();
+  if(!crop.cropped()) {
+    DEBUGLN("crop experiment: no smaller supported window contains every sensor; full frame retained");return;
+  }
+  constexpr size_t fullBytes=640UL*480;
+  uint8_t *reference=(uint8_t *)ps_malloc(fullBytes);
+  if(!reference) { DEBUGLN("crop experiment: no memory for reference; full frame retained");return; }
+  DEBUGF("crop experiment begin x=%u y=%u width=%u height=%u retained_pixels=%lu full_pixels=307200; monitoring suspended\n",
+    crop.x,crop.y,crop.width,crop.height,(unsigned long)((uint32_t)crop.width*crop.height));
+  // Reuse the existing health flag for a deliberately suspended image operation.
+  // This function is synchronous: serviceSnapshot() cannot run until it resets it.
+  snapshot.active=true;
+  for(uint16_t i=0;i<cellCount;++i) {
+    cells[i].state=UNKNOWN;cells[i].enterCount=cells[i].clearCount=0;
+  }
+  for(uint16_t i=0;i<groupCount;++i) groups[i].state=UNKNOWN;
+  queueAllStates();sendStateBitmap();sendHealth();
+  uint8_t *pixels=nullptr;
+  uint16_t width=640,height=480;
+  framePixels=nullptr; // Old lease can be returned by any successful capture below.
+  bool ok=measureCaptureWindow("full",pixels,width,height);
+  if(ok) {
+    memcpy(reference,pixels,fullBytes);
+    ok=imageSource.begin(cameraSettings,pixels,width,height,&crop);
+  }
+  if(ok) ok=measureCaptureWindow("crop",pixels,width,height);
+  if(ok) {
+    uint64_t difference=0;
+    for(uint16_t y=0;y<height;++y) for(uint16_t x=0;x<width;++x)
+      difference+=abs((int)pixels[(size_t)y*width+x]-(int)reference[(size_t)(y+crop.y)*640+x+crop.x]);
+    const uint32_t maeTenths=(uint32_t)(difference*10/((uint32_t)width*height));
+    DEBUGF("crop_alignment x=%u y=%u width=%u height=%u mean_absolute_difference=%lu.%lu (separate exposures; inspect image alignment)\n",
+      crop.x,crop.y,width,height,(unsigned long)(maeTenths/10),(unsigned long)(maeTenths%10));
+    if(exportFrames) {
+      imageSource.pause();sendHealth();
+      writeCropComparisonFrame(reference);
+      memset(reference,0,fullBytes);
+      for(uint16_t y=0;y<height;++y)
+        memcpy(reference+(size_t)(crop.y+y)*640+crop.x,pixels+(size_t)y*width,width);
+      writeCropComparisonFrame(reference);
+      DEBUGLN("\ncrop comparison frames exported (full then crop on VGA canvas)");
+    }
+  } else DEBUGLN("crop experiment failed; restoring full-frame capture");
+  free(reference);
+  // Rebuild even on failed crop init. No cropped pointer or dimensions escape.
+  const bool restored=initCamera(cameraSettings) && captureFrame();
+  snapshot=SnapshotTransfer();
+  if(!restored) {
+    cameraReady=false;baselineReady=false;framePixels=nullptr;
+    DEBUGLN("crop experiment: full-frame recovery failed; restart camera");
+  } else DEBUGLN("crop experiment complete: full-frame monitoring restored; crop NOT used for detection");
+  queueAllStates();sendStateBitmap();sendHealth();
+#else
+  (void)exportFrames;
+#endif
+}
+
 char serialLine[180];size_t serialLength=0;
 void handleSerialLine(char *line) {
   char *command=strtok(line," \t");if(!command) return;
   if(strcmp(command,"H")==0) {
-    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast threshold_permille enter clear | A commit | R baseline | F raw frame | X clear RAM config | Z FORMAT LittleFS");
+    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast threshold_permille enter clear | A commit | R baseline | F raw frame | O crop benchmark | O FRAME crop comparison images | X clear RAM config | Z FORMAT LittleFS");
   } else if(strcmp(command,"I")==0) printInfo();
   else if(strcmp(command,"P")==0) {
     char *value=strtok(nullptr," \t");uint8_t mac[6];
@@ -1182,6 +1288,11 @@ void handleSerialLine(char *line) {
   } else if(strcmp(command,"A")==0) DEBUGF("commit status=%u\n",commitConfig(stagingRevision));
   else if(strcmp(command,"R")==0) DEBUGLN(configured && captureBaseline()?"baseline OK":"baseline failed");
   else if(strcmp(command,"F")==0) serialSnapshot();
+  else if(strcmp(command,"O")==0) {
+    char *option=strtok(nullptr," \t");
+    if(option && strcmp(option,"FRAME")!=0) DEBUGLN("O or O FRAME required");
+    else cropExperiment(option!=nullptr);
+  }
   else if(strcmp(command,"X")==0 && !calibration.active) {
     cellCount=groupCount=0;baselineReady=configured=stagingOpen=false;
     stateHead=stateCount=0;DEBUGLN("configuration cleared from RAM");

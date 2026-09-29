@@ -1,5 +1,6 @@
 #pragma once
 #include <esp_camera.h>
+#include "CaptureWindow.h"
 
 // Set to 0 to compare against the unmodified sensor driver clock.
 #ifndef CAMERA_OV2640_VGA_CLOCK_TRIAL
@@ -75,19 +76,28 @@ class ImageSource {
     resume();
     return applied;
   }
-  bool begin(const CameraSettings &settings,uint8_t *&framePixels,uint16_t &frameWidth,uint16_t &frameHeight) {
+  bool begin(const CameraSettings &settings,uint8_t *&framePixels,uint16_t &frameWidth,uint16_t &frameHeight,
+             const CaptureWindow *crop=nullptr) {
+  if(crop && (!CaptureWindowPlanner::valid(*crop) || settings.resolution!=VGA ||
+              settings.vflip || settings.hmirror || !supportsCrop())) return false;
   if(settings.resolution>XGA) return false;
   if(ready_) { stopCaptureTask();releaseFrames();esp_camera_deinit();ready_=false; }
   framePixels=nullptr;
   const Resolution &r=RESOLUTIONS[settings.resolution];
-  frameWidth=r.width;frameHeight=r.height;
-  captureWidth_=r.width;captureHeight_=r.height;
+  frameWidth=crop?crop->width:r.width;frameHeight=crop?crop->height:r.height;
+  captureWidth_=frameWidth;captureHeight_=frameHeight;
   camera_config_t c={};
   c.pin_pwdn=PWDN;c.pin_reset=RESET;c.pin_xclk=XCLK;c.pin_sccb_sda=SIOD;c.pin_sccb_scl=SIOC;
   c.pin_d0=D0;c.pin_d1=D1;c.pin_d2=D2;c.pin_d3=D3;c.pin_d4=D4;c.pin_d5=D5;c.pin_d6=D6;c.pin_d7=D7;
   c.pin_vsync=VSYNC;c.pin_href=HREF;c.pin_pclk=PCLK;c.xclk_freq_hz=20000000;
   c.ledc_timer=LEDC_TIMER_0;c.ledc_channel=LEDC_CHANNEL_0;
   c.pixel_format=PIXFORMAT_GRAYSCALE;c.frame_size=r.frameSize;
+  if(crop) {
+    const framesize_t presets[]={FRAMESIZE_96X96,FRAMESIZE_128X128,FRAMESIZE_QCIF,
+      FRAMESIZE_HQVGA,FRAMESIZE_240X240,FRAMESIZE_QVGA,FRAMESIZE_320X320,
+      FRAMESIZE_HVGA,FRAMESIZE_VGA};
+    c.frame_size=presets[crop->preset];
+  }
   // Experimental grayscale double buffering: validate FPS and image integrity
   // on each board. WHEN_EMPTY keeps queued/leased frames out of reuse.
   c.fb_location=CAMERA_FB_IN_PSRAM;c.fb_count=2;c.grab_mode=CAMERA_GRAB_WHEN_EMPTY;
@@ -101,8 +111,17 @@ class ImageSource {
     return false;
   }
   ready_=true;
-  if(!applyControls(settings) || !applyCaptureClock(settings)) {
+  if((crop && !applyCropWindow(*crop)) || !applyControls(settings) || !applyCaptureClock(settings)) {
     esp_camera_deinit();ready_=false;return false;
+  }
+  // The driver starts capture during init. Drain old-mode/transitional frames
+  // after programming a crop before the producer can publish any to callers.
+  if(crop) {
+    for(uint8_t i=0;i<3;++i) {
+      camera_fb_t *stale=esp_camera_fb_get();
+      if(!stale) { esp_camera_deinit();ready_=false;return false; }
+      esp_camera_fb_return(stale);
+    }
   }
   resetMailbox();
   if(!startCaptureTask()) {
@@ -144,11 +163,37 @@ class ImageSource {
     return true;
   }
   void resume() { pauseRequested_=false; }
+  bool supportsCrop() const {
+#if defined(CAMERA_BOARD_AI_THINKER)
+    sensor_t *sensor=ready_?esp_camera_sensor_get():nullptr;
+    return sensor && sensor->id.PID==OV2640_PID && sensor->set_res_raw;
+#else
+    return false;
+#endif
+  }
   uint32_t acquisitionCount() const { return acquisitionCount_; }
   uint32_t acquisitionFailures() const { return acquisitionFailures_; }
   uint32_t replacedFrames() const { return replacedFrames_; }
 
  private:
+  bool applyCropWindow(const CaptureWindow &crop) {
+#if defined(CAMERA_BOARD_AI_THINKER)
+    sensor_t *sensor=esp_camera_sensor_get();
+    if(!sensor || sensor->id.PID!=OV2640_PID || !sensor->set_res_raw) return false;
+    // OV2640 set_res_raw uses startX as its mode selector (1 = SVGA).
+    // Keep the full VGA path's 800x600 native mode and 5:4 input/output
+    // scale. Offsets refer to native-mode pixels; this mapping needs board QA.
+    // The driver itself was allocated for the selected OUTPUT preset above.
+    const int result=sensor->set_res_raw(sensor,1,0,0,0,
+      crop.x*5/4,crop.y*5/4,crop.width*5/4,crop.height*5/4,
+      crop.width,crop.height,false,false);
+    DEBUGF("crop window x=%u y=%u output=%ux%u native=%ux%u result=%d\n",
+      crop.x,crop.y,crop.width,crop.height,crop.width*5/4,crop.height*5/4,result);
+    return result==0;
+#else
+    (void)crop;return false;
+#endif
+  }
   bool applyCaptureClock(const CameraSettings &settings) {
 #if defined(CAMERA_BOARD_AI_THINKER) && CAMERA_OV2640_VGA_CLOCK_TRIAL
     sensor_t *sensor=esp_camera_sensor_get();
