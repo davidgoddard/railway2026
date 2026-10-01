@@ -17,6 +17,24 @@ The system has three components:
 
 Camera modules need power and communicate with the bridge without data cables. After configuration, the bridge also needs only power; the setup computer can be disconnected.
 
+![Camera modules send occupancy states through the bridge to railway control software, while the setup application connects over USB](Documentation/assets/example.png)
+
+## Detection at speed
+
+Depending upon the area to be monitored you may not need the fastest frames per second processing rates.  The cheapest modules, the esp32-cam modules can achieve frame rates above 3 per second which for a shunting area where locomotives move slowly, a loco may only move a centimetre or so past the sensor before the system knows the sensor fired.  Compared to cut-track block detection, the front of the loco may have gone more than a centimetre into the area before the block triggers anyway making the cheap cameras quite acceptable.  If you are monitoring a higher speed line and don't want to move the sensor earlier in the locomotive's path then the esp32-s3 camera modules will attain rates around 10 frames per second and the esp32-P4 modules higer still.
+
+At **10 frames/second**, frames are **100 ms apart**, so the distances become:
+
+| Scale speed | OO (1:76) | HO (1:87) |
+| ----------- | --------- | --------- |
+| 5 mph       | 2.9 mm    | 2.6 mm    |
+| 10 mph      | 5.9 mm    | 5.1 mm    |
+| 20 mph      | 11.8 mm   | 10.3 mm   |
+| 30 mph      | 17.6 mm   | 15.4 mm   |
+| 40 mph      | 23.5 mm   | 20.6 mm   |
+| 60 mph      | 35.3 mm   | 30.8 mm   |
+| 80 mph      | 47.0 mm   | 41.1 mm   |
+
 ## ESP32 hardware requirements
 
 The detector and sensor state logic are hardware independent. Camera capture and radio communication still depend on facilities provided by the selected ESP32 and board. Selecting an ESP32 target in Arduino does not by itself provide a camera pin map, a camera driver, PSRAM, or an ESP-NOW-capable radio.
