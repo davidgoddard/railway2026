@@ -8,7 +8,7 @@ This is a historical, standalone experiment and does not implement the productio
 - A second pin map is included for **Espressif ESP32-S3-EYE**. In `camera_module.ino`, comment out `CAMERA_BOARD_AI_THINKER` and uncomment `CAMERA_BOARD_ESP32S3_EYE` before compiling for that board. Other ESP32-S3 camera boards have different pins and need a matching map.
 - Install an ESP32 Arduino core that includes `esp_camera.h`; select the appropriate board and enable PSRAM. This sketch captures grayscale frames and requires PSRAM.
 - For an AI Thinker ESP32-CAM, use a suitable USB-to-serial programmer and stable 5 V supply. Follow that board's upload procedure, including its boot pin, then reset it to run.
-- Open Serial Monitor at **115200 baud** to see camera initialization errors and the hotspot address.
+- Open Serial Monitor at **921600 baud** to see camera initialization errors and the hotspot address.
 
 The sketch version is defined on the first line of `camera_module.ino` and printed both in Serial Monitor and on the web page, so you can confirm which upload is running.
 

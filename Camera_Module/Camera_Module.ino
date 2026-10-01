@@ -1,4 +1,4 @@
-#define CAMERA_MODULE_VERSION "0.2.32"
+#define CAMERA_MODULE_VERSION "0.2.41"
 #define CAMERA_DEBUG_SERIAL 1
 #include <Arduino.h> // Load target macros before selecting the board pin map.
 // Override these in the build flags for another supported camera board.
@@ -21,6 +21,21 @@
 #include <esp_heap_caps.h>
 #include <math.h>
 #include <stddef.h>
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3) && !ARDUINO_USB_CDC_ON_BOOT
+#if ARDUINO_USB_MODE
+HWCDC CameraUSB;
+#define CAMERA_USB_BEGIN() CameraUSB.begin()
+#else
+#include "USB.h"
+USBCDC CameraUSB;
+#define CAMERA_USB_BEGIN() do { CameraUSB.begin();USB.begin(); } while(0)
+#endif
+#define CAMERA_SEPARATE_USB 1
+#else
+#define CAMERA_SEPARATE_USB 0
+#define CAMERA_USB_BEGIN() do {} while(0)
+#endif
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
 #error ESP32-P4 needs a board-specific image source and ESP-NOW transport via a companion radio
@@ -1123,17 +1138,45 @@ void printInfo() {
   }
 #endif
 }
-void serialSnapshot() {
+bool serialWriteAll(Stream &output,const uint8_t *data,size_t length) {
+  size_t offset=0;uint32_t lastProgress=millis();
+  while(offset<length) {
+    const size_t requested=min((size_t)4096,length-offset);
+    const size_t written=output.write(data+offset,requested);
+    if(written) { offset+=written;lastProgress=millis(); }
+    else if(millis()-lastProgress>5000) return false;
+    yield();
+  }
+  return true;
+}
+bool serialSnapshot(Stream &output,bool focusCrop=false) {
 #if CAMERA_DEBUG_SERIAL
-  if(snapshot.active || !frameNumber || !framePixels) { DEBUGLN("snapshot unavailable");return; }
-  const uint32_t bytes=(uint32_t)frameWidth*frameHeight;
-  const uint32_t crc=crc32(framePixels,bytes);
+  if(snapshot.active || !frameNumber || !framePixels) { DEBUGLN("snapshot unavailable");return false; }
+  const uint16_t width=focusCrop?min((uint16_t)320,min(frameWidth,frameHeight)):frameWidth;
+  const uint16_t height=focusCrop?width:frameHeight;
+  const uint16_t left=(frameWidth-width)/2,top=(frameHeight-height)/2;
+  const uint32_t bytes=(uint32_t)width*height;
+  uint32_t crcState=0xFFFFFFFFUL;
+  for(uint16_t row=0;row<height;++row) {
+    const uint8_t *source=framePixels+(uint32_t)(top+row)*frameWidth+left;
+    for(uint16_t column=0;column<width;++column) {
+      crcState^=source[column];
+      for(uint8_t bit=0;bit<8;++bit) crcState=(crcState>>1)^((crcState&1)?0xEDB88320UL:0);
+    }
+  }
+  const uint32_t crc=~crcState;
   struct __attribute__((packed)) SerialFrameHeader {
     char magic[8];uint32_t frame,bytes,crc;uint16_t width,height;
-  } header={{'R','A','I','L','F','R','M','1'},frameNumber,bytes,crc,frameWidth,frameHeight};
-  Serial.write((const uint8_t *)&header,sizeof(header));
-  Serial.write(framePixels,bytes);Serial.flush();
-  DEBUGF("\nsnapshot bytes=%lu crc=%08lx\n",(unsigned long)bytes,(unsigned long)crc);
+  } header={{'R','A','I','L','F','R','M','1'},frameNumber,bytes,crc,width,height};
+  bool complete=serialWriteAll(output,(const uint8_t *)&header,sizeof(header));
+  for(uint16_t row=0;complete&&row<height;++row) complete=serialWriteAll(output,
+    framePixels+(uint32_t)(top+row)*frameWidth+left,width);
+  output.flush();
+  if(!complete) DEBUGLN("snapshot transfer stalled");
+  return complete;
+#else
+  (void)output;
+  return false;
 #endif
 }
 // Capture-only experiment. It must never feed unverified crop coordinates into
@@ -1243,10 +1286,11 @@ void cropExperiment(bool exportFrames) {
 }
 
 char serialLine[180];size_t serialLength=0;
+bool serialVideoStreaming=false;
 void handleSerialLine(char *line) {
   char *command=strtok(line," \t");if(!command) return;
   if(strcmp(command,"H")==0) {
-    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast threshold_permille enter clear | A commit | R baseline | F raw frame | O crop benchmark | O FRAME crop comparison images | X clear RAM config | Z FORMAT LittleFS");
+    DEBUGLN("H help | I info | P MAC pair | C channel | B revision count resolution [brightness contrast saturation vflip hmirror] | S index id group x y radius C/S contrast threshold_permille enter clear | A commit | R baseline | F raw frame | V START/STOP live frames | O crop benchmark | O FRAME crop comparison images | X clear RAM config | Z FORMAT LittleFS");
   } else if(strcmp(command,"I")==0) printInfo();
   else if(strcmp(command,"P")==0) {
     char *value=strtok(nullptr," \t");uint8_t mac[6];
@@ -1287,7 +1331,13 @@ void handleSerialLine(char *line) {
     } else DEBUGLN("S syntax error");
   } else if(strcmp(command,"A")==0) DEBUGF("commit status=%u\n",commitConfig(stagingRevision));
   else if(strcmp(command,"R")==0) DEBUGLN(configured && captureBaseline()?"baseline OK":"baseline failed");
-  else if(strcmp(command,"F")==0) serialSnapshot();
+  else if(strcmp(command,"F")==0) serialSnapshot(Serial,false);
+  else if(strcmp(command,"V")==0) {
+    char *mode=strtok(nullptr," \t");
+    if(mode && strcmp(mode,"START")==0) serialVideoStreaming=true;
+    else if(mode && strcmp(mode,"STOP")==0) serialVideoStreaming=false;
+    else DEBUGLN("V START or V STOP required");
+  }
   else if(strcmp(command,"O")==0) {
     char *option=strtok(nullptr," \t");
     if(option && strcmp(option,"FRAME")!=0) DEBUGLN("O or O FRAME required");
@@ -1321,19 +1371,30 @@ void pollSerial() {
     else serialLength=0;
   }
 }
-
-bool blankStorage(const esp_partition_t *partition) {
-  uint8_t bytes[256];
-  for(size_t offset=0;offset<partition->size;offset+=sizeof(bytes)) {
-    size_t count=min(sizeof(bytes),(size_t)partition->size-offset);
-    if(esp_partition_read(partition,offset,bytes,count)!=ESP_OK) return false;
-    for(size_t i=0;i<count;++i) if(bytes[i]!=0xFF) return false;
+#if CAMERA_SEPARATE_USB
+char usbLine[16];size_t usbLength=0;
+bool usbVideoStreaming=false;
+void pollCameraUsb() {
+  while(CameraUSB.available()) {
+    const char ch=CameraUSB.read();
+    if(ch=='\r') continue;
+    if(ch=='\n') {
+      usbLine[usbLength]=0;
+      if(strcmp(usbLine,"V START")==0) usbVideoStreaming=true;
+      else if(strcmp(usbLine,"V STOP")==0) usbVideoStreaming=false;
+      usbLength=0;
+    } else if(usbLength<sizeof(usbLine)-1) usbLine[usbLength++]=ch;
+    else usbLength=0;
   }
-  return true;
 }
+#endif
+
 void setup() {
   pinMode(STATUS_LED,OUTPUT);digitalWrite(STATUS_LED,LOW);
-  Serial.begin(115200);delay(200);
+  Serial.begin(921600);delay(200);
+#if CAMERA_SEPARATE_USB
+  CameraUSB.setTxTimeoutMs(5000);CAMERA_USB_BEGIN();
+#endif
   DEBUGF("Railway camera %s boot\n",CAMERA_MODULE_VERSION);
   if(!psramFound()) { DEBUGLN("PSRAM required");return; }
   cells=(CellRuntime *)ps_malloc(sizeof(CellRuntime)*MAX_CELLS);
@@ -1358,11 +1419,10 @@ void setup() {
   esp_now_register_recv_cb(onReceive);
   addPeer(BROADCAST_MAC);
   const esp_partition_t *storage=esp_partition_find_first(ESP_PARTITION_TYPE_DATA,ESP_PARTITION_SUBTYPE_DATA_SPIFFS,"spiffs");
-  bool freshStorage=storage && blankStorage(storage);
-  storageReady=storage && LittleFS.begin(freshStorage);
+  storageReady=storage && LittleFS.begin(true);
   if(!storage) DEBUGLN("LittleFS partition missing");
   if(!storageReady) DEBUGLN("LittleFS unavailable; persistent baseline disabled");
-  else if(freshStorage) DEBUGLN("LittleFS initialized");
+  else DEBUGLN("LittleFS initialized");
   // A saved baseline knows the required resolution and initializes the camera
   // directly at that size. Initializing QVGA first and immediately tearing the
   // driver down for the saved size made cold boot timing-dependent.
@@ -1375,6 +1435,9 @@ void setup() {
 
 void loop() {
   pollSerial();
+#if CAMERA_SEPARATE_USB
+  pollCameraUsb();
+#endif
   if(!inbox) { delay(100);return; }
   Received message;
   for(int n=0;n<16 && xQueueReceive(inbox,&message,0)==pdTRUE;++n) handleRadio(message);
@@ -1405,6 +1468,10 @@ void loop() {
       }
     }
   }
+  if(serialVideoStreaming && !serialSnapshot(Serial,true)) serialVideoStreaming=false;
+#if CAMERA_SEPARATE_USB
+  if(usbVideoStreaming && !serialSnapshot(CameraUSB,true)) usbVideoStreaming=false;
+#endif
   sendStateBitmap();sendScores();
   if(millis()-lastHello>=HELLO_MS) { lastHello=millis();sendHello(); }
   if(millis()-lastHealth>=HEALTH_MS) { lastHealth=millis();sendHealth(); }

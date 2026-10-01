@@ -1,6 +1,6 @@
 # Camera capture and detection optimisation handover
 
-Updated: 2026-09-29. Current experimental firmware: **0.2.32**.
+Updated: 2026-09-29. Current experimental firmware: **0.2.35**.
 
 ## Objective and current position
 
@@ -8,7 +8,7 @@ Increase **sustained updates per sensor per second**, preserving image detail, s
 
 The working clock setting is **divide by 4**, giving approximately **2.7–3.1 FPS** in the supplied logs. Divide by 2 produced repeated incomplete frames and was reverted. Direct driver-buffer ownership and pipeline timings are implemented.
 
-**0.2.32 contains an automatically sized crop benchmark, not automatic cropped occupancy detection.** It computes an enclosing window from the deployed sensors, tests actual camera cropping, and restores full-frame operation. Hardware crop timing, pixel alignment, scaling and exposure effects are not yet verified. This is the next required board experiment before cropped pixels can safely be associated with existing sensor geometry and baselines.
+**0.2.32 contains an automatically sized crop benchmark, not automatic cropped occupancy detection.** It computes an enclosing window from the deployed sensors, tests actual camera cropping, and restores full-frame operation. Hardware crop timing, pixel alignment, scaling and exposure effects are not yet verified. This is the next required board experiment before cropped pixels can safely be associated with existing sensor geometry and baselines. Version 0.2.33 additionally makes the OV2640 clock override capability-based: it is available at every configured resolution and on either supported board map when the detected sensor is an OV2640. Version 0.2.34 added a resolution-independent 30 MHz OV5640 PCLK trial on ESP32-S3, measured at approximately 6 FPS on the supplied SVGA setup. Version 0.2.35 raises that trial to 40 MHz. Only the original AI Thinker/VGA OV2640 divide-by-4 and S3/OV5640 30 MHz results have hardware measurements so far.
 
 No firmware has been flashed by the agent. All hardware observations below came from the user. Changes in this working tree span the earlier capture experiments; do not discard them as unrelated edits.
 
@@ -70,7 +70,7 @@ The application UI estimates FPS from camera frame-number changes between health
 
 ### Sensor clock experiments (0.2.29–0.2.31)
 
-`ImageSource.h` defaults to:
+The original VGA trial used:
 
 ```cpp
 #define CAMERA_OV2640_VGA_CLOCK_TRIAL 1
@@ -80,6 +80,12 @@ The application UI estimates FPS from camera frame-number changes between health
 The override applies only to AI Thinker builds, detected OV2640, VGA, and an existing full CLKRC register value of 7. The sensor-bank register address for the driver's `get_reg`/`set_reg` API is **0x111**. Its six divider bits encode **divisor minus one**. The trial changes 7 to 3 (÷8 to ÷4), verifies readback and preserves other controls. External XCLK remains 20 MHz. Unexpected existing values are logged and left unchanged; write/readback failures abort initialization through the existing retry path.
 
 Set `CAMERA_OV2640_VGA_CLOCK_TRIAL=0` to retain driver defaults. Explicit build flags override header defaults. Divisor 2 is retained only as an explicit experiment and is known to fail in the user's tested setup. Only divisor values 2 and 4 currently compile; **divide by 3 has been discussed but is not implemented or tested**.
+
+Version 0.2.33 replaces that board/resolution gate with detected-sensor capability gating. `CAMERA_OV2640_CLOCK_OVERRIDE=1` and `CAMERA_OV2640_CLOCK_DIVISOR=4` now apply to an OV2640 at every supported resolution and on either board map. The implementation preserves non-divider CLKRC bits and accepts explicit divisors 1–64 for testing. Non-OV2640 sensors are logged and unchanged. The former VGA macro names remain build-flag aliases. This broader availability is not broader validation: each board, resolution and sensor-clock combination still requires complete-frame, image-quality, exposure and detection testing.
+
+Version 0.2.34 detects OV5640 separately and, on ESP32-S3, calls the driver's `set_pll` API for a 30 MHz PCLK at every supported resolution. `CAMERA_OV5640_PLL_OVERRIDE=0` restores driver defaults; `CAMERA_OV5640_PCLK_MHZ` accepts 4–40 for controlled experiments. External XCLK remains 20 MHz. The affected registers are snapshotted and multiplier/divider readback is verified, with restoration and failed initialization if the trial cannot be applied. This preserves resolution as user configuration rather than inferring it from deployed sensor locations.
+
+Version 0.2.35 changes the default OV5640 trial to 40 MHz after the user's SVGA module measured around 6 FPS at 30 MHz. Forty MHz is the documented ESP32-S3 ceiling and is not yet hardware-validated here. Revert to 30 MHz on incomplete frames, tearing, capture failures, unstable exposure or detection regressions.
 
 `Arduino.h` now loads target macros before automatic board-map selection. Previously that selection occurred before the target definitions were loaded. Preserve this ordering so S3 selects its own map and stays outside the AI Thinker trial.
 
@@ -111,7 +117,7 @@ Using unverified crop coordinates with saved full-frame baselines could make a s
 
 Upload 0.2.32. Keep the camera at VGA with existing deployed sensors and the default ÷4 clock. Keep the scene stationary for the comparison. Do not start calibration or snapshot transfer simultaneously.
 
-For timing only, open the **camera's** USB serial monitor at 115200 baud, newline ending, and send:
+For timing only, open the **camera's** USB serial monitor at 921600 baud, newline ending, and send:
 
 ```text
 O
@@ -141,7 +147,7 @@ Replace the device path. This sends `O FRAME` and saves:
 - `crop-check-crop.png`: camera-cropped pixels placed at their expected position on a black full-size canvas;
 - `crop-check.log`: text diagnostics, including the chosen coordinates and timing.
 
-The ordinary command without `--crop` still sends `F` and saves one full frame. Do not send `O FRAME` into a text terminal: it emits binary image data. At 115200 baud, exporting both uncompressed VGA canvases takes roughly a minute; occupancy is suspended and the bridge may temporarily time out while binary output prevents interleaved heartbeat logging. The capture utility waits for confirmation that full-frame monitoring was restored, not merely for the second image. The simple `O` timing test is much shorter.
+The ordinary command without `--crop` still sends `F` and saves one full frame. Do not send `O FRAME` into a text terminal: it emits binary image data. At 921600 baud, exporting both uncompressed VGA canvases still takes several seconds; occupancy is suspended and the bridge may temporarily time out while binary output prevents interleaved heartbeat logging. The capture utility waits for confirmation that full-frame monitoring was restored, not merely for the second image. The simple `O` timing test is much shorter.
 
 ### Required next observations and integration work
 
@@ -201,7 +207,7 @@ Do not remove frame validity checks, unknown-state handling, baseline compatibil
 | `tests/camera/` | Host model of driver/RTOS ownership and crop planner tests. |
 | `Camera_Module/README.md` | Firmware usage and versioned experiment notes. |
 
-Local toolchain: Arduino CLI bundled at `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`; installed Arduino-ESP32 **3.3.5**. Builds use temporary directories, not tracked binaries. The guide mentions compatible 3.x cores; do not claim the tested build used 3.3.8.
+Local toolchain: Arduino CLI bundled at `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`; installed Arduino-ESP32 **3.3.8**. Builds use temporary directories, not tracked binaries.
 
 Build from the repository root:
 

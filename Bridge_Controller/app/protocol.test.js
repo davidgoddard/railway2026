@@ -28,6 +28,13 @@ test('builds a complete ordered upload including the MQTT alias', () => {
   assert.equal(commands[3], `COMMIT ${mac}`);
   assert.equal(commands[4], `TOPIC ${mac} 20 706C6174666F726D2D31`);
 });
+test('uploads per-camera orientation settings', () => {
+  const saved = config(), draft = structuredClone(saved);
+  draft.settings.hmirror = 1;
+  draft.settings.vflip = 1;
+  assert.equal(sameCameraConfiguration(draft, saved), false);
+  assert.equal(commandsForConfig(mac, draft)[0], `BEGIN ${mac} 5 2 0 0 0 0 1 1`);
+});
 test('uploads a camera-wide one-frame occupancy choice for every sensor', () => {
   const saved = config(), draft = structuredClone(saved);
   for (const cell of draft.cells) cell.enter = 1;
@@ -117,7 +124,7 @@ test('counts changed, added, removed, and renamed camera items', () => {
   draft.cells = draft.cells.filter(cell => cell.id !== 2);
   assert.equal(countCameraChanges(draft, saved), 4);
 });
-test('records a committed draft locally without waiting for a bridge refresh', () => {
+test('marks added and geometry-edited sensors for calibration in a committed draft', () => {
   const current = config();
   current.revision = 7;
   current.lastAutoSizeRevision = 6;
@@ -129,6 +136,28 @@ test('records a committed draft locally without waiting for a bridge refresh', (
   assert.equal(saved.revision, 8);
   assert.equal(saved.lastAutoSizeRevision, 6);
   assert.equal(saved.cells[0].x, 123);
-  assert.equal(saved.cells[0].createdRevision, 2);
+  assert.equal(saved.cells[0].createdRevision, 8);
   assert.equal(saved.cells[2].createdRevision, 8);
+});
+test('does not mark non-geometry sensor edits for calibration', () => {
+  const current = config();
+  current.revision = 7;
+  current.lastAutoSizeRevision = 6;
+  const draft = structuredClone(current);
+  draft.cells[0].threshold++;
+  draft.cells[0].enter++;
+  draft.cells[0].group++;
+  const saved = committedConfig(current, draft);
+  assert.equal(saved.cells[0].createdRevision, current.cells[0].createdRevision);
+});
+test('marks radius and shape edits for calibration', () => {
+  const current = config();
+  current.revision = 7;
+  current.lastAutoSizeRevision = 6;
+  const draft = structuredClone(current);
+  draft.cells[0].radius++;
+  draft.cells[1].shape = 1;
+  const saved = committedConfig(current, draft);
+  assert.equal(saved.cells[0].createdRevision, 8);
+  assert.equal(saved.cells[1].createdRevision, 8);
 });

@@ -87,11 +87,16 @@ function commandsForConfig(mac, config) {
 }
 function committedConfig(current, draft) {
   const revision = current.revision + 1;
-  const existing = new Map(current.cells.map(cell => [cell.id, cell.createdRevision]));
+  const existing = new Map(current.cells.map(cell => [cell.id, cell]));
   return {
     ...JSON.parse(JSON.stringify(draft)), revision,
     lastAutoSizeRevision: current.lastAutoSizeRevision,
-    cells: draft.cells.map(cell => ({ ...cell, createdRevision: existing.get(cell.id) || revision }))
+    cells: draft.cells.map(cell => {
+      const previous = existing.get(cell.id);
+      const geometryChanged = previous &&
+        (cell.x !== previous.x || cell.y !== previous.y || cell.radius !== previous.radius || cell.shape !== previous.shape);
+      return { ...cell, createdRevision: !previous || geometryChanged ? revision : previous.createdRevision };
+    })
   };
 }
 module.exports = { RESOLUTIONS, DEFAULT_CELL, MAC, SLUG, hex, parseRow, crc32, Snapshot, validateConfig, commandsForConfig, committedConfig };

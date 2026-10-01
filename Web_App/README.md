@@ -11,7 +11,7 @@ Serve this directory over HTTPS and open it in desktop Chrome or Edge. GitHub Pa
 
 1. Click **Scan USB ports** or **Choose USB device** and approve the ESP32 bridge.
 2. Select the approved device and click **Connect bridge**.
-3. The browser opens Web Serial at 115200 baud and uses the same bridge line protocol as Electron.
+3. The browser opens Web Serial at 921600 baud and uses the same bridge line protocol as Electron.
 
 Opening `index.html` directly with `file://` is not supported because Web Serial requires a secure context.
 

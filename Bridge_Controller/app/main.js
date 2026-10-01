@@ -5,8 +5,10 @@ const path = require('node:path');
 const { parseRow, Snapshot, validateConfig, commandsForConfig, committedConfig, MAC } = require('./protocol');
 const { saveFrame, loadFrame } = require('./frame-cache');
 const { createMonitor } = require('./mqtt-monitor');
+const { FocusStreamParser } = require('./focus-stream');
 
 let win, port, pending, queue = Promise.resolve(), buffer = '', refreshTimer, connectionGeneration = 0, refreshPromise = null;
+let focusPort = null, focusParser = null;
 const snapshots = new Map(), frameTimers = new Map();
 const configs = new Map(), cameras = new Map(), states = new Map(), cellStates = new Map();
 const healthSamples = new Map();
@@ -187,7 +189,7 @@ async function connect(serialPath) {
   ++connectionGeneration;
   const available = await SerialPort.list();
   if (!available.some(p => p.path === serialPath)) throw Error('Selected serial port is unavailable');
-  const next = new SerialPort({ path: serialPath, baudRate: 115200, autoOpen: false });
+  const next = new SerialPort({ path: serialPath, baudRate: 921600, autoOpen: false });
   try { await new Promise((resolve, reject) => next.open(err => err ? reject(err) : resolve())); }
   catch (error) {
     if (/busy|access denied|permission denied|EBUSY/i.test(error.message)) throw Error('USB port is in use. Close Arduino Serial Monitor and any other serial app, then try again.');
@@ -210,6 +212,25 @@ async function disconnect() {
   if (port?.isOpen) await new Promise(resolve => port.close(() => resolve()));
   port = null; cameras.clear(); configs.clear(); states.clear(); cellStates.clear(); healthSamples.clear(); network = { wifi: 'disconnected', wifiDetail: '', mqtt: 'disconnected', mqttDetail: '', wifiSaved: null, mqttSaved: null, bridgeVersion: '' }; state();
 }
+async function focusConnect(serialPath) {
+  if(!serialPath||serialPath===port?.path)throw Error('Choose the camera USB port, not the connected bridge port');
+  await focusDisconnect();
+  const available=await SerialPort.list();if(!available.some(item=>item.path===serialPath))throw Error('Selected camera port is unavailable');
+  const next=new SerialPort({path:serialPath,baudRate:921600,autoOpen:false});
+  try{await new Promise((resolve,reject)=>next.open(error=>error?reject(error):resolve()));}
+  catch(error){if(/busy|access denied|permission denied|EBUSY/i.test(error.message))throw Error('Camera USB port is in use. Close Arduino Serial Monitor and try again.');throw error;}
+  focusPort=next;focusParser=new FocusStreamParser(frame=>send('focus:frame',frame),message=>send('focus:error',{message}));
+  next.on('data',data=>{if(focusPort===next)focusParser.push(data);});
+  next.on('error',error=>{if(focusPort===next)send('focus:error',{message:error.message});});
+  next.on('close',()=>{if(focusPort!==next)return;focusPort=null;focusParser=null;send('focus:status',{connected:false,message:'Camera USB disconnected'});});
+  await new Promise((resolve,reject)=>next.write('V START\n',error=>error?reject(error):next.drain(error=>error?reject(error):resolve())));
+  send('focus:status',{connected:true,path:serialPath});return {connected:true,path:serialPath};
+}
+async function focusDisconnect() {
+  const active=focusPort;focusPort=null;focusParser=null;
+  if(active?.isOpen){await new Promise(resolve=>active.write('V STOP\n',()=>active.drain(()=>resolve())));await new Promise(resolve=>active.close(()=>resolve()));}
+  send('focus:status',{connected:false});return {connected:false};
+}
 function createWindow() {
   win = new BrowserWindow({ width: 1440, height: 900, minWidth: 1080, minHeight: 700, backgroundColor: '#0c1420', title: 'Railway Bridge Controller', webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true } });
   win.loadFile(path.join(__dirname, 'index.html'));
@@ -222,6 +243,8 @@ app.whenReady().then(() => {
   ipcMain.handle('ports', () => SerialPort.list().then(list => list.map(p => ({ path: p.path, manufacturer: p.manufacturer || '', vendorId: p.vendorId || '', productId: p.productId || '' }))));
   ipcMain.handle('connect', (_, serialPath) => connect(serialPath));
   ipcMain.handle('disconnect', disconnect);
+  ipcMain.handle('focus-connect', (_, serialPath) => focusConnect(serialPath));
+  ipcMain.handle('focus-disconnect', focusDisconnect);
   ipcMain.handle('refresh', refresh);
   ipcMain.handle('logs', logs);
   ipcMain.handle('frame', async (_, mac) => { if (!MAC.test(mac)) throw Error('Invalid camera'); expectFrame(mac);try { return await run(`FRAME ${mac}`); } catch (error) { clearFrameRequest(mac);throw error; } });
@@ -253,4 +276,4 @@ app.whenReady().then(() => {
   app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => monitor?.stop());
+app.on('before-quit', () => { monitor?.stop();focusDisconnect().catch(()=>{}); });

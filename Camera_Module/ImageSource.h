@@ -2,18 +2,45 @@
 #include <esp_camera.h>
 #include "CaptureWindow.h"
 
-// Set to 0 to compare against the unmodified sensor driver clock.
-#ifndef CAMERA_OV2640_VGA_CLOCK_TRIAL
-#define CAMERA_OV2640_VGA_CLOCK_TRIAL 1
+// Set to 0 to retain the sensor driver's clock at every resolution.  The old
+// VGA-specific names remain accepted as build-flag aliases.
+#ifndef CAMERA_OV2640_CLOCK_OVERRIDE
+#ifdef CAMERA_OV2640_VGA_CLOCK_TRIAL
+#define CAMERA_OV2640_CLOCK_OVERRIDE CAMERA_OV2640_VGA_CLOCK_TRIAL
+#else
+#define CAMERA_OV2640_CLOCK_OVERRIDE 1
+#endif
 #endif
 
-// Default 4 restores the measured ~3 FPS setting. Divisor 2 produced short
-// frames on the tested AI Thinker and is retained only for explicit experiments.
-#ifndef CAMERA_OV2640_VGA_CLOCK_DIVISOR
-#define CAMERA_OV2640_VGA_CLOCK_DIVISOR 4
+// Divide by 4 is measured on AI Thinker/VGA. Other OV2640 boards and
+// resolutions are enabled for hardware testing, not assumed to be validated.
+#ifndef CAMERA_OV2640_CLOCK_DIVISOR
+#ifdef CAMERA_OV2640_VGA_CLOCK_DIVISOR
+#define CAMERA_OV2640_CLOCK_DIVISOR CAMERA_OV2640_VGA_CLOCK_DIVISOR
+#else
+#define CAMERA_OV2640_CLOCK_DIVISOR 4
 #endif
-#if CAMERA_OV2640_VGA_CLOCK_DIVISOR != 2 && CAMERA_OV2640_VGA_CLOCK_DIVISOR != 4
-#error CAMERA_OV2640_VGA_CLOCK_DIVISOR must be 2 or 4
+#endif
+#if CAMERA_OV2640_CLOCK_DIVISOR < 1 || CAMERA_OV2640_CLOCK_DIVISOR > 64
+#error CAMERA_OV2640_CLOCK_DIVISOR must be between 1 and 64
+#endif
+
+// The OV5640 driver configures non-JPEG output conservatively (normally a
+// 10 MHz PCLK). ESP32-S3's dedicated camera peripheral supports up to 40 MHz,
+// so advance the successful 30 MHz test to a 40 MHz trial without restricting
+// resolution.
+#ifndef CAMERA_OV5640_PLL_OVERRIDE
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+#define CAMERA_OV5640_PLL_OVERRIDE 1
+#else
+#define CAMERA_OV5640_PLL_OVERRIDE 0
+#endif
+#endif
+#ifndef CAMERA_OV5640_PCLK_MHZ
+#define CAMERA_OV5640_PCLK_MHZ 40
+#endif
+#if CAMERA_OV5640_PCLK_MHZ < 4 || CAMERA_OV5640_PCLK_MHZ > 40
+#error CAMERA_OV5640_PCLK_MHZ must be between 4 and 40
 #endif
 
 // Select the board pin map here. Additional DVP boards need only a new map.
@@ -195,31 +222,68 @@ class ImageSource {
 #endif
   }
   bool applyCaptureClock(const CameraSettings &settings) {
-#if defined(CAMERA_BOARD_AI_THINKER) && CAMERA_OV2640_VGA_CLOCK_TRIAL
+#if CAMERA_OV2640_CLOCK_OVERRIDE || CAMERA_OV5640_PLL_OVERRIDE
+    (void)settings; // Used by diagnostics when DEBUGF is enabled.
     sensor_t *sensor=esp_camera_sensor_get();
     if(!sensor) return false;
-    // Espressif's OV2640 non-JPEG VGA path sets CLKRC divider bits to 7.
-    // CLKRC encodes divisor minus one. Preserve the other CLKRC bits,
-    // the external 20 MHz clock, pixel-clock control and exposure controls.
-    // get_reg/set_reg encode sensor bank 1 in bit 8 of the register address.
-    if(settings.resolution!=VGA || sensor->id.PID!=OV2640_PID) return true;
-    if(!sensor->get_reg || !sensor->set_reg) return false;
-    constexpr int CLKRC_REGISTER=0x111,DIVIDER_MASK=0x3f;
-    constexpr int trialDivider=CAMERA_OV2640_VGA_CLOCK_DIVISOR-1;
-    const int before=sensor->get_reg(sensor,CLKRC_REGISTER,0xff);
-    if(before<0) return false;
-    if(before!=7) {
-      DEBUGF("capture clock trial skipped: unexpected OV2640 CLKRC=0x%02X\n",before);
+#if CAMERA_OV5640_PLL_OVERRIDE
+    if(sensor->id.PID==OV5640_PID) {
+      if(!sensor->get_reg || !sensor->set_reg || !sensor->set_pll) return false;
+      // With 20 MHz XCLK these documented OV5640 PLL parameters make the
+      // multiplier numerically equal to PCLK MHz: pre-div /2, 10-bit PLL
+      // factor 2/5, PCLK root /2 and manual PCLK /2.
+      constexpr int registers[]={0x3039,0x3034,0x3035,0x3036,0x3037,0x3108,0x3824,0x460C,0x3103};
+      int before[sizeof(registers)/sizeof(registers[0])];
+      for(size_t i=0;i<sizeof(registers)/sizeof(registers[0]);++i) {
+        before[i]=sensor->get_reg(sensor,registers[i],0xff);
+        if(before[i]<0) return false;
+      }
+      const int result=sensor->set_pll(sensor,false,CAMERA_OV5640_PCLK_MHZ,1,2,false,1,true,2);
+      const int multiplier=sensor->get_reg(sensor,0x3036,0xff);
+      const int pclkDivider=sensor->get_reg(sensor,0x3824,0xff);
+      if(result!=0 || multiplier!=CAMERA_OV5640_PCLK_MHZ || pclkDivider!=2) {
+        for(size_t i=0;i<sizeof(registers)/sizeof(registers[0]);++i)
+          sensor->set_reg(sensor,registers[i],0xff,before[i]);
+        DEBUGF("capture clock failed: OV5640 PLL result=%d multiplier=%d pclk_div=%d; restarting camera\n",
+          result,multiplier,pclkDivider);
+        return false;
+      }
+      DEBUGF("capture clock: OV5640 resolution=%u PCLK trial=%d MHz (20 MHz XCLK)\n",
+        settings.resolution,CAMERA_OV5640_PCLK_MHZ);
       return true;
     }
-    const int written=sensor->set_reg(sensor,CLKRC_REGISTER,DIVIDER_MASK,trialDivider);
+#endif
+#if CAMERA_OV2640_CLOCK_OVERRIDE
+    if(sensor->id.PID==OV2640_PID) {
+    // CLKRC encodes divisor minus one. Apply the configured value to every
+    // OV2640 board and resolution while preserving the other register bits,
+    // external 20 MHz XCLK, pixel-clock control and exposure controls.
+    // get_reg/set_reg encode sensor bank 1 in bit 8 of the register address.
+    if(!sensor->get_reg || !sensor->set_reg) return false;
+    constexpr int CLKRC_REGISTER=0x111,DIVIDER_MASK=0x3f;
+    constexpr int requestedBits=CAMERA_OV2640_CLOCK_DIVISOR-1;
+    const int before=sensor->get_reg(sensor,CLKRC_REGISTER,0xff);
+    if(before<0) return false;
+    const int expected=(before&~DIVIDER_MASK)|requestedBits;
+    if(before==expected) {
+      DEBUGF("capture clock: OV2640 CLKRC=0x%02X already divider /%d\n",
+        before,CAMERA_OV2640_CLOCK_DIVISOR);
+      return true;
+    }
+    const int written=sensor->set_reg(sensor,CLKRC_REGISTER,DIVIDER_MASK,requestedBits);
     const int after=sensor->get_reg(sensor,CLKRC_REGISTER,0xff);
-    if(written!=0 || after!=trialDivider) {
+    if(written!=0 || after!=expected) {
       sensor->set_reg(sensor,CLKRC_REGISTER,0xff,before);
-      DEBUGF("capture clock trial failed: write=%d readback=%d; restarting camera\n",written,after);
+      DEBUGF("capture clock failed: write=%d readback=%d expected=%d; restarting camera\n",
+        written,after,expected);
       return false;
     }
-    DEBUGF("capture clock trial: OV2640 VGA CLKRC=0x%02X -> 0x%02X (divider /8 -> /%d)\n",before,after,CAMERA_OV2640_VGA_CLOCK_DIVISOR);
+    DEBUGF("capture clock: OV2640 resolution=%u CLKRC=0x%02X -> 0x%02X (divider /%d -> /%d)\n",
+      settings.resolution,before,after,(before&DIVIDER_MASK)+1,CAMERA_OV2640_CLOCK_DIVISOR);
+      return true;
+    }
+#endif
+    DEBUGF("capture clock unchanged: unsupported sensor PID=0x%04X\n",sensor->id.PID);
 #else
     (void)settings;
 #endif

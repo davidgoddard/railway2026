@@ -21,7 +21,7 @@ int main() {
   assert(cropRegisters[0]==crop.x*5/4 && cropRegisters[1]==crop.y*5/4);
   assert(cropRegisters[2]==120 && cropRegisters[3]==120);
   assert(cropRegisters[4]==96 && cropRegisters[5]==96);
-  assert(clockRegister==CAMERA_OV2640_VGA_CLOCK_DIVISOR-1);
+  assert(clockRegister==CAMERA_OV2640_CLOCK_DIVISOR-1);
   assert(source.capture(pixels,width,height,frame));
   assert(pixels==fake::pixels[0].data() || pixels==fake::pixels[1].data());
   assert(source.begin(settings,pixels,width,height));

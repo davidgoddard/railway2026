@@ -57,17 +57,23 @@ struct camera_config_t {
   int pixel_format,frame_size,fb_location,fb_count,grab_mode;
 };
 struct camera_fb_t { uint8_t *buf;size_t len;uint16_t width,height;int format; };
-constexpr int OV2640_PID=0x26;
-inline int clockRegister=7,clockWrites=0;
-inline bool failClockWrite=false,failCrop=false;
+constexpr int OV2640_PID=0x26,OV5640_PID=0x5640;
+inline int clockRegister=7,clockInitialUpperBits=0,clockWrites=0;
+inline int ov5640Registers[0x10000]={},ov5640PllCalls=0;
+inline bool failClockWrite=false,failOv5640Pll=false,failCrop=false;
 inline int cropRegisters[6]={};
 struct sensor_t {
   struct { int PID=OV2640_PID; } id;
   static int readRegister(sensor_t *,int reg,int mask) {
-    assert(reg==0x111);return clockRegister & mask;
+    if(reg==0x111) return clockRegister & mask;
+    assert(reg>=0 && reg<0x10000);return ov5640Registers[reg] & mask;
   }
   static int writeRegister(sensor_t *,int reg,int mask,int value) {
-    assert(reg==0x111);++clockWrites;
+    if(reg!=0x111) {
+      assert(reg>=0 && reg<0x10000);
+      ov5640Registers[reg]=(ov5640Registers[reg]&~mask)|(value&mask);return 0;
+    }
+    ++clockWrites;
     if(failClockWrite) return -1;
     clockRegister=(clockRegister & ~mask)|(value & mask);return 0;
   }
@@ -80,6 +86,22 @@ struct sensor_t {
     clockRegister=7;return failCrop?-1:0;
   }
   int (*set_res_raw)(sensor_t *,int,int,int,int,int,int,int,int,int,int,bool,bool)=crop;
+  static int pll(sensor_t *,int bypass,int multiplier,int sysDiv,int preDiv,int root2x,
+                 int pclkRootDiv,int pclkManual,int pclkDiv) {
+    ++ov5640PllCalls;
+    if(failOv5640Pll) return -1;
+    ov5640Registers[0x3039]=bypass?0x80:0;
+    ov5640Registers[0x3034]=0x1a;
+    ov5640Registers[0x3035]=0x01|((sysDiv&0x0f)<<4);
+    ov5640Registers[0x3036]=multiplier;
+    ov5640Registers[0x3037]=(preDiv&0x0f)|(root2x?0x10:0);
+    ov5640Registers[0x3108]=((pclkRootDiv&3)<<4)|6;
+    ov5640Registers[0x3824]=pclkDiv;
+    ov5640Registers[0x460c]=pclkManual?0x22:0x20;
+    ov5640Registers[0x3103]=0x13;
+    return 0;
+  }
+  int (*set_pll)(sensor_t *,int,int,int,int,int,int,int,int)=pll;
   static int control(sensor_t *,int) { return 0; }
   int (*set_brightness)(sensor_t *,int)=control;
   int (*set_contrast)(sensor_t *,int)=control;
@@ -105,7 +127,7 @@ inline esp_err_t esp_camera_init(camera_config_t *config) {
   assert(config->fb_count==2);
   assert(config->grab_mode==CAMERA_GRAB_WHEN_EMPTY);
   fake::config=*config;fake::initialised=true;
-  clockRegister=config->frame_size==FRAMESIZE_QVGA?3:7;
+  clockRegister=(config->frame_size==FRAMESIZE_QVGA?3:7)|clockInitialUpperBits;
   const uint16_t widths[]={320,640,800,1024,96,128,176,240,240,320,480},heights[]={240,480,600,768,96,128,144,176,240,320,320};
   for(int i=0;i<2;++i) {
     fake::pixels[i].resize(size_t(widths[config->frame_size])*heights[config->frame_size]);

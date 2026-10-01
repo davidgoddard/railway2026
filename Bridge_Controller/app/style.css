@@ -40,6 +40,7 @@ header h1{font-size:22px;margin:0}
 .preview-controls .zoom-note{white-space:nowrap}
 .preview-controls button{padding:5px 9px;font-size:10px}
 .preview-controls select{min-width:74px;padding:5px 8px;font-size:10px}
+.preview-controls #frame-size-mode{min-width:128px}
 .live-toggle{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border:1px solid #365066;border-radius:7px;color:#c8d9e4;font-size:11px;font-weight:800;cursor:pointer}
 .live-toggle:has(input:checked){border-color:#36cda4;background:#174439;color:#a6f5d7}
 .live-toggle input{width:14px;height:14px;margin:0;padding:0;accent-color:#29d8ae}
@@ -56,6 +57,10 @@ header h1{font-size:22px;margin:0}
 @media(max-width:900px){.test-panel{grid-template-columns:1fr}.test-summary,.test-results{grid-column:1}}
 input:disabled,select:disabled{opacity:.55}
 .canvas-wrap{flex:1;min-height:0;overflow:hidden}
+.canvas-wrap #frame-canvas,.canvas-wrap #overlay-canvas{position:absolute;left:50%;top:50%}
+.canvas-wrap.panning #overlay-canvas{cursor:grabbing}
+.focus-panel{margin-bottom:17px;padding:17px 20px;border:1px solid #2f5263;border-radius:13px;background:#102431}.focus-head,.focus-body{display:flex;justify-content:space-between;gap:18px}.focus-head{align-items:flex-start;margin-bottom:14px}.focus-head strong,.focus-head span{display:block}.focus-head span{margin-top:4px;color:#8ca5b5;font-size:11px}.focus-body{justify-content:flex-start;align-items:center}.focus-image{position:relative;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));place-items:stretch;width:384px;min-height:192px;flex:none;border:1px solid #36566a;border-radius:9px;background:#08131d;overflow:hidden}.focus-image>span{grid-column:1/-1;align-self:center;max-width:220px;margin:auto;color:#7893a5;font-size:11px;text-align:center}.focus-tile{min-width:0;margin:0;padding:5px;border:1px solid #1c3443}.focus-tile canvas{display:block;width:100%;height:auto;aspect-ratio:1;max-width:none;max-height:none;image-rendering:pixelated}.focus-tile figcaption{padding:4px 2px 1px;color:#a9c0ce;font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.focus-controls{display:flex;flex-direction:column;gap:12px;min-width:280px}.focus-controls label{color:#a9bdca;font-size:11px}.focus-controls select{display:block;width:100%;margin-top:6px}.focus-score span,.focus-score strong,.focus-score small{display:block}.focus-score strong{margin:4px 0;font-size:30px;color:#53e0b7}.focus-score meter{width:100%;height:16px}.focus-score small,.focus-controls p{color:#8ca5b5;font-size:10px;line-height:1.5}.focus-controls p{margin:0}
+.focus-image{grid-template-columns:1fr;width:322px;height:322px;min-height:0;flex:none;place-items:center;overflow:auto}.focus-image>canvas{display:block;width:auto;height:auto;max-width:none;max-height:none;object-fit:none;image-rendering:pixelated}.focus-score{display:none}
 canvas{max-height:100%}
 #preview-placeholder div{font-size:38px}
 .inspector{min-height:0;gap:7px;overflow:hidden}
@@ -75,7 +80,7 @@ canvas{max-height:100%}
 .sensor-row-info strong,.sensor-row-info small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sensor-row-info small{margin-top:2px;color:#8099aa;font-size:10px}
 .sensor-radius{text-align:right;color:#9fb7c4;font-size:10px}
-.output-row{background:#172a39;border-bottom-color:#315064}.output-row .sensor-row-info strong{color:#edf7fb}.output-pill{background:#244153!important}.sensor-child{padding-left:20px;background:#10202e}.sensor-child .pill{width:28px;margin-left:11px;background:transparent;color:#54dcba}.output-state{text-align:right;color:#8da5b7;font-size:9px;text-transform:capitalize}.output-state.occupied{color:#ff8995}.output-state.clear{color:#4de2b8}.advanced-fields{margin-top:8px;border-top:1px solid #294052;padding-top:8px}.advanced-fields summary{cursor:pointer;color:#a9bdca;font-size:11px;font-weight:750;margin-bottom:8px}.advanced-fields:not([open]) summary{margin-bottom:0}
+.output-row{background:#172a39;border-bottom-color:#315064}.output-row .sensor-row-info strong{color:#edf7fb}.output-pill{background:#244153!important}.sensor-child{padding-left:20px;background:#10202e}.sensor-child .pill{width:28px;margin-left:11px;background:transparent;color:#54dcba}.output-state{text-align:right;color:#8da5b7;font-size:9px;text-transform:capitalize}.output-state.occupied{color:#ff8995}.output-state.clear{color:#4de2b8}.advanced-fields{display:block;margin-top:8px;border-top:1px solid #294052;padding-top:8px}.advanced-fields-heading{display:block;color:#a9bdca;font-size:11px;font-weight:750;margin-bottom:12px}
 .selection-card{max-height:42%;overflow-y:auto;overscroll-behavior:contain}
 .selection-card .field-pair{gap:6px}
 .selection-card label{margin-bottom:6px}
@@ -90,6 +95,8 @@ canvas{max-height:100%}
 .camera-settings label{margin:9px 0 0}
 .camera-settings select{padding:6px 8px}
 .camera-settings .field-note{margin-top:4px}
+.camera-settings .orientation-settings{margin-top:9px}
+.camera-settings .orientation-settings label{margin:0;justify-content:flex-start}
 .camera-item-info{flex:1;min-width:0}
 .camera-item-info strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .camera-item.offline .cam-icon{border-color:#9a4d59;color:#ff8995}
@@ -140,6 +147,9 @@ canvas{max-height:100%}
 .comparison-heat-key{display:grid;grid-template-columns:1fr auto;gap:2px 7px;align-items:center;margin:0 0 5px;color:#718b9e;font-size:8px}.comparison-heat-key i{grid-column:1/-1;height:4px;border-radius:3px;background:linear-gradient(90deg,#23b86a55,#e5bc3b88,#ef514faa)}.comparison-heat-key span:last-child{text-align:right}
 @media(max-width:1200px){.monitor-settings form{grid-template-columns:repeat(3,minmax(0,1fr))}}
 
+.monitor-timeline-head label{display:flex;align-items:center;gap:9px;margin:0;color:#8fa5b7;font-size:11px}.monitor-timeline-head select{min-width:210px;padding:7px 10px}.timeline-key{display:grid;grid-template-columns:230px 1fr 1fr 1fr;padding:8px 16px;border-bottom:1px solid #263d4e;color:#718a9d;font-size:9px;text-transform:uppercase;letter-spacing:.07em}.timeline-key span:nth-child(2){text-align:left}.timeline-key span:nth-child(3){text-align:center}.timeline-key span:nth-child(4){text-align:right}.viewer-sensors.monitor-timeline{display:block;padding:0;max-height:560px;overflow:auto}.timeline-row{display:grid;grid-template-columns:230px minmax(420px,1fr);align-items:stretch;min-height:58px;border-bottom:1px solid #263d4e}.timeline-row:last-child{border-bottom:0}.timeline-sensor{position:relative;padding:10px 86px 9px 16px;border-right:1px solid #31495b;background:#172735}.timeline-row.occupied .timeline-sensor{background:#54343a}.timeline-row.clear .timeline-sensor{background:#153c36}.timeline-row.unknown .timeline-sensor{background:#303b48}.timeline-sensor strong,.timeline-sensor small{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.timeline-sensor strong{font-size:12px}.timeline-sensor small{margin-top:4px;color:#92a8b8;font-size:9px}.timeline-sensor .state-badge{position:absolute;right:11px;top:15px}.activity-graph{display:block;width:100%;height:58px;max-width:none;max-height:none;background:#0b1722}.timeline-row:hover .timeline-sensor{filter:brightness(1.12)}
+@media(max-width:900px){.timeline-key{grid-template-columns:170px 1fr 1fr 1fr}.timeline-row{grid-template-columns:170px minmax(360px,1fr)}.timeline-sensor{padding-left:11px}.monitor-timeline{overflow-x:auto}}
+
 /* Four-track setup workspace: the camera spans two tracks and each inspector
    column occupies one. Lists and long details scroll inside their own cards. */
 @media(min-width:1300px){
@@ -158,6 +168,7 @@ canvas{max-height:100%}
 .selection-card .cell-analysis canvas{width:96px;height:96px}
 .selection-card .cell-angle-list{gap:3px;margin-top:5px}
 .selection-card .cell-angle-list i{padding:2px 4px}
+.card label.angle-toggle{display:inline-flex;align-items:center;gap:6px;margin:6px 0 2px;color:#b9cbd7;font-size:9px;font-weight:700;cursor:pointer;white-space:nowrap}.card label.angle-toggle input{display:inline-block;flex:0 0 13px;width:13px;height:13px;margin:0;padding:0;accent-color:#29d8ae}
 .selection-actions{flex:none;margin:6px -3px -1px;padding:7px 3px 1px;border-top:1px solid #294052;background:#132231}
 .selection-actions[hidden]{display:none}
 .test-actions{display:flex;align-items:end;justify-content:flex-end;gap:7px}.test-actions button{width:auto;white-space:nowrap}

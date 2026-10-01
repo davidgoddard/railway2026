@@ -40,6 +40,7 @@ header h1{font-size:22px;margin:0}
 .preview-controls .zoom-note{white-space:nowrap}
 .preview-controls button{padding:5px 9px;font-size:10px}
 .preview-controls select{min-width:74px;padding:5px 8px;font-size:10px}
+.preview-controls #frame-size-mode{min-width:128px}
 .live-toggle{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border:1px solid #365066;border-radius:7px;color:#c8d9e4;font-size:11px;font-weight:800;cursor:pointer}
 .live-toggle:has(input:checked){border-color:#36cda4;background:#174439;color:#a6f5d7}
 .live-toggle input{width:14px;height:14px;margin:0;padding:0;accent-color:#29d8ae}
@@ -56,6 +57,8 @@ header h1{font-size:22px;margin:0}
 @media(max-width:900px){.test-panel{grid-template-columns:1fr}.test-summary,.test-results{grid-column:1}}
 input:disabled,select:disabled{opacity:.55}
 .canvas-wrap{flex:1;min-height:0;overflow:hidden}
+.canvas-wrap #frame-canvas,.canvas-wrap #overlay-canvas{position:absolute;left:50%;top:50%}
+.canvas-wrap.panning #overlay-canvas{cursor:grabbing}
 canvas{max-height:100%}
 #preview-placeholder div{font-size:38px}
 .inspector{min-height:0;gap:7px;overflow:hidden}
@@ -90,6 +93,8 @@ canvas{max-height:100%}
 .camera-settings label{margin:9px 0 0}
 .camera-settings select{padding:6px 8px}
 .camera-settings .field-note{margin-top:4px}
+.camera-settings .orientation-settings{margin-top:9px}
+.camera-settings .orientation-settings label{margin:0;justify-content:flex-start}
 .camera-item-info{flex:1;min-width:0}
 .camera-item-info strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .camera-item.offline .cam-icon{border-color:#9a4d59;color:#ff8995}

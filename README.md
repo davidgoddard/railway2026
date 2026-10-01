@@ -28,7 +28,7 @@ The bridge sketch has no fixed GPIO assignments and is not tied to the ESP32-C3 
 - a 2.4 GHz Wi-Fi interface supported by Arduino-ESP32 3.x, including ESP-NOW;
 - enough RAM for Wi-Fi, MQTT, camera records, configuration staging, and snapshot transfer;
 - a flash partition containing LittleFS;
-- a USB CDC or USB-to-UART serial connection visible to the setup application at 115200 baud; and
+- a USB CDC or USB-to-UART serial connection visible to the setup application at 921600 baud; and
 - the PubSubClient Arduino library.
 
 The ESP32-C3 SuperMini is the tested and documented bridge target. Original ESP32/WROOM boards and suitable ESP32-S2, ESP32-S3, ESP32-C5, and ESP32-C6 boards should use the same sketch when their Arduino board profile, serial route, and flash partition are configured correctly. The eight-camera limit is a conservative C3 RAM limit in the sketch, rather than a C3 hardware dependency. ESP32-H2 has no Wi-Fi and cannot run this bridge. ESP32-P4 has no integrated radio and can run it only when a supported external Wi-Fi companion supplies every Wi-Fi and ESP-NOW API used by the sketch.

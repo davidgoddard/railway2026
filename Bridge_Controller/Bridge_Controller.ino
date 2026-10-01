@@ -1,4 +1,4 @@
-#define BRIDGE_VERSION "0.1.21"
+#define BRIDGE_VERSION "0.1.22"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -787,9 +787,15 @@ void command(char *input) {
   if(!strcmp(cmd,"CELL")) {
     long v[12];for(int i=0;i<12;++i) { char *a=strtok_r(nullptr," \r\n",&saveptr);if(!number(a,v[i],0,2147483647)) { Serial.println("ERR CELL args");return; } }
     Cell x={(uint32_t)v[1],(uint32_t)v[2],(uint16_t)v[3],(uint16_t)v[4],(uint8_t)v[5],(uint8_t)v[6],(uint16_t)v[7],(uint16_t)v[8],(uint8_t)v[9],(uint8_t)v[10],c->stagedRevision};
-    // Creation is bridge-owned metadata. Preserve it for an existing sensor
-    // even when a setup app holds a stale draft after its first save.
-    for(uint16_t i=0;i<c->count;++i) if(c->cells[i].id==x.id) { x.createdRevision=c->cells[i].createdRevision;break; }
+    // The revision marker selects sensors for normal calibration. Preserve it
+    // for ordinary edits, but advance it when geometry changes because the old
+    // baseline, radius choice, and threshold are no longer valid.
+    for(uint16_t i=0;i<c->count;++i) if(c->cells[i].id==x.id) {
+      const Cell &old=c->cells[i];
+      if(x.x==old.x && x.y==old.y && x.radius==old.radius && x.shape==old.shape)
+        x.createdRevision=old.createdRevision;
+      break;
+    }
     if(!c->staged || v[0]!=c->received || c->received>=c->stagedCount || !validCell(x,c->stagedSettings)) { Serial.println("ERR CELL invalid");return; }
     for(uint16_t i=0;i<c->received;++i) if(c->staged[i].id==x.id) { Serial.println("ERR CELL duplicate");return; }
     c->staged[c->received++]=x;Serial.println("OK CELL");return;
@@ -918,7 +924,7 @@ void serviceNetwork() {
   mqtt.loop();
 }
 void setup() {
-  Serial.begin(115200);delay(200);
+  Serial.begin(921600);delay(200);
   bridgeBootId=esp_random();recordDiagnostic("BRIDGE_BOOT","-");
   prefs.begin("railway",false);ssid=prefs.getString("ssid","");password=prefs.getString("pass","");
   broker=prefs.getString("broker","");brokerPort=prefs.getUShort("port",1883);topic=prefs.getString("topic","railway/home");

@@ -41,7 +41,7 @@ async function main() {
   if (!serialPath || !serialPath.startsWith('/dev/')) {
     throw Error('Usage: node tools/capture-camera-frame.js /dev/cu.usbserial-... [output.png] [--crop]');
   }
-  const port = new SerialPort({ path: serialPath, baudRate: 115200, autoOpen: false });
+  const port = new SerialPort({ path: serialPath, baudRate: 921600, autoOpen: false });
   const stream = new CameraFrameStream();
   let finished = false;
   const base = output.replace(/\.png$/i, '');

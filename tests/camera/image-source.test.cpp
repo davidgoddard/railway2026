@@ -1,5 +1,8 @@
 #include "stubs/esp_camera.h"
+#ifndef CAMERA_BOARD_ESP32S3_EYE
 #define CAMERA_BOARD_AI_THINKER 1
+#endif
+#define CAMERA_OV5640_PLL_OVERRIDE 1
 #define DEBUGF(...) do {} while(0)
 enum { QVGA,VGA,SVGA,XGA };
 struct CameraSettings { uint8_t resolution=QVGA;int brightness=0,contrast=0,saturation=0,vflip=0,hmirror=0; };
@@ -9,7 +12,14 @@ int main() {
   ImageSource source;CameraSettings settings;
   uint8_t *pixels=nullptr;uint16_t width=0,height=0;ImageSource::Frame frame;
   assert(source.begin(settings,pixels,width,height));
-  assert(clockWrites==0); // QVGA must keep its driver clock.
+#if CAMERA_OV2640_CLOCK_OVERRIDE
+  assert(clockRegister==CAMERA_OV2640_CLOCK_DIVISOR-1); // Applies at QVGA too.
+#else
+  assert(clockRegister==3 && clockWrites==0);
+#endif
+#if CAMERA_OV2640_CLOCK_OVERRIDE
+  const int writesAfterQvga=clockWrites;
+#endif
   assert(source.capture(pixels,width,height,frame));
   // Exact pointer identity proves the detector receives driver memory, not a copy.
   assert(pixels==fake::pixels[0].data() || pixels==fake::pixels[1].data());
@@ -33,8 +43,8 @@ int main() {
   settings.resolution=VGA;
   assert(source.reconfigure(settings,pixels,width,height)); // Deinit checks both leases returned.
   assert(pixels==nullptr && width==640 && height==480);
-#if CAMERA_OV2640_VGA_CLOCK_TRIAL
-  assert(clockRegister==CAMERA_OV2640_VGA_CLOCK_DIVISOR-1 && clockWrites==1);
+#if CAMERA_OV2640_CLOCK_OVERRIDE
+  assert(clockRegister==CAMERA_OV2640_CLOCK_DIVISOR-1 && clockWrites==writesAfterQvga+1);
 #else
   assert(clockRegister==7 && clockWrites==0);
 #endif
@@ -72,26 +82,40 @@ int main() {
   assert(source.begin(settings,pixels,width,height));
   assert(clockWrites==writesBefore && clockRegister==7);
   fake::failInit=true;assert(!source.begin(settings,pixels,width,height));
+  // OV5640 uses its own PLL API at every resolution. The 20 MHz XCLK profile
+  // makes the multiplier equal to the requested PCLK MHz.
+  fake::failInit=false;fake::sensor.id.PID=OV5640_PID;
+  const int pllCallsBefore=ov5640PllCalls;
+  assert(source.begin(settings,pixels,width,height));
+  assert(ov5640PllCalls==pllCallsBefore+1);
+  assert(ov5640Registers[0x3036]==CAMERA_OV5640_PCLK_MHZ);
+  assert(ov5640Registers[0x3824]==2);
+  fake::failInit=true;assert(!source.begin(settings,pixels,width,height));
+  fake::failInit=false;failOv5640Pll=true;
+  ov5640Registers[0x3036]=10;ov5640Registers[0x3824]=2;
+  assert(!source.begin(settings,pixels,width,height));
+  assert(ov5640Registers[0x3036]==10 && ov5640Registers[0x3824]==2);
+  failOv5640Pll=false;
   fake::sensor.id.PID=OV2640_PID;fake::failInit=false;
-#if CAMERA_OV2640_VGA_CLOCK_TRIAL
+#if CAMERA_OV2640_CLOCK_OVERRIDE
   // A successful bus write without the requested readback must also fail.
   fake::sensor.set_reg=[](sensor_t *,int,int,int) { return 0; };
   assert(!source.begin(settings,pixels,width,height));
   assert(!fake::initialised && pixels==nullptr);
   fake::sensor.set_reg=sensor_t::writeRegister;
-  // Unknown driver clock settings must not be overwritten.
-  fake::sensor.get_reg=[](sensor_t *,int,int) { return 0x87; };
+  // Non-divider bits in an unfamiliar driver value must be preserved.
+  clockInitialUpperBits=0x80;
   const int writesBeforeUnknown=clockWrites;
   assert(source.begin(settings,pixels,width,height));
-  assert(clockWrites==writesBeforeUnknown);
+  assert(clockWrites==writesBeforeUnknown+1 && clockRegister==(0x80|CAMERA_OV2640_CLOCK_DIVISOR-1));
   fake::failInit=true;assert(!source.begin(settings,pixels,width,height));
-  fake::failInit=false;fake::sensor.get_reg=sensor_t::readRegister;
+  fake::failInit=false;clockInitialUpperBits=0;
   failClockWrite=true;
   assert(!source.begin(settings,pixels,width,height));
   assert(!fake::initialised && pixels==nullptr);
   failClockWrite=false;
   assert(source.begin(settings,pixels,width,height));
-  assert(clockRegister==CAMERA_OV2640_VGA_CLOCK_DIVISOR-1);
+  assert(clockRegister==CAMERA_OV2640_CLOCK_DIVISOR-1);
   fake::failInit=true;assert(!source.begin(settings,pixels,width,height));
 #endif
   assert(fake::gets==fake::returns);

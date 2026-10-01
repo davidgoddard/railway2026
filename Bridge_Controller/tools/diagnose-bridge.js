@@ -5,7 +5,7 @@ const { SerialPort } = require('serialport');
 const serialPath = process.argv[2];
 if (!serialPath) throw Error('Usage: node tools/diagnose-bridge.js /dev/cu.usbmodem...');
 
-const port = new SerialPort({ path: serialPath, baudRate: 115200, autoOpen: false });
+const port = new SerialPort({ path: serialPath, baudRate: 921600, autoOpen: false });
 let input = '';
 let cameraMac = '';
 let snapBytes = 0;

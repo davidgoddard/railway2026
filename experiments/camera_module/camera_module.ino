@@ -1,4 +1,4 @@
-#define CAMERA_ANGLE_EXPERIMENT_VERSION "0.12.0"
+#define CAMERA_ANGLE_EXPERIMENT_VERSION "0.12.1"
 
 /*
   Railway camera angle experiment
@@ -1624,7 +1624,7 @@ void handleClearLog() {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(921600);
   delay(200);
   Serial.printf("Railway camera angle experiment v%s\n", CAMERA_ANGLE_EXPERIMENT_VERSION);
   for (int angle = 0; angle <= 20; ++angle)
